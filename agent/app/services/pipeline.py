@@ -34,6 +34,7 @@ from app.knowledge import (
     component_check_lines,
     dependency_path,
     family_label,
+    is_matcher_only_family,
     load_architecture,
     load_failure_modes,
     load_family_catalog,
@@ -41,7 +42,6 @@ from app.knowledge import (
     load_troubleshooting_cases,
     localized_failure_mode_actions,
     match_failure_mode_symptoms,
-    is_matcher_only_family,
     match_runai_known_issues,
     merge_runtime_failure_modes,
     runtime_shadow_hints,
@@ -6501,7 +6501,7 @@ def _kb_remediation_lines(
         if actions:
             symptom_name = _safe_line(symptom.get("symptom"), limit=160, masker=active_masker)
             learned = is_matcher_only_family(family)
-            header = (f"- Learned from a previous incident (not a catalog family): " if learned else "") + (
+            header = ("- Learned from a previous incident (not a catalog family): " if learned else "") + (
                 f"Matched symptom **{symptom_name}** ({_family_label(family)}); known fixes from the knowledge base:"
             )
             return [

@@ -32,8 +32,8 @@ from typing import Any
 from app.collectors.base import resolve_target
 from app.config import load_settings
 from app.knowledge import load_family_catalog
-from app.ontology.typedb_client import escape_typeql as esc
 from app.masking import build_masker
+from app.ontology.typedb_client import escape_typeql as esc
 from ontology.incident import OntologyIncident
 from ontology.load_knowledge import (
     _ensure_action,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import shlex
 from dataclasses import replace
@@ -41,6 +42,8 @@ from app.mcp_client import (
     mcp_tool_text,
 )
 from app.services.query_memory import domain_query_key
+
+_log = logging.getLogger(__name__)
 
 # pods/exec policy: DENYLIST. The drill-down runs read-only diagnostics of its
 # own choosing — nvidia-smi, ping, cat /proc/*, ps, ss, ip addr, dig, curl, df,
