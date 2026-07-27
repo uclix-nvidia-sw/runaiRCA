@@ -461,3 +461,34 @@ def test_reasoning_trace_v3_uses_assessment_hypothesis_ids_without_family_infere
     ]
     _record_selected_hypothesis_id(state)
     assert "selected_hypothesis_id" not in state.investigation_context["reasoning_trace_v3"]
+
+
+def test_assessment_evidence_id_resolves_by_execution_identity() -> None:
+    # _aggregate_evidence compacts result.artifacts after drill-down, so any
+    # recorded position is stale; resolution must ride the identity stamp.
+    from app.services.pipeline import _assessment_evidence_id
+
+    probe_artifact = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="ontology_probe",
+        status="ok",
+        confidence="medium",
+        summary="probe",
+    )
+    probe_artifact.probe_execution_ids = ["run-1:t:1"]
+    probe_artifact.evidence_id = "E07"
+    other = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        confidence="high",
+        summary="events",
+    )
+    result = CollectorResult(
+        agent="kubernetes", status="ok", summary="x", artifacts=[other, probe_artifact]
+    )
+    assert _assessment_evidence_id(result, {"execution_id": "run-1:t:1"}) == "E07"
+    assert _assessment_evidence_id(result, {"execution_id": "missing", "artifact_index": 0}) == ""
+    assert _assessment_evidence_id(result, {}) == ""

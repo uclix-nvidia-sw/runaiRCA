@@ -87,7 +87,7 @@ from app.mcp_client import (
 )
 from app.plan import InvestigationPlan
 from app.services.evidence_projection import observed_payload
-from app.services.probe_evaluation import evaluate_probe
+from app.services.probe_evaluation import ProbeAssessment, evaluate_probe
 from app.services.query_memory import QueryMemory, domain_query_key
 
 _log = logging.getLogger(__name__)
@@ -278,10 +278,14 @@ async def _drill_one(
                     continue
                 system_no_node_query_attempted = True
             key = _query_fingerprint(query, target)
-            if key in seen_queries:
-                continue
             execution_key = domain_query_key(result.agent, query, target)
-            if not memory.claim(execution_key):
+            if key in seen_queries or not memory.claim(execution_key):
+                # The equivalent read already ran in the base pass. Skipping the
+                # probe outright discarded its supports/refutes verdict on exactly
+                # the obvious incidents whose base pass had already fetched the
+                # answer, starving the trace-v3 hypothesis ledger. Assess the
+                # declared signals against the collected observations instead.
+                _replay_declared_probe(result, query, plan, probe_attempts)
                 continue
             seen_queries.add(key)
             await _run_query(
@@ -757,10 +761,15 @@ async def _run_query(
     if artifact_type == "ontology_probe" and isinstance(probe, dict):
         assessments = result.details.get("ontology_probe_assessments")
         if isinstance(assessments, list) and assessments:
+            # Identity link, never a positional index: _aggregate_evidence
+            # compacts result.artifacts before the trace resolves this probe's
+            # evidence card, so a recorded index silently dangles or mislinks.
             stored_artifact = result.artifacts[-1]
-            assessments[-1]["artifact_index"] = len(result.artifacts) - 1
-            if evidence_id := str(getattr(stored_artifact, "evidence_id", "") or ""):
-                assessments[-1]["evidence_ids"] = [evidence_id]
+            if execution_id := str(assessments[-1].get("execution_id") or ""):
+                stored_artifact.probe_execution_ids = [
+                    *(stored_artifact.probe_execution_ids or []),
+                    execution_id,
+                ]
     _record_blackboard(blackboard, result, target)
     return bool(
         error
@@ -940,6 +949,82 @@ def _declared_probe_queries(
             seen.add(fingerprint)
             queries.append(query)
     return queries
+
+
+def _replay_declared_probe(
+    result: CollectorResult,
+    query: dict[str, Any],
+    plan: InvestigationPlan | None,
+    probe_attempts: dict[str, int],
+) -> None:
+    """Assess a deduplicated declared probe against already-collected artifacts.
+
+    The probe's read already ran, so its observation is present in this agent's
+    artifacts. Re-querying would duplicate evidence, but the probe's job is the
+    verdict and the hypothesis↔evidence link, not the fetch — evaluate the
+    authored signals against the existing scoped observations instead.
+    Refutation wins across artifacts: a mixed replay is a contradiction.
+    """
+    probe = query.get("_ontology_probe")
+    if not isinstance(probe, dict):
+        return
+    best: ProbeAssessment | None = None
+    best_artifact = None
+    for item in result.artifacts:
+        if str(getattr(item, "status", "") or "") != "ok":
+            continue
+        payload = getattr(item, "result", None)
+        if not isinstance(payload, dict):
+            continue
+        assessment = evaluate_probe(
+            probe,
+            {
+                "status": "ok",
+                "error": None,
+                "result": payload,
+                "observation": payload.get("observation"),
+            },
+            require_scoped_observation=True,
+        )
+        if assessment.verdict == "refutes":
+            best, best_artifact = assessment, item
+            break
+        if assessment.verdict == "supports" and best is None:
+            best, best_artifact = assessment, item
+    if best is None:
+        best = evaluate_probe(
+            probe,
+            {"status": "ok", "error": None, "result": None, "observation": None},
+            require_scoped_observation=True,
+        )
+    record = best.as_dict()
+    template_id = _template_id(probe)
+    attempt_index = probe_attempts.get(template_id, 0) + 1
+    probe_attempts[template_id] = attempt_index
+    directive = plan.diagnostic_directive if plan else {}
+    run_id = str(directive.get("run_id") or "").strip() if isinstance(directive, dict) else ""
+    record.update(
+        {
+            "template_id": template_id,
+            "attempt_index": attempt_index,
+            "executed_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "replayed_from_base_pass": True,
+        }
+    )
+    if run_id and template_id:
+        execution_id = f"{run_id}:{template_id}:{attempt_index}"
+        record["execution_id"] = execution_id
+        record["hypothesis_ids"] = [
+            str(value) for value in probe.get("hypothesis_ids") or [] if str(value).strip()
+        ]
+        if best_artifact is not None:
+            best_artifact.probe_execution_ids = [
+                *(getattr(best_artifact, "probe_execution_ids", None) or []),
+                execution_id,
+            ]
+    assessments = result.details.setdefault("ontology_probe_assessments", [])
+    if isinstance(assessments, list):
+        assessments.append(record)
 
 
 def _template_id(probe: dict[str, Any]) -> str:

@@ -419,6 +419,29 @@ def _assign_hypothesis_ids(hypotheses: list[dict[str, str]], run_id: str) -> lis
     return [{**item, "id": f"{run_id}:H{index}"} for index, item in enumerate(hypotheses, start=1)]
 
 
+def _ensure_walk_family_hypothesis(
+    hypotheses: list[dict[str, str]], directive: dict, families
+) -> list[dict[str, str]]:
+    """Keep the runbook walk's conclusion as a tracked hypothesis.
+
+    Declared probes bind to hypothesis IDs by family, so when LLM refinement
+    drops the walk's provisional family every probe verdict is orphaned and
+    the trace-v3 ledger can never support the family the walk concluded.
+    """
+    family = str((directive or {}).get("provisional_family") or "").strip()
+    if not family or family not in families:
+        return hypotheses
+    if any(str(item.get("family") or "") == family for item in hypotheses):
+        return hypotheses
+    return [
+        *hypotheses,
+        {
+            "family": family,
+            "reason": "runbook walk provisional conclusion; verify with declared probes",
+        },
+    ]
+
+
 def _bind_probe_hypotheses(
     directive: dict, hypotheses: list[dict[str, str]], run_id: str
 ) -> dict:
@@ -827,6 +850,9 @@ async def plan_investigation(
             h for h in plan.hypotheses if h.get("family") != seed_family
         ]
     plan.warnings = list(dict.fromkeys([*plan.warnings, *plan_warnings]))
+    plan.hypotheses = _ensure_walk_family_hypothesis(
+        plan.hypotheses, plan.diagnostic_directive, family_catalog.families
+    )
     plan.hypotheses = _assign_hypothesis_ids(plan.hypotheses, run_id)
     plan.diagnostic_directive = _bind_probe_hypotheses(
         plan.diagnostic_directive,

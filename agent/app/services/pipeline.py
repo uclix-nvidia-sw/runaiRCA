@@ -1102,12 +1102,16 @@ def _probe_assessments(results: list[CollectorResult]) -> list[dict[str, Any]]:
 
 
 def _assessment_evidence_id(result: CollectorResult, assessment: dict[str, Any]) -> str:
-    try:
-        index = int(assessment.get("artifact_index"))
-    except (TypeError, ValueError):
+    # Resolve by execution identity, never by position: _aggregate_evidence
+    # compacts result.artifacts after drill-down, so a recorded index dangles
+    # or mislinks. The drill-down stamps probe_execution_ids on the artifact
+    # whose observation the assessment judged.
+    execution_id = str(assessment.get("execution_id") or "")
+    if not execution_id:
         return ""
-    if 0 <= index < len(result.artifacts):
-        return str(getattr(result.artifacts[index], "evidence_id", "") or "")
+    for item in result.artifacts:
+        if execution_id in (getattr(item, "probe_execution_ids", None) or []):
+            return str(getattr(item, "evidence_id", "") or "")
     return ""
 
 

@@ -1073,3 +1073,20 @@ async def test_llm_cannot_narrow_control_plane_below_floor(monkeypatch) -> None:
     target = _target(alert_name="SomeAlert", namespace="runai-backend")
     plan = await plan_investigation(settings, target, None, {}, [])
     assert plan.check_control_plane is True  # deterministic floor held
+
+
+def test_walk_family_hypothesis_is_preserved_for_probe_binding() -> None:
+    # Declared probes bind to hypothesis IDs by family; when refinement drops
+    # the runbook walk's conclusion, every probe verdict is orphaned.
+    from app.services.planner import _ensure_walk_family_hypothesis
+
+    directive = {"provisional_family": "workload_startup_error"}
+    families = {"workload_startup_error", "image_pull_error"}
+    hypotheses = [{"family": "image_pull_error", "reason": "r"}]
+
+    out = _ensure_walk_family_hypothesis(hypotheses, directive, families)
+    assert out[-1]["family"] == "workload_startup_error"
+    # Already present → unchanged; unknown/absent family → unchanged.
+    assert _ensure_walk_family_hypothesis(out, directive, families) == out
+    assert _ensure_walk_family_hypothesis(hypotheses, {"provisional_family": "bogus"}, families) == hypotheses
+    assert _ensure_walk_family_hypothesis(hypotheses, {}, families) == hypotheses
