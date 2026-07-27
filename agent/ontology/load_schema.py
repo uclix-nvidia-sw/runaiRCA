@@ -94,6 +94,11 @@ DATA_MIGRATIONS = [
     "match $x isa namespace; delete $x;",
     "match $x isa project; delete $x;",
     "match $x isa queue; delete $x;",
+    # Suffixed "workloads" minted by the old raw-pod-name fallback
+    # (name-<rs-hash>-<random5>). Only the unambiguous Deployment shape is
+    # cleaned — ordinal suffixes can be legitimate workload names. Non-fatal
+    # like every entry here; re-ingest rebuilds the stem identities.
+    'match $w isa workload, has name $n; $n like ".*-[0-9a-f]{8,10}-[a-z0-9]{5}"; delete $w;',
 ]
 
 

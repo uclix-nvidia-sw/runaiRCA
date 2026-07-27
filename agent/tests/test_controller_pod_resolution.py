@@ -327,3 +327,26 @@ async def test_workload_firing_warning_uses_resolved_pod_identity_anchor(
         assert (observation["polarity"], observation["coverage"]) == ("present", "scoped")
     else:
         assert observation["event_count"] == 0
+
+
+def test_pod_fallback_workload_identity_is_stemmed() -> None:
+    # No workload/controller label: the pod-name fallback must collapse to the
+    # stable workload stem, or every restart mints a new "workload" identity
+    # (the ontology had workload-exporter-8fbbcbf59-wzqzb-style vertices).
+    for pod, stem in [
+        ("workload-exporter-8fbbcbf59-wzqzb", "workload-exporter"),
+        ("runai-container-toolkit-x7k2p", "runai-container-toolkit"),
+        ("prometheus-prometheus-node-0", "prometheus-prometheus-node"),
+    ]:
+        target = resolve_target({"namespace": "runai", "pod": pod}, {})
+        assert target.workload_name == stem, pod
+        # The pod itself stays the concrete target for k8s reads.
+        assert target.pod == pod
+
+
+def test_explicit_workload_label_is_never_stemmed() -> None:
+    # A Run:ai workload legitimately named with a trailing ordinal must keep it.
+    target = resolve_target(
+        {"namespace": "runai-vision", "workload": "train-3", "pod": "train-3-0-0"}, {}
+    )
+    assert target.workload_name == "train-3"

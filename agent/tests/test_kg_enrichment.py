@@ -188,6 +188,40 @@ def test_query_kg_escapes_typeql_literals() -> None:
     assert 'has incident_id "INC-1"; delete' not in joined
 
 
+def test_query_kg_surfaces_location_history_and_renders_it() -> None:
+    # The infra layer's "have we seen trouble HERE before": resolved incidents
+    # whose alerts fired at the same node/namespace, any alert name.
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "has node_name" in query:
+                    return [{"iid": "INC-node-1", "sum": "GPU fell off the bus."}]
+                if "has namespace_name" in query:
+                    return [
+                        {"iid": "INC-node-1", "sum": "duplicate — must dedupe"},
+                        {"iid": "INC-ns-2", "sum": "quota exhausted in namespace."},
+                    ]
+                return []
+
+            yield run
+
+    target = replace(_target(), namespace="runai-vision")
+    data = _query_kg(FakeClient(), target, [])  # type: ignore[arg-type]
+
+    history = data["location_history"]
+    assert [item["incident_id"] for item in history] == ["INC-node-1", "INC-ns-2"]
+    assert history[0]["where"] == "node gpu-1"
+    assert history[1]["where"] == "namespace runai-vision"
+
+    lines = _knowledge_base_lines(
+        {"enabled": True, "available": True, "location_history": history}, [], "", ""
+    )
+    joined = "\n".join(lines)
+    assert "2 past resolved incident(s)" in joined
+    assert "INC-node-1 (node gpu-1): GPU fell off the bus." in joined
+
+
 def test_query_kg_projects_typedb_symptom_metadata() -> None:
     class FakeClient:
         @contextmanager

@@ -6407,6 +6407,24 @@ def _knowledge_base_lines(
             f"- Blast radius: {blast} workload(s) share the alerting node, so the impact "
             "is node-wide rather than a single workload."
         )
+    history = kg_context.get("location_history") or []
+    if history:
+        body.append(
+            f"- {len(history)} past resolved incident(s) at this alert's location "
+            "(different alerts, same node/namespace):"
+        )
+        for item in history[:4]:
+            where = active_masker.mask_text(str(item.get("where") or "location"))
+            incident_id = _short_sentence(
+                active_masker.mask_text(str(item.get("incident_id") or "(unknown)")), limit=80
+            )
+            summary = _short_sentence(
+                active_masker.mask_text(
+                    str(item.get("analysis_summary") or "(no stored RCA summary)")
+                ),
+                limit=240,
+            )
+            body.append(f"  - {incident_id} ({where}): {summary}")
     prior = kg_context.get("prior_incidents") or []
     if prior:
         body.append(f"- This alert recurred in {len(prior)} prior incident(s):")

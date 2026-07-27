@@ -609,6 +609,33 @@ def _is_kube_state_metrics_exporter(
     return False
 
 
+_POD_RANDOM_SUFFIX_RE = re.compile(r"-[a-z0-9]{5}$")
+_POD_REPLICASET_HASH_RE = re.compile(r"-[a-z0-9]{8,10}$")
+_POD_ORDINAL_SUFFIX_RE = re.compile(r"-\d+$")
+
+
+def normalize_pod_name(pod: str) -> str:
+    """Strip controller-generated suffixes so pods of one workload collapse to
+    one identity (mirrors the backend's normalizePodName):
+      - Deployment:  <name>-<replicaset-hash>-<random5>
+      - DaemonSet:   <name>-<random5>
+      - StatefulSet: <name>-<ordinal>
+    Without this, a pod-label fallback minted a new "workload" per restart —
+    the ontology accumulated workload-exporter-8fbbcbf59-wzqzb-style vertices.
+    """
+    pod = (pod or "").strip()
+    if not pod:
+        return ""
+    if _POD_RANDOM_SUFFIX_RE.search(pod):
+        stripped = _POD_RANDOM_SUFFIX_RE.sub("", pod)
+        if _POD_REPLICASET_HASH_RE.search(stripped):
+            return _POD_REPLICASET_HASH_RE.sub("", stripped)
+        return stripped
+    if _POD_ORDINAL_SUFFIX_RE.search(pod):
+        return _POD_ORDINAL_SUFFIX_RE.sub("", pod)
+    return pod
+
+
 def resolve_target(
     labels: dict[str, str],
     annotations: dict[str, str],
@@ -634,7 +661,12 @@ def resolve_target(
         queue=value_from(labels, annotations, "queue", "runai_queue", "runai.io/queue"),
         namespace=namespace,
         workload_name=(
-            explicit_workload_name or workload_kind_name or value_from(labels, annotations, "pod")
+            # Explicit workload/controller labels are already stable identities
+            # and stay verbatim; only the raw-pod-name FALLBACK is normalized
+            # (a Run:ai workload named "train-3" must not lose its "-3").
+            explicit_workload_name
+            or workload_kind_name
+            or normalize_pod_name(value_from(labels, annotations, "pod"))
         ),
         workload_type=(
             value_from(labels, annotations, "workload_type", "kind", "runai_workload_type")

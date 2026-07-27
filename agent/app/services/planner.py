@@ -849,6 +849,8 @@ async def _llm_refine(
         prior = kg_context.get("prior_incidents") or []
         kg_summary = (
             f"blast_radius={kg_context.get('blast_radius_workloads', 0)} workloads; "
+            f"{len(kg_context.get('location_history') or [])} past resolved incident(s) "
+            "at this node/namespace; "
             f"{len(prior)} prior incident(s) for this alert; "
             f"knowledge families={sorted((kg_context.get('knowledge') or {}).keys())}"
         )
