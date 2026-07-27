@@ -580,12 +580,12 @@ frontend:
     pullPolicy: IfNotPresent
   service:
     annotations: {}
-    # ClusterIP: the Ingress (default-on below) is the access path. The entry
-    # PORT (e.g. 30006) belongs to the cluster's ingress CONTROLLER service,
-    # not to this chart's Ingress resource. `nodePort` is honored only if you
-    # opt back into type: NodePort for a direct fallback.
-    type: ClusterIP
-    nodePort: null
+    # Our OWN nginx is the gateway (no external ingress controller needed):
+    # the frontend container serves the dashboard and proxies /api, /webhook
+    # and /api-docs to the backend. Pinned to NodePort 30006 so the dashboard
+    # address survives reinstalls (random NodePorts changed it every release).
+    type: NodePort
+    nodePort: 30006
     port: 80
   config:
     apiBaseUrl: ""
