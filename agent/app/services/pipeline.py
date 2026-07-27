@@ -2652,6 +2652,13 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             language=language,
             next_check=state.self_check_next,
         )
+        if not carried_guidance:
+            # A gated run that HAD eligible evidence never emitted a guide —
+            # its report carried cause-specific sections instead, and abstain
+            # just replaced all of them with the stub. Build the guide now:
+            # the bare stub leaves the operator with less help than a
+            # zero-evidence run (live case: INC-1785128597…, a 318-char report).
+            carried_guidance = _abstain_guidance_block(state, language)
         if carried_guidance:
             response.analysis_detail = _append_general_guidance(
                 response.analysis_detail, carried_guidance
@@ -4498,6 +4505,30 @@ def _insert_before_appendix(detail: str, block: str) -> str:
 def _append_general_guidance(detail: str, block: str) -> str:
     """Keep non-diagnostic guidance outside the RCA conclusion and action sections."""
     return f"{detail.rstrip()}\n\n{block}"
+
+
+def _abstain_guidance_block(state: "PipelineState", language: str) -> str:
+    """The guide built fresh at abstain time when the pre-abstain report had
+    none: a run with eligible evidence carried cause-specific sections instead,
+    and abstain() replaced the whole document with the stub."""
+    plan = state.plan
+    return "\n".join(
+        [
+            _general_guidance_heading(language),
+            "",
+            *general_guidance_lines(
+                _alert_text(state.request),
+                state.failure_modes,
+                state.known_issues,
+                language=language,
+                masker=state.masker,
+                component=getattr(plan, "component", "") if plan else "",
+                components=load_architecture(state.settings.architecture_file),
+                matched_alert=getattr(plan, "matched_alert", None) if plan else None,
+                families=_plan_families(plan),
+            ),
+        ]
+    )
 
 
 def _general_guidance_block(detail: str, language: str) -> str:

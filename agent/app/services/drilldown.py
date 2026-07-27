@@ -121,6 +121,9 @@ _QUERY_STRING_LITERAL_RE = re.compile(r'"(?:\\.|[^"\\])*"')
 # Go string unescaping rejects regex escapes such as ``\d`` and ``\-``.
 _LOGQL_INVALID_STRING_ESCAPE_RE = re.compile(r"\\([^abfnrtv\\'\"0-7xuU])")
 _LOGQL_LEADING_SELECTOR_RE = re.compile(r"^\s*\{([^}]*)\}")
+# A [range] directly after a closing paren, with no ":" (which would make it a
+# valid subquery). `rate(x[5m])` and `x{...}[5m]` stay legal.
+_PROMQL_RANGE_ON_EXPRESSION_RE = re.compile(r"\)\s*\[[^\]:]+\]")
 _LOGQL_MATCHER_RE = re.compile(
     r'[a-zA-Z_][a-zA-Z0-9_]*\s*(=~|!~|!=|=)\s*("(?:\\.|[^"\\])*"|`[^`]*`)'
 )
@@ -1096,6 +1099,18 @@ def _sanitize_metric_query(query: str, tool: str) -> tuple[str, str | None]:
         normalized = _QUERY_STRING_LITERAL_RE.sub(_harden_logql_string_literal, normalized)
         if selector_error := _logql_selector_error(normalized):
             return "", selector_error
+    if tool == "promql_query" and _PROMQL_RANGE_ON_EXPRESSION_RE.search(
+        _QUERY_STRING_LITERAL_RE.sub('""', normalized)
+    ):
+        # Prometheus 400s with "ranges only allowed for vector selectors" when a
+        # [window] follows an expression instead of a selector. Fail locally
+        # with guidance the model can act on (live case: a drill-down query
+        # burned its step on this exact parse error).
+        return "", (
+            "invalid PromQL query: a [range] may only follow a vector selector. "
+            "Put the range on the selector (rate(metric{...}[5m])) or use a "
+            "subquery with a step (expr[10m:1m])."
+        )
     return normalized, None
 
 

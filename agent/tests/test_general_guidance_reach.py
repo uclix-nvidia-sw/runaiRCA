@@ -331,6 +331,37 @@ def test_general_guidance_block_absent_returns_empty() -> None:
     assert pipeline._general_guidance_block("## 1. Problem\n\nx", "ko") == ""
 
 
+def test_abstain_builds_a_guide_when_the_report_never_had_one() -> None:
+    # A gated run WITH eligible evidence carries cause-specific sections and no
+    # guide; abstain() replaces everything with the stub. The fallback must
+    # build the guide from plan/knowledge state — the live INC-1785128597 case
+    # ended as a bare 318-char stub without it.
+    from types import SimpleNamespace
+
+    from tests.test_orchestrator import make_settings
+
+    settings = make_settings()
+    state = SimpleNamespace(
+        settings=settings,
+        plan=InvestigationPlan(
+            hypotheses=[{"family": "runai_scheduling_quota"}], llm_refined=True
+        ),
+        request=AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "OperatorRequestedAnalysis", "source": "chat"},
+                annotations={"summary": "Thanos Receive 가 OOMKilled 반복"},
+            )
+        ),
+        failure_modes=load_failure_modes("knowledge/failure_modes.yaml"),
+        known_issues=[],
+        masker=None,
+    )
+    block = pipeline._abstain_guidance_block(state, "ko")
+    assert block.startswith("## 일반 점검 가이드")
+    assert "결론이 아닙니다" in block or "결론 아님" in block
+
+
 def test_general_guidance_block_finds_the_other_language() -> None:
     # A stored report may have been written under a different language setting.
     korean = "## 일반 점검 가이드 (현재 RCA 결론 아님)\n\n- 한 줄"

@@ -1,0 +1,244 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:62582d633330
+  source_revision_hash: sha256:1fb89ce08236afc68d8704efd548ec61cb6d8055fafb68c268fdad99dca45002
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: Thanos Receive WAL write failed with stale NFS file handle during metric
+    gap
+  masked_summary: A customer reported an approximately 12-hour Run:AI metric-collection
+    gap and quoted repeated Thanos Receive errors in which committing samples failed
+    during WAL writes with stale NFS file handle. Support preliminarily pointed to
+    the storage side and proposed NFS checks and remount/restart. The customer requested
+    closure while planning further investigation; no NFS configuration confirmation,
+    executed mitigation, recovery verification, permanent resolution, or Engineering
+    confirmation was supplied.
+  status: unresolved
+  occurred_at: '2025-09-30'
+  resolved_at: null
+  family: storage_backend_error
+  family_confidence: medium
+  observed_mechanism: During the reported metric-collection gap, repeated quoted Thanos
+    Receive errors showed commit-samples failures while writing the WAL because of
+    a stale NFS file handle.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: null
+  confirmed_mechanism_confidence: low
+searchable_context:
+  normalized_symptoms:
+  - Run:AI metric collection unavailable for approximately 12 hours
+  - Thanos Receive unable to commit samples to WAL
+  - stale NFS file handle during WAL write
+  metric_signatures: []
+  error_signatures:
+  - stale NFS file handle
+  - 'commit samples: write to WAL'
+  issue_references: []
+  canonical_component_tokens:
+  - runai-backend-thanos-receive
+  - nfs-storage-backend
+  version_tokens: []
+  trigger_tokens:
+  - wal-write-stale-nfs-handle
+  retrieval_keywords:
+  - stale NFS file handle
+  - commit samples write to WAL
+  - Thanos Receive WAL
+  - Run:AI metrics unavailable
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported an approximately 12-hour metric-collection gap
+    on September 30, 2025 KST.
+  supports:
+  - F001
+  - H002
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: The transcript quotes a Thanos Receive commit-samples WAL-write
+    failure ending with stale NFS file handle; tenant and WAL segment are masked.
+  supports:
+  - F002
+  - H002
+  - A001
+- evidence_id: E003
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: The transcript quotes a separate internal server error message from
+    the related pod logs.
+  supports:
+  - F002
+  - A001
+- evidence_id: E004
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer asked whether a Run:AI known issue triggered the problem;
+    this is a hypothesis, not proof.
+  supports: []
+- evidence_id: E005
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support preliminarily said the issue did not appear Run:AI-caused
+    and asked whether the Thanos PVC used NFS.
+  supports:
+  - F003
+  - A002
+- evidence_id: E006
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support explained stale NFS handle desynchronization, listed network
+    issues as one possible cause, and proposed remount or pod restart as a typical
+    response.
+  supports:
+  - F003
+  - A004
+- evidence_id: E007
+  source_message_ids:
+  - M002
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support proposed reviewing NFS CSI logs; no review result was supplied.
+  supports:
+  - A003
+- evidence_id: E008
+  source_message_ids:
+  - M003
+  source_actor: system
+  evidence_kind: statement
+  artifact_availability: supplied_raw
+  masked_summary: Portal metadata records Closed status and a 10/12/2025 close date.
+  supports:
+  - F005
+- evidence_id: E009
+  source_message_ids:
+  - M004
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer planned NFS-side investigation and requested closure without
+    a technical result.
+  supports:
+  - F004
+  - F005
+  - A005
+  - A006
+- evidence_id: E010
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support closed the case administratively without reporting a technical
+    resolution.
+  supports:
+  - F004
+  - F005
+  - A006
+historical_actions:
+- action_id: A001
+  normalized_action: Review the related runai-backend Thanos Receive pod logs for
+    the metric-gap window.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E002
+  - E003
+- action_id: A002
+  normalized_action: Confirm whether the Thanos PVC storage uses NFS.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E005
+- action_id: A003
+  normalized_action: Inspect logs for the NFS CSI implementation.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E007
+- action_id: A004
+  normalized_action: Remount the filesystem by restarting the affected pod.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E006
+- action_id: A005
+  normalized_action: Investigate the NFS storage side.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E009
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - catalog_entry: NFS Unresponsive / Stale Handle
+    family: storage_backend_error
+    match_type: exact_mechanism
+    confidence: high
+    relationship: The case quotes stale NFS file handle during a WAL write; the underlying
+      stale-handle trigger and recovery remain unconfirmed.
+  - catalog_entry: No Metrics — Thanos Down
+    family: observability_accuracy
+    match_type: exact_symptom_only
+    confidence: medium
+    relationship: The symptom and component match, but this case's most specific mechanism
+      is a storage-backend write failure.
+  family_candidates:
+  - family: storage_backend_error
+    confidence: medium
+  - family: observability_accuracy
+    confidence: low
+  - family: k8s_storage_error
+    confidence: low
+historical_use:
+  context_class: evaluation_only
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: This administratively closed but technically unresolved case is
+    useful for recognizing a specific storage-backend signature surfacing through
+    Thanos Receive. It must not prove a current root cause or present the proposed
+    restart as a verified resolution.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

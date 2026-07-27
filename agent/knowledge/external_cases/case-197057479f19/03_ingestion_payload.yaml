@@ -1,0 +1,419 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:197057479f19
+  source_revision_hash: sha256:cc6225a3dd213583a9693e06fb282d60710cf0f700fe6c571acbf7144fbbcdd2
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: PodGroup status-update retry loop stalled node-pool transitions
+  masked_summary: Four masked workloads on Run:ai 2.23.31 stopped transitioning between
+    prioritized node pools and remained Pending after persistent PodGroup status-update
+    conflicts. Support relayed Engineering's diagnosis that the scheduler retried
+    an uncleaned update payload indefinitely, preventing the scheduling condition
+    update and Pod Group Assigner handoff. A fixed version and workaround were proposed
+    but not executed or validated before administrative closure.
+  status: unresolved
+  occurred_at: '2026-04-16'
+  resolved_at: null
+  family: runai_control_plane_error
+  family_confidence: high
+  observed_mechanism: A quoted PodGroup conflict and Support's review of unavailable
+    diagnostics showed normal node-pool transitions ending around 09:42 UTC, then
+    reconcile-only assigner activity and no matching scheduler advancement on April
+    17.
+  observed_mechanism_confidence: medium
+  confirmed_mechanism: Support relayed Engineering's conclusion that conflict handling
+    failed to clean the status-update payload, causing indefinite retry, a stale scheduling
+    condition, and stopped Pod Group Assigner transitions.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - multiple workloads remain Pending after node-pool capacity appears available
+  - primary-to-secondary node-pool transitions stop after repeated PodGroup status
+    conflicts
+  - Pod Group Assigner reconciles without handling or successful assignment
+  - stop/resume leaves the PodGroup scheduling state unchanged
+  metric_signatures: []
+  error_signatures:
+  - status_updater/concurrency.go:106 [status-updater] Failed to update pod group
+    status
+  - 'Operation cannot be fulfilled on podgroups.scheduling.run.ai "<podgroup>": the
+    object has been modified; please apply your changes to the latest version and
+    try again'
+  issue_references: []
+  canonical_component_tokens:
+  - Run:ai node-pool scheduler
+  - Pod Group Assigner
+  - PodGroup scheduling condition
+  - scheduler status updater
+  version_tokens:
+  - Run:ai control plane 2.23.31
+  - Run:ai cluster 2.23.31
+  - runai-engine 3.36.17
+  - Support-stated fix in runai-engine 3.36.27 and Run:ai cluster 2.23.66
+  trigger_tokens:
+  - PodGroup optimistic-concurrency status conflict
+  - persistent retry of uncleaned status-update payload
+  - prioritized node-pool handoff
+  retrieval_keywords:
+  - PodGroup status updater concurrency conflict
+  - Failed to update pod group status object has been modified
+  - Pod Group Assigner node-pool transition stalled
+  - scheduling condition stale after status conflict
+  - stop resume retained PodGroup state
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer reported four masked workloads remained Pending after resources
+    appeared available and after stop/resume.
+  supports:
+  - F001
+  - H001
+  - A001
+- evidence_id: E002
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer described prioritized node pools and proposed that failed
+    PodGroup status updates affected later scheduling.
+  supports:
+  - F001
+  - H001
+  - A001
+- evidence_id: E003
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Quoted scheduler text shows status_updater/concurrency.go:106 failing
+    a PodGroup status update because the object was modified.
+  supports:
+  - F002
+  - H001
+- evidence_id: E004
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Quoted scheduler text shows attempts to patch workload pods that
+    were already absent.
+  supports:
+  - H003
+- evidence_id: E005
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Quoted scheduler text shows preemption skipped for jobs judged no
+    easier to preempt for.
+  supports:
+  - H004
+- evidence_id: E006
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer referenced node-pool scheduler and full cluster diagnostics
+    absent from the local source bundle.
+  supports:
+  - F008
+- evidence_id: E007
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported no later matching primary-pool entries and repeated
+    secondary-pool errors after workload-name filtering.
+  supports:
+  - A004
+- evidence_id: E008
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer repeated the causal status-update conflict phrase in the
+    follow-up.
+  supports:
+  - F002
+- evidence_id: E009
+  source_message_ids:
+  - M003
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer stated Run:ai cluster and control-plane version 2.23.31.
+  supports:
+  - A004
+- evidence_id: E010
+  source_message_ids:
+  - M004
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Four masked per-workload diagnostic ZIP archives were referenced
+    but not locally supplied.
+  supports:
+  - F008
+  - A004
+- evidence_id: E011
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support said referenced logs showed rapid primary-to-secondary transitions
+    until approximately 09:42 UTC while both pools lacked resources.
+  supports:
+  - F003
+- evidence_id: E012
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support classified pod-not-found as benign and skipped preemption
+    as expected, while a single conflict would normally retry.
+  supports:
+  - F004
+  - H003
+  - H004
+- evidence_id: E013
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support reported transitions stopped after approximately 09:42 UTC
+    and no assigner or scheduler activity advanced the workloads on April 17.
+  supports:
+  - F003
+  - H001
+  - H002
+- evidence_id: E014
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support preliminarily proposed that persistent conflicts left the
+    scheduling condition stale and blocked node-pool handoff.
+  supports:
+  - H002
+- evidence_id: E015
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support explained that stop/resume does not reset or recreate the
+    PodGroup or its scheduling condition.
+  supports:
+  - A001
+- evidence_id: E016
+  source_message_ids:
+  - M005
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support proposed workload recreation and PodGroup schedulingConditions/label
+    inspection if recurrence occurred.
+  supports:
+  - A002
+  - A003
+- evidence_id: E017
+  source_message_ids:
+  - M007
+  source_actor: nvidia_support
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support acknowledged receiving PodGroup resources and forwarding
+    them to Engineering; the resources are not locally supplied.
+  supports:
+  - F008
+  - A005
+- evidence_id: E018
+  source_message_ids:
+  - M008
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support relayed Engineering's identification of a known bug fixed
+    in a newer version.
+  supports:
+  - F005
+  - H005
+  - A006
+- evidence_id: E019
+  source_message_ids:
+  - M008
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Relayed Engineering feedback identified uncleaned update-payload
+    retry as preventing condition update and node-pool transitions.
+  supports:
+  - F005
+  - H001
+  - H002
+- evidence_id: E020
+  source_message_ids:
+  - M008
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support stated current engine/cluster versions and fixed runai-engine
+    3.36.27 included in cluster 2.23.66.
+  supports:
+  - F006
+  - H005
+  - A006
+- evidence_id: E021
+  source_message_ids:
+  - M008
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support recommended upgrading the Run:ai cluster to 2.23.66 or later;
+    no execution or result is supplied.
+  supports:
+  - F006
+  - H005
+  - A006
+- evidence_id: E022
+  source_message_ids:
+  - M008
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support said deletion and recreation would address the immediate
+    symptom if recurrence preceded upgrade; no result is supplied.
+  supports:
+  - A002
+- evidence_id: E023
+  source_message_ids:
+  - M011
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer agreed that the case could close without reporting a technical-resolution
+    result.
+  supports:
+  - F007
+- evidence_id: E024
+  source_message_ids:
+  - M012
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support administratively closed the ticket without adding technical
+    validation.
+  supports:
+  - F007
+historical_actions:
+- action_id: A001
+  normalized_action: Stop and resume the affected workloads.
+  outcome: ineffective
+  verified: true
+  evidence_ids:
+  - E001
+  - E002
+  - E015
+- action_id: A002
+  normalized_action: Delete and recreate affected workloads to create fresh PodGroups.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E016
+  - E022
+- action_id: A003
+  normalized_action: Inspect PodGroup schedulingConditions and labels if the issue
+    recurs.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E016
+- action_id: A004
+  normalized_action: Provide filtered scheduler and Pod Group Assigner diagnostics
+    plus Run:ai versions.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E007
+  - E009
+  - E010
+- action_id: A005
+  normalized_action: Provide PodGroup resources for Engineering escalation.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E017
+- action_id: A006
+  normalized_action: Upgrade the Run:ai cluster to 2.23.66 or later.
+  outcome: unknown_outcome
+  verified: false
+  evidence_ids:
+  - E018
+  - E020
+  - E021
+knowledge_links:
+  known_issue_matches: []
+  failure_mode_matches:
+  - catalog_entry: Scheduler Or Reconcile Error
+    match_type: exact_symptom_only
+    confidence: high
+  - catalog_entry: Gang Or Pod-Group Not Scheduling
+    match_type: partial
+    confidence: medium
+  - catalog_entry: Pending — Node Pool Out Of Resources
+    match_type: partial
+    confidence: low
+  family_candidates:
+  - family: runai_control_plane_error
+    confidence: high
+  - family: runai_scheduling_quota
+    confidence: medium
+  - family: k8s_control_plane_error
+    confidence: low
+historical_use:
+  context_class: unresolved_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The case has usable causal signatures and a relayed Engineering
+    diagnosis, but no customer-executed workaround/fixed-version result. It can guide
+    investigation of matching live evidence only as unresolved labelled context.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

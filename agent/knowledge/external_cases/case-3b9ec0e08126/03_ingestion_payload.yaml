@@ -1,0 +1,427 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:3b9ec0e08126
+  source_revision_hash: sha256:c1b7365b813ed0d6d1a05962b68c2cc0fafb77a3caa83058a06233d772fc620b
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_with_warnings
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+incident:
+  title: Recurring GPU dashboard corruption after ephemeral-storage eviction and duplicate
+    pod GPU metrics
+  masked_summary: A workload with no ephemeral-storage request was diagnosed as being
+    evicted and restarted under node storage pressure. Restarted GPU pods produced
+    duplicate per-pod GPU series, runai_pod_info_unique failed with many-to-many matching,
+    and GPU dashboards became incorrect. One pod deletion temporarily restored the
+    dashboard, but the issue recurred and the proposed storage fix was not revalidated.
+  status: unresolved
+  occurred_at: '2026-01-27'
+  resolved_at: null
+  family: node_kubelet_pressure
+  family_confidence: medium
+  observed_mechanism: A quoted Prometheus failure contained two runai_pod_gpu_info_fixed
+    series for one masked pod UUID; deleting the failed pod restored the dashboard
+    once, recurrence followed, and Support later quoted an eviction with 36591904Ki
+    used and an ephemeral-storage request of zero.
+  observed_mechanism_confidence: high
+  confirmed_mechanism: Support linked a missing ephemeral-storage request to node-pressure
+    eviction and restart churn, restart churn to duplicate GPU metrics, and duplicate
+    metrics to runai_pod_info_unique failure and incorrect dashboards. Fractional
+    GPU was a likelihood-increasing factor rather than the direct cause.
+  confirmed_mechanism_confidence: medium
+searchable_context:
+  normalized_symptoms:
+  - incorrect GPU allocation and free-device values across Run:ai dashboards
+  - runai_pod_info_unique recording rule not evaluating
+  - duplicate GPU series for one pod UUID
+  - failed pods after ephemeral-storage eviction
+  - dashboard temporarily recovers after deleting an offending failed pod
+  metric_signatures:
+  - runai_pod_info_unique recording rule evaluation failure
+  - two runai_pod_gpu_info_fixed series for one pod UUID
+  - all GPU nodes displayed 8 Free GPU devices while more than 1,300 GPUs were reported
+    allocated
+  - ephemeral-storage used 36591904Ki with request 0
+  error_signatures:
+  - found duplicate series for the match group on the right hand-side of the operation
+  - many-to-many matching not allowed
+  - 'The node was low on resource: ephemeral-storage'
+  - failed finding runai-calculated-status annotation
+  issue_references:
+  - GPU Allocation Shows Zero On Dashboard
+  canonical_component_tokens:
+  - prometheus-runai
+  - metrics-exporter
+  - runai_pod_info_unique
+  - kubernetes-ephemeral-storage-eviction
+  - runai-dashboard
+  - runai-scheduler-default
+  - runai-agent
+  version_tokens:
+  - Run:ai control plane 2.22.27
+  - Run:ai cluster 2.22.27
+  trigger_tokens:
+  - missing ephemeral-storage request
+  - node low on ephemeral-storage
+  - pod eviction and restart
+  - duplicate per-pod GPU series
+  - fractional GPU label complexity
+  retrieval_keywords:
+  - runai_pod_info_unique many-to-many matching
+  - runai_pod_gpu_info_fixed duplicate series
+  - ephemeral-storage request 0
+  - GPU allocation dashboard shows incorrect free devices
+  - pod deletion temporarily restores GPU dashboard
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported more than 1,300 GPUs allocated while every node
+    displayed 8 free devices and dashboard metrics were incorrect.
+  supports:
+  - F001
+  - H002
+  - A001
+- evidence_id: E002
+  source_message_ids:
+  - M002
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: A masked Prometheus warning reported duplicate right-hand series
+    and many-to-many matching not allowed for runai_pod_info_unique.
+  supports:
+  - F001
+  - H002
+- evidence_id: E003
+  source_message_ids:
+  - M002
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Masked kubectl output showed two affected pods in 0/1 Error state.
+  supports:
+  - H002
+- evidence_id: E004
+  source_message_ids:
+  - M002
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported one full GPU requested but 0.1 GPU displayed for
+    selected workloads.
+  supports: []
+- evidence_id: E005
+  source_message_ids:
+  - M003
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support's preliminary hypothesis attributed collection failure to
+    missing runai-calculated-status annotations.
+  supports:
+  - H001
+  - A002
+- evidence_id: E006
+  source_message_ids:
+  - M003
+  source_actor: nvidia_support
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support quoted a workload-exporter failure finding the runai-calculated-status
+    annotation.
+  supports:
+  - H001
+- evidence_id: E007
+  source_message_ids:
+  - M004
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Scheduler and agent rollouts succeeded and a new pod had the annotation,
+    but the dashboard issue remained.
+  supports:
+  - F003
+  - H001
+  - A002
+- evidence_id: E008
+  source_message_ids:
+  - M005
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Two runai_pod_gpu_info_fixed series had different GPU labels for
+    the same masked pod UUID in the rule failure.
+  supports:
+  - F002
+  - H002
+  - H005
+- evidence_id: E009
+  source_message_ids:
+  - M005
+  - M007
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Deleting the specific failed pod restored the dashboard and Resources
+    to Nodes view during the companion episode.
+  supports:
+  - F004
+  - H002
+  - H005
+  - A003
+- evidence_id: E010
+  source_message_ids:
+  - M006
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support revised the diagnosis to duplicate or stale failed-workload
+    metrics breaking runai_pod_info_unique and downstream GPU allocation metrics.
+  supports:
+  - H002
+  - A004
+  - A005
+- evidence_id: E011
+  source_message_ids:
+  - M010
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported recurrence and raised rule-expression, workload-value,
+    and fractional-GPU hypotheses.
+  supports:
+  - F005
+  - H003
+  - H005
+- evidence_id: E012
+  source_message_ids:
+  - M010
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer referenced affected-workload details, completed jobs, and
+    latest logs that are not locally supplied.
+  supports:
+  - F009
+- evidence_id: E013
+  source_message_ids:
+  - M012
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer reported attaching additional workload dumps requested
+    by Support; the files are not locally supplied.
+  supports:
+  - F009
+  - A006
+- evidence_id: E014
+  source_message_ids:
+  - M013
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support's final diagnosis said the affected workload configuration
+    omitted an ephemeral-storage request.
+  supports:
+  - F006
+  - H003
+- evidence_id: E015
+  source_message_ids:
+  - M013
+  source_actor: nvidia_support
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support quoted a node-low ephemeral-storage eviction showing 36591904Ki
+    used with request zero.
+  supports:
+  - F006
+  - H003
+- evidence_id: E016
+  source_message_ids:
+  - M013
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: referenced_not_supplied
+  masked_summary: Support reported approximately 36GB use per examined job and approximately
+    93 percent eviction-related failure.
+  supports:
+  - F006
+  - H003
+- evidence_id: E017
+  source_message_ids:
+  - M013
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support linked missing storage request to eviction and restart,
+    duplicate GPU metrics, many-to-many rule failure, and incorrect dashboard data.
+  supports:
+  - F007
+  - H003
+  - H005
+- evidence_id: E018
+  source_message_ids:
+  - M014
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer accepted the eviction explanation and asked whether fractional
+    GPU sharing was the duplicate source.
+  supports:
+  - H004
+- evidence_id: E019
+  source_message_ids:
+  - M015
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support said restart causes duplicates for full or fractional GPU
+    pods and that sharing itself is not the direct cause.
+  supports:
+  - F007
+  - H003
+  - H004
+  - H005
+- evidence_id: E020
+  source_message_ids:
+  - M016
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer requested closure without reporting storage-fix execution,
+    limited retest, or non-recurrence.
+  supports:
+  - F008
+- evidence_id: E021
+  source_message_ids:
+  - M013
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: quoted_in_transcript
+  masked_summary: Support proposed stopping new jobs, bulk cleanup, Prometheus recovery,
+    40Gi request, 50Gi limit, and limited job retesting.
+  supports:
+  - A005
+  - A007
+  - A008
+  - A009
+  - A010
+historical_actions:
+- action_id: A001
+  normalized_action: Collect screenshots and runai-adm diagnostics for the initial
+    dashboard episode.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E001
+- action_id: A002
+  normalized_action: Restart runai-scheduler-default and runai-agent to restore annotation
+    injection.
+  outcome: ineffective
+  verified: true
+  evidence_ids:
+  - E005
+  - E007
+- action_id: A003
+  normalized_action: Delete the specific failed pod associated with duplicate series.
+  outcome: mitigating
+  verified: true
+  evidence_ids:
+  - E009
+- action_id: A004
+  normalized_action: Delete the failed workload and its remaining pods.
+  outcome: mitigating
+  verified: false
+  evidence_ids:
+  - E010
+- action_id: A005
+  normalized_action: Restart Prometheus, check rule logs, and verify dashboard recovery.
+  outcome: mitigating
+  verified: false
+  evidence_ids:
+  - E010
+  - E021
+- action_id: A006
+  normalized_action: Collect additional workload dump archives for several affected
+    workloads.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E013
+- action_id: A007
+  normalized_action: Stop new job creation and bulk-delete failed pods before recovering
+    Prometheus.
+  outcome: mitigating
+  verified: false
+  evidence_ids:
+  - E021
+- action_id: A008
+  normalized_action: Add a 40Gi ephemeral-storage request and 50Gi limit to the workload
+    template.
+  outcome: resolving
+  verified: false
+  evidence_ids:
+  - E021
+- action_id: A009
+  normalized_action: Test two or three corrected jobs for successful completion without
+    eviction before resuming the pipeline.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E021
+- action_id: A010
+  normalized_action: Monitor Prometheus for absence of further many-to-many errors
+    after cleanup.
+  outcome: diagnostic
+  verified: false
+  evidence_ids:
+  - E021
+knowledge_links:
+  known_issue_matches:
+  - GPU Allocation Shows Zero On Dashboard; partial because the downstream duplicate-metric
+    episode matches but the follow-up storage-pressure chain and permanent fix are
+    not fully covered or revalidated
+  failure_mode_matches:
+  - No Space Left On Device; partial node_kubelet_pressure match for ephemeral-storage
+    pressure without supplied filesystem diagnostics
+  family_candidates:
+  - family: node_kubelet_pressure
+    confidence: medium
+  - family: observability_accuracy
+    confidence: high
+  - family: workload_startup_error
+    confidence: low
+historical_use:
+  context_class: unresolved_context
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - action_reference
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: The downstream duplicate-series mechanism and temporary mitigation
+    are well supported, but the deeper storage diagnosis relies on unavailable workload
+    dumps and the proposed permanent configuration change has no reported execution
+    or validation.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false

@@ -120,6 +120,24 @@ def test_logql_empty_selector_rejected_before_loki() -> None:
         assert sanitized == "" and error and "selector" in error, query
 
 
+def test_promql_range_on_expression_rejected_locally() -> None:
+    # Prometheus rejects a [range] on an expression with HTTP 400 ("ranges only
+    # allowed for vector selectors"); catch it before burning a drill-down step.
+    for query in (
+        'sum(rate(container_memory_usage_bytes[5m]))[10m]',
+        '(metric_a + metric_b)[5m]',
+    ):
+        sanitized, error = drilldown._sanitize_metric_query(query, "promql_query")
+        assert sanitized == "" and error and "vector selector" in error, query
+    for query in (
+        'rate(container_memory_usage_bytes{namespace="runai"}[5m])',
+        'sum(rate(x[5m]))',
+        'max_over_time(rate(x[5m])[10m:1m])',  # subquery: legal
+    ):
+        _, error = drilldown._sanitize_metric_query(query, "promql_query")
+        assert error is None, (query, error)
+
+
 def test_logql_anchored_selectors_pass() -> None:
     for query in (
         '{namespace="runai"} |= "error"',

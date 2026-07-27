@@ -1,0 +1,330 @@
+payload_schema_version: '2.0'
+payload_kind: historical_incident_candidate
+identity:
+  source_system: enterprise_support
+  deduplication_key: enterprise_support:239ee9638d98
+  source_revision_hash: sha256:992958d773195f83df4c0208418fa8d1f5409bb8a37b50337ed3415994c31219
+  source_revision_hash_status: computed_from_canonical_manifest
+  source_revision_hash_algorithm: sha256
+  source_revision_hash_scope: canonical_supplied_bundle_manifest_v1
+  curation_revision: 1
+approval:
+  curation_decision: approved_for_ingestion_after_human_review
+  user_approval_required: true
+  user_approved_at: null
+  approved_by: null
+  human_review: 'semantic_diff_review vs ''Distributed Training Locked hostPath Policy
+    Rejected In UI'': entry enriched (2.23.39 claimed fix ineffective, API workaround);
+    case kept as resolved prior'
+incident:
+  title: Distributed training Web UI rejected locked master hostPath policy on Run:ai
+    2.23.x
+  masked_summary: A distributed training Web UI submission was rejected at masterSpec.storage.hostPath
+    under the tested locked-policy and master-toggle conditions on 2.23.30, 2.23.31,
+    and 2.23.39, while API or CLI submission succeeded; customer validation showed
+    UI and API success on 2.23.60.
+  status: resolved
+  occurred_at: '2026-02-02'
+  resolved_at: '2026-03-23'
+  family: runai_control_plane_error
+  family_confidence: high
+  observed_mechanism: The Web UI path rejected the distributed workload at masterSpec.storage.hostPath
+    when the master-setup toggle was enabled under the tested policy conditions; the
+    API or CLI path and toggle-disabled UI path succeeded.
+  observed_mechanism_confidence: high
+  confirmed_mechanism: null
+  confirmed_mechanism_confidence: low
+searchable_context:
+  normalized_symptoms:
+  - Distributed training Web UI submission rejected by policy
+  - Locked master hostPath field named in rejection
+  - API or CLI submission succeeds while Web UI fails
+  - Master-setup toggle enabled reproduces the failure
+  metric_signatures: []
+  error_signatures:
+  - The administrator prohibited modifying
+  - masterSpec.storage.hostPath
+  issue_references: []
+  canonical_component_tokens:
+  - Run:ai distributed training Web UI
+  - Run:ai distributed workload API
+  - masterSpec.storage.hostPath policy enforcement
+  version_tokens:
+  - Run:ai 2.22.27
+  - Run:ai 2.23.30
+  - Run:ai 2.23.31
+  - Run:ai 2.23.39
+  - Run:ai 2.23.60
+  trigger_tokens:
+  - rules.master.storage.hostPath.instances.locked
+  - Allow different setup for the master
+  - masterSpecSameAsWorker
+  retrieval_keywords:
+  - distributed training locked hostPath policy
+  - administrator prohibited modifying
+  - masterSpec.storage.hostPath
+  - Web UI versus CLI or API
+  - Allow different setup for the master
+  - Run:ai 2.23.x
+evidence_refs:
+- evidence_id: E001
+  source_message_ids:
+  - M001
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: Web UI submission with a locked master hostPath policy was rejected
+    and the named storage item varied.
+  supports:
+  - F001
+- evidence_id: E003
+  source_message_ids:
+  - M007
+  source_actor: customer
+  evidence_kind: transcript_quote
+  artifact_availability: quoted_in_transcript
+  masked_summary: A minimal locked-hostPath policy still failed while the master-setup
+    toggle was enabled and not modifiable.
+  supports:
+  - F001
+  - A003
+- evidence_id: E006
+  source_message_ids:
+  - M008
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support called the behavior unexpected and proposed an API test
+    to distinguish the UI path.
+  supports:
+  - H002
+  - A002
+- evidence_id: E007
+  source_message_ids:
+  - M009
+  - M010
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: API submission with masterSpec omitted succeeded and was accepted
+    as an interim workaround.
+  supports:
+  - F002
+  - H002
+  - A002
+- evidence_id: E009
+  source_message_ids:
+  - M014
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support stated that an internal check showed a fix in 2.23.39.
+  supports:
+  - F005
+  - H004
+  - A006
+- evidence_id: E010
+  source_message_ids:
+  - M016
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer's corrected hypothesis related differing master and worker
+    configuration and the enabled toggle to the error on 2.23.30 and 2.23.39.
+  supports:
+  - F003
+  - H003
+  - A006
+- evidence_id: E011
+  source_message_ids:
+  - M017
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Disabling the master-setup toggle allowed UI submission; enabling
+    it prevented creation.
+  supports:
+  - F003
+  - H002
+  - H003
+  - A004
+- evidence_id: E012
+  source_message_ids:
+  - M019
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Same-policy API or CLI submission worked on 2.23.31 while Web UI
+    submission failed.
+  supports:
+  - F002
+  - H002
+  - H003
+  - A005
+- evidence_id: E014
+  source_message_ids:
+  - M022
+  - M024
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer reported 2.22.27 UI and CLI success, 2.23.30 through 2.23.39
+    UI failure, and CLI success on the affected versions.
+  supports:
+  - F004
+  - H002
+  - H005
+  - A006
+  - A007
+- evidence_id: E015
+  source_message_ids:
+  - M027
+  - M028
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support relayed that Engineering assistance appeared to find an
+    issue and that a 2.23 fix was in progress.
+  supports:
+  - F006
+  - H005
+- evidence_id: E016
+  source_message_ids:
+  - M030
+  - M031
+  source_actor: nvidia_support
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Support first projected 2.23.58 and then requested testing of available
+    2.23.60.
+  supports:
+  - F006
+  - A009
+- evidence_id: E017
+  source_message_ids:
+  - M032
+  source_actor: customer
+  evidence_kind: diagnostic_outcome
+  artifact_availability: quoted_in_transcript
+  masked_summary: Customer confirmed successful UI and CLI or API submission on 2.23.60,
+    including API success with masterSpecSameAsWorker false.
+  supports:
+  - F006
+  - F007
+  - H005
+  - A009
+- evidence_id: E018
+  source_message_ids:
+  - M033
+  source_actor: customer
+  evidence_kind: attachment_reference
+  artifact_availability: referenced_not_supplied
+  masked_summary: Customer attached an API test file and two recordings for the 2.23.60
+    validation.
+  supports:
+  - A009
+- evidence_id: E019
+  source_message_ids:
+  - M034
+  - M035
+  source_actor: customer
+  evidence_kind: statement
+  artifact_availability: not_applicable
+  masked_summary: Customer agreed that the case could be closed after Support requested
+    resolution confirmation.
+  supports:
+  - F007
+historical_actions:
+- action_id: A001
+  normalized_action: Collect and attach cluster diagnostics.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E005
+- action_id: A002
+  normalized_action: Submit through the API with masterSpecSameAsWorker true and masterSpec
+    omitted.
+  outcome: mitigating
+  verified: true
+  evidence_ids:
+  - E006
+  - E007
+- action_id: A003
+  normalized_action: Reproduce the UI failure with a minimal locked-hostPath policy.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E003
+- action_id: A004
+  normalized_action: Disable the master-setup toggle in a template before UI submission.
+  outcome: mitigating
+  verified: true
+  evidence_ids:
+  - E011
+- action_id: A005
+  normalized_action: Compare same-policy API or CLI and Web UI submission on 2.23.31.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E012
+- action_id: A006
+  normalized_action: Test the claimed 2.23.39 fix with the affected UI scenario.
+  outcome: ineffective
+  verified: true
+  evidence_ids:
+  - E009
+  - E010
+  - E014
+- action_id: A007
+  normalized_action: Re-test 2.22.27 after matching worker-environment security settings.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E014
+- action_id: A008
+  normalized_action: Supply the latest cross-version policy for Engineering reproduction.
+  outcome: diagnostic
+  verified: true
+  evidence_ids:
+  - E004
+- action_id: A009
+  normalized_action: Test the available 2.23.60 build through UI and CLI or API.
+  outcome: resolving
+  verified: true
+  evidence_ids:
+  - E016
+  - E017
+  - E018
+knowledge_links:
+  known_issue_matches:
+  - Distributed Training Locked hostPath Policy Rejected In UI — exact repository
+    coverage match that directly references this case; not used as evidence
+  failure_mode_matches: []
+  family_candidates:
+  - family: runai_control_plane_error
+    confidence: high
+  - family: platform_lifecycle_change
+    confidence: low
+  - family: k8s_storage_error
+    confidence: low
+historical_use:
+  context_class: evaluation_only
+  allowed_uses:
+  - retrieval_context
+  - investigation_planning
+  - hypothesis_generation
+  - regression_evaluation
+  prohibited_uses:
+  - current_root_cause_proof
+  - automatic_action_execution
+  - positive_promotion
+  - verified_resolution_claim
+  usage_rationale: Retain only for semantic comparison and regression evaluation because
+    the exact internal mechanism is undisclosed and the maintained known-issue catalog
+    already directly references this case and mechanism.
+privacy:
+  source_sensitive_data_detected: true
+  payload_masking_status: masked
+  payload_contains_raw_logs: false
+  payload_contains_secrets: false
+  payload_contains_personal_data: false
