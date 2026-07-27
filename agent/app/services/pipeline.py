@@ -44,7 +44,6 @@ from app.knowledge import (
     runtime_shadow_hints,
 )
 from app.llm import (
-    complete,
     complete_json,
     complete_with_error,
     llm_configured,
