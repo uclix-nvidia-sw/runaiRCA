@@ -44,6 +44,20 @@ class RuntimeKnowledgeValidationResponse(BaseModel):
     normalized: dict[str, Any] | None = None
 
 
+class KnowledgeActionRefineRequest(BaseModel):
+    """Backend request to generalize operator remediation text for reuse."""
+
+    family: str = ""
+    mechanism: str = ""
+    actions: list[str]
+    context: dict[str, str] = Field(default_factory=dict)
+
+
+class KnowledgeActionRefineResponse(BaseModel):
+    actions: list[str]
+    refined: bool = False
+
+
 class PreviousAnalysisContext(BaseModel):
     status: str
     summary: str

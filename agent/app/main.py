@@ -23,8 +23,11 @@ from app.schemas import (
     ChatResponse,
     IncidentSummaryRequest,
     IncidentSummaryResponse,
+    KnowledgeActionRefineRequest,
+    KnowledgeActionRefineResponse,
     RuntimeKnowledgeValidationResponse,
 )
+from app.services.knowledge_refine import refine_actions
 from app.services.orchestrator import AnalysisOrchestrator
 
 
@@ -166,6 +169,21 @@ def healthz() -> dict[str, object]:
 def validate_knowledge(payload: dict[str, object]) -> dict[str, object]:
     """Internal, read-only contract check for compiled runtime knowledge."""
     return validate_runtime_knowledge(payload)
+
+
+@app.post("/knowledge/refine-actions", response_model=KnowledgeActionRefineResponse)
+async def refine_knowledge_actions(
+    request: KnowledgeActionRefineRequest,
+) -> KnowledgeActionRefineResponse:
+    """Rewrite operator remediation text into instance-free, reusable actions."""
+    actions, refined = await refine_actions(
+        settings,
+        family=request.family,
+        mechanism=request.mechanism,
+        actions=request.actions,
+        context=request.context,
+    )
+    return KnowledgeActionRefineResponse(actions=actions, refined=refined)
 
 
 @app.get("/knowledge/families")

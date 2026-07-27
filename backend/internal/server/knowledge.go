@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -385,6 +386,156 @@ func operatorConfirmedActions(card map[string]any) []string {
 		}
 	}
 	return actions
+}
+
+// singleCompiledSymptom returns the learned symptom map when the payload
+// compiles exactly one failure mode with one symptom — the only shape learned
+// candidates produce. Anything else is not an editable learned candidate.
+func singleCompiledSymptom(payload map[string]any) (map[string]any, bool) {
+	compiled, _ := payload["compiled"].(map[string]any)
+	modes, _ := compiled["failure_modes"].([]any)
+	var found map[string]any
+	count := 0
+	for _, rawMode := range modes {
+		mode, ok := rawMode.(map[string]any)
+		if !ok {
+			continue
+		}
+		symptoms, _ := mode["symptoms"].([]any)
+		for _, rawSymptom := range symptoms {
+			symptom, ok := rawSymptom.(map[string]any)
+			if !ok {
+				continue
+			}
+			count++
+			found = symptom
+		}
+	}
+	if count != 1 {
+		return nil, false
+	}
+	return found, true
+}
+
+func compiledCandidateActions(payload map[string]any) ([]string, bool) {
+	symptom, ok := singleCompiledSymptom(payload)
+	if !ok {
+		return nil, false
+	}
+	return sanitizeStringSlice(symptom["actions"]), true
+}
+
+// EditKnowledgeCandidateActions lets a reviewer curate the remediation wording
+// of a ready candidate before activation. Evidence, keywords, mechanism, and
+// identity (fingerprint/content hash) stay immutable — the content hash keeps
+// identifying the snapshot-derived compilation, so approval's revalidation
+// still passes and the curated wording ships in the published package.
+func (s *Store) EditKnowledgeCandidateActions(id string, actions []string, actor string) (KnowledgeCandidate, error) {
+	trimmed := make([]string, 0, len(actions))
+	for _, action := range actions {
+		action = strings.TrimSpace(action)
+		if action == "" {
+			continue
+		}
+		if len(action) > 2000 {
+			return KnowledgeCandidate{}, errors.New("action text is too long")
+		}
+		trimmed = append(trimmed, action)
+	}
+	if len(trimmed) == 0 || len(trimmed) > 10 {
+		return KnowledgeCandidate{}, errors.New("between 1 and 10 non-empty actions are required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate := s.knowledgeCandidates[id]
+	if candidate == nil {
+		return KnowledgeCandidate{}, errors.New("knowledge candidate not found")
+	}
+	if candidate.Status != knowledgeCandidateReady {
+		return KnowledgeCandidate{}, errors.New("only a ready-for-review candidate can be edited")
+	}
+	if !s.applyKnowledgeCandidateActionsLocked(candidate, trimmed, knowledgeActor(actor), "candidate_actions_edited", "reviewer curated remediation actions") {
+		return KnowledgeCandidate{}, errors.New("could not persist candidate action edit")
+	}
+	return cloneKnowledgeCandidate(candidate), nil
+}
+
+// RefineKnowledgeCandidateActions applies the LLM's instance-free rewrite, but
+// only while the candidate still carries exactly the actions the refiner saw —
+// a concurrent human edit always wins. Applying an unchanged list still stamps
+// the curation marker so the refiner is never re-invoked for this candidate.
+func (s *Store) RefineKnowledgeCandidateActions(id string, expected, refined []string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate := s.knowledgeCandidates[id]
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		return false
+	}
+	current, ok := compiledCandidateActions(candidate.Payload)
+	if !ok || !slices.Equal(current, expected) {
+		return false
+	}
+	return s.applyKnowledgeCandidateActionsLocked(candidate, refined, "llm-refiner", "candidate_actions_refined", "instance identifiers generalized for reuse")
+}
+
+// KnowledgeCandidatesPendingActionRefinement lists ready candidates whose
+// actions have not been curated yet (neither LLM-refined nor human-edited).
+func (s *Store) KnowledgeCandidatesPendingActionRefinement() []KnowledgeCandidate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []KnowledgeCandidate{}
+	for _, candidate := range s.knowledgeCandidates {
+		if candidate == nil || candidate.Status != knowledgeCandidateReady {
+			continue
+		}
+		if provenance, ok := candidate.Payload["provenance"].(map[string]any); ok {
+			if _, curated := provenance["actions_curated_by"]; curated {
+				continue
+			}
+		}
+		if actions, ok := compiledCandidateActions(candidate.Payload); !ok || len(actions) == 0 {
+			continue
+		}
+		out = append(out, cloneKnowledgeCandidate(candidate))
+	}
+	return out
+}
+
+func (s *Store) applyKnowledgeCandidateActionsLocked(candidate *KnowledgeCandidate, actions []string, actor, eventType, note string) bool {
+	updated := cloneKnowledgeCandidate(candidate)
+	symptom, ok := singleCompiledSymptom(updated.Payload)
+	if !ok {
+		return false
+	}
+	previous := sanitizeStringSlice(symptom["actions"])
+	actionValues := make([]any, 0, len(actions))
+	for _, action := range actions {
+		actionValues = append(actionValues, action)
+	}
+	symptom["actions"] = actionValues
+	provenance, _ := updated.Payload["provenance"].(map[string]any)
+	if provenance == nil {
+		provenance = map[string]any{}
+		updated.Payload["provenance"] = provenance
+	}
+	if _, ok := provenance["raw_actions"]; !ok {
+		rawValues := make([]any, 0, len(previous))
+		for _, action := range previous {
+			rawValues = append(rawValues, action)
+		}
+		provenance["raw_actions"] = rawValues
+	}
+	provenance["actions_curated_by"] = actor
+	now := time.Now().UTC()
+	updated.UpdatedAt = now
+	hydrateKnowledgeCandidate(&updated)
+	event := s.newKnowledgeEventLocked(updated.CandidateID, "", eventType, actor, note, now)
+	if !s.persistKnowledgeCandidateActionsLocked(&updated, event) {
+		return false
+	}
+	*candidate = updated
+	s.knowledgeEvents[event.EventID] = event
+	return true
 }
 
 // compiledKnowledgePayload is intentionally a narrow public representation.

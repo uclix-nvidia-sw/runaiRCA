@@ -57,6 +57,10 @@ func (s *Server) handleAnalysisRunEvaluation(w http.ResponseWriter, r *http.Requ
 			writeError(w, http.StatusNotFound, "analysis run not found")
 			return
 		}
+		// A resolved/mitigated review is the common path that mints a knowledge
+		// candidate (generateKnowledgeCandidateForReviewedRunLocked); generalize
+		// its verbatim operator actions off the request path.
+		go s.refineKnowledgeCandidateActions()
 		writeJSON(w, http.StatusOK, envelope(review))
 	default:
 		writeError(w, http.StatusNotFound, "unknown analysis run evaluation")

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import {
   decideKnowledgeCandidate,
+  editKnowledgeCandidateActions,
   fetchKnowledgeCandidates,
   fetchKnowledgePackages,
   fetchProbeMetrics,
@@ -112,14 +113,27 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
     : undefined;
 
   const decide = async (candidate: KnowledgeCandidate, action: CandidateAction) => {
-    const label = action === 'approve' ? 'approve' : 'reject';
-    if (!window.confirm(`${label[0].toUpperCase()}${label.slice(1)} this incident-derived knowledge candidate?`)) return;
+    const label = decisionConfirmLabel(action);
+    if (!window.confirm(`${label} this incident-derived knowledge candidate?`)) return;
     setBusyID(candidate.candidate_id);
     try {
       await decideKnowledgeCandidate(candidate.candidate_id, action);
       await load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : `Could not ${label} candidate.`);
+      setError(err instanceof Error ? err.message : `Could not ${label.toLowerCase()} candidate.`);
+    } finally {
+      setBusyID('');
+    }
+  };
+
+  const editActions = async (candidate: KnowledgeCandidate, actions: string[]) => {
+    setBusyID(candidate.candidate_id);
+    try {
+      await editKnowledgeCandidateActions(candidate.candidate_id, actions);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not save candidate actions.');
+      throw err;
     } finally {
       setBusyID('');
     }
@@ -227,7 +241,7 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
 
         <section className="knowledge-panel candidate-detail-panel">
           {selected ? (
-            <CandidateDetail candidate={selected} matchingPackage={matchingPackage} busy={busyID === selected.candidate_id} onDecide={decide} />
+            <CandidateDetail key={selected.candidate_id} candidate={selected} matchingPackage={matchingPackage} busy={busyID === selected.candidate_id} onDecide={decide} onEditActions={editActions} />
           ) : (
             <EmptyState text="Select a candidate to inspect its evidence and provenance." />
           )}
@@ -292,20 +306,30 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
   );
 }
 
+// Confirm-dialog verb per decision. 'approve' publishes an active package, so
+// it confirms as Activate — and shadow/activate must never read as Reject.
+export function decisionConfirmLabel(action: CandidateAction): string {
+  return { approve: 'Activate', shadow: 'Shadow', activate: 'Activate', reject: 'Reject' }[action];
+}
+
 export function CandidateDetail({
   candidate,
   matchingPackage,
   busy,
   onDecide,
+  onEditActions,
 }: {
   candidate: KnowledgeCandidate;
   matchingPackage?: KnowledgePackage;
   busy: boolean;
   onDecide: (candidate: KnowledgeCandidate, action: CandidateAction) => Promise<void>;
+  onEditActions?: (candidate: KnowledgeCandidate, actions: string[]) => Promise<void>;
 }) {
   const evidence = candidate.evidence_summaries ?? [];
   const canReview = candidate.status === 'ready_for_review';
   const canActivate = candidate.status === 'shadow';
+  const [editingActions, setEditingActions] = useState(false);
+  const [draftActions, setDraftActions] = useState('');
   // Reviewers judge the knowledge CHAIN (symptoms → cause → family, plus the
   // confirmed action and the diagnostic probes that backed it), so those lead
   // the grid. Analysis hash, case/run ids, and the promotion path are backend
@@ -316,6 +340,9 @@ export function CandidateDetail({
   const mechanism = candidate.payload?.mechanism || symptoms[0]?.name || '';
   const confirmedActions = symptoms.flatMap((symptom) => symptom.actions ?? []);
   const observedKeywords = Array.from(new Set(symptoms.flatMap((symptom) => symptom.keywords ?? [])));
+  const rawActions = Array.isArray(candidate.provenance?.raw_actions)
+    ? (candidate.provenance?.raw_actions as unknown[]).map((value) => String(value)).filter(Boolean)
+    : [];
   const diagnosticSteps = (candidate.probe_template_ids ?? []).map((templateId) => {
     const execution = candidate.trace?.probe_executions?.find((probe) => probe.template_id === templateId);
     const parts = templateId.split(':');
@@ -349,9 +376,54 @@ export function CandidateDetail({
           </div>
           <div>
             <dt>Confirmed actions</dt>
-            <dd>{confirmedActions.length > 0
-              ? confirmedActions.join(' · ')
-              : 'none recorded — add the effective action in the evaluation review'}</dd>
+            <dd>
+              {editingActions ? (
+                <span className="knowledge-action-editor">
+                  <textarea
+                    aria-label="Confirmed actions, one per line"
+                    rows={3}
+                    value={draftActions}
+                    onChange={(event) => setDraftActions(event.target.value)}
+                  />
+                  <span className="knowledge-action-editor-buttons">
+                    <button
+                      className="primary-button"
+                      disabled={busy}
+                      type="button"
+                      onClick={() => {
+                        const next = draftActions.split('\n').map((line) => line.trim()).filter(Boolean);
+                        if (next.length === 0 || !onEditActions) return;
+                        void onEditActions(candidate, next).then(() => setEditingActions(false)).catch(() => undefined);
+                      }}
+                    >
+                      {busy ? 'Saving…' : 'Save actions'}
+                    </button>
+                    <button className="ghost-button" type="button" onClick={() => setEditingActions(false)}>Cancel</button>
+                  </span>
+                </span>
+              ) : (
+                <>
+                  {confirmedActions.length > 0
+                    ? confirmedActions.join(' · ')
+                    : 'none recorded — add the effective action in the evaluation review'}
+                  {canReview && onEditActions && (
+                    <button
+                      className="ghost-button knowledge-action-edit"
+                      type="button"
+                      onClick={() => {
+                        setDraftActions(confirmedActions.join('\n'));
+                        setEditingActions(true);
+                      }}
+                    >
+                      Edit
+                    </button>
+                  )}
+                </>
+              )}
+              {rawActions.length > 0 && rawActions.join(' ') !== confirmedActions.join(' ') && (
+                <small className="knowledge-raw-actions">Operator&apos;s original: {rawActions.join(' · ')}</small>
+              )}
+            </dd>
           </div>
           <div>
             <dt>Diagnostic steps</dt>

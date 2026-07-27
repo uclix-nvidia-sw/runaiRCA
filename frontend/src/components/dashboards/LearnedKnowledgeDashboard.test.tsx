@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
 import type { KnowledgeCandidate } from '../../types';
-import { CandidateDetail, IngestionPreview } from './LearnedKnowledgeDashboard';
+import { CandidateDetail, decisionConfirmLabel, IngestionPreview } from './LearnedKnowledgeDashboard';
 
 function candidate(overrides: Partial<KnowledgeCandidate> = {}): KnowledgeCandidate {
   return {
@@ -104,5 +104,27 @@ describe('CandidateDetail', () => {
     const noActions = candidate();
     noActions.payload!.compiled!.failure_modes![0].symptoms![0].actions = [];
     expect(render(noActions)).toContain('add the effective action in the evaluation review');
+  });
+
+  it('offers action editing during review and shows the operator original after curation', () => {
+    const curated = candidate({
+      provenance: { raw_actions: ['kubectl get secret nonexistent-secret -n default'], actions_curated_by: 'llm-refiner' },
+    });
+    const markup = renderToStaticMarkup(
+      <CandidateDetail candidate={curated} busy={false} onDecide={async () => {}} onEditActions={async () => {}} />,
+    );
+    expect(markup).toContain('>Edit<');
+    expect(markup).toContain('kubectl get secret nonexistent-secret -n default');
+    // Without an edit handler the control stays hidden.
+    expect(render(curated)).not.toContain('>Edit<');
+  });
+});
+
+describe('decisionConfirmLabel', () => {
+  it('never confirms shadow or activate as a rejection', () => {
+    expect(decisionConfirmLabel('approve')).toBe('Activate');
+    expect(decisionConfirmLabel('shadow')).toBe('Shadow');
+    expect(decisionConfirmLabel('activate')).toBe('Activate');
+    expect(decisionConfirmLabel('reject')).toBe('Reject');
   });
 });

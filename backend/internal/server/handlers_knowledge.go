@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -85,6 +86,10 @@ func (s *Server) handleKnowledge(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(parts) == 2 && parts[1] == "decision" && r.Method == http.MethodPost {
 			s.handleKnowledgeCandidateDecision(w, r, parts[0])
+			return
+		}
+		if len(parts) == 2 && parts[1] == "actions" && r.Method == http.MethodPost {
+			s.handleKnowledgeCandidateActionsEdit(w, r, parts[0])
 			return
 		}
 	}
@@ -315,6 +320,112 @@ func (s *Server) validateKnowledgeCandidate(id string) error {
 		return errKnowledgeValidatorRejected
 	}
 	return nil
+}
+
+type knowledgeActionsEditPayload struct {
+	Actions []string `json:"actions"`
+	Actor   string   `json:"actor,omitempty"`
+}
+
+// handleKnowledgeCandidateActionsEdit lets a reviewer curate the remediation
+// wording before activation. Only the action list is writable; evidence,
+// keywords, mechanism, and identity remain immutable.
+func (s *Server) handleKnowledgeCandidateActionsEdit(w http.ResponseWriter, r *http.Request, id string) {
+	var request knowledgeActionsEditPayload
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxJSONBodyBytes))
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid candidate actions payload")
+		return
+	}
+	candidate, err := s.store.EditKnowledgeCandidateActions(id, request.Actions, request.Actor)
+	if err != nil {
+		if strings.Contains(err.Error(), "required") || strings.Contains(err.Error(), "too long") {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		knowledgeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(candidate))
+}
+
+// refineKnowledgeCandidateActions rewrites freshly generated candidates'
+// operator-recorded actions into instance-free wording via the Agent. Fire and
+// forget from an approve/evaluation request: on any failure the verbatim
+// actions stay and the reviewer can edit them by hand. The provenance curation
+// marker keeps this idempotent.
+func (s *Server) refineKnowledgeCandidateActions() {
+	for _, candidate := range s.store.KnowledgeCandidatesPendingActionRefinement() {
+		actions, ok := compiledCandidateActions(candidate.Payload)
+		if !ok || len(actions) == 0 {
+			continue
+		}
+		refined, err := s.callKnowledgeActionRefiner(candidate, actions)
+		if err != nil {
+			log.Printf("knowledge action refinement skipped for %s: %v", candidate.CandidateID, err)
+			continue
+		}
+		// A stale result (the reviewer edited meanwhile) is silently discarded.
+		s.store.RefineKnowledgeCandidateActions(candidate.CandidateID, actions, refined)
+	}
+}
+
+func (s *Server) callKnowledgeActionRefiner(candidate KnowledgeCandidate, actions []string) ([]string, error) {
+	base := strings.TrimRight(s.knowledgeValidatorURL, "/")
+	if base == "" || s.client == nil {
+		return nil, errors.New("agent is not configured")
+	}
+	contextValues := map[string]string{}
+	if raw, ok := candidate.Payload["context"].(map[string]any); ok {
+		for key, value := range raw {
+			if text := strings.TrimSpace(stringValue(value)); text != "" {
+				contextValues[key] = text
+			}
+		}
+	}
+	body := mustJSON(map[string]any{
+		"family":    candidate.RootCauseFamily,
+		"mechanism": stringValue(candidate.Payload["mechanism"]),
+		"actions":   actions,
+		"context":   contextValues,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/knowledge/refine-actions", strings.NewReader(string(body)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	response, err := s.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		return nil, errors.New("refiner unavailable")
+	}
+	var result struct {
+		Actions []string `json:"actions"`
+		Refined bool     `json:"refined"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	if !result.Refined {
+		return actions, nil
+	}
+	if len(result.Actions) != len(actions) {
+		return nil, errors.New("refiner returned a mismatched action list")
+	}
+	refined := make([]string, 0, len(result.Actions))
+	for _, action := range result.Actions {
+		action = strings.TrimSpace(action)
+		if action == "" {
+			return nil, errors.New("refiner returned an empty action")
+		}
+		refined = append(refined, action)
+	}
+	return refined, nil
 }
 
 func (s *Server) handleKnowledgePackageRetirement(w http.ResponseWriter, r *http.Request, id string) {

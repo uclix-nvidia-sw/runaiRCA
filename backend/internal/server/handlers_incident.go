@@ -450,6 +450,12 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 		s.store.invalidateRecurrenceStatsLocked()
 		s.store.mu.Unlock()
 		s.hub.Broadcast(incidentResolvedEvent(id, status, resolvedAt, userApprovedAt))
+		if userApprovedAt != nil {
+			// Approval may have minted a knowledge candidate whose actions are the
+			// operator's verbatim, instance-specific text. Generalize them off the
+			// request path; failures leave the originals for manual curation.
+			go s.refineKnowledgeCandidateActions()
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": status, "user_approved_at": userApprovedAt})
 	case "archive", "unarchive", "restore":
 		if len(parts) != 2 || r.Method != http.MethodPost {

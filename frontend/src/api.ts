@@ -311,6 +311,15 @@ export async function decideKnowledgeCandidate(id: string, action: 'approve' | '
   });
 }
 
+// Only the remediation wording is writable during review; evidence, keywords,
+// mechanism, and identity stay immutable on the backend.
+export async function editKnowledgeCandidateActions(id: string, actions: string[]): Promise<void> {
+  await write(`/api/v1/knowledge-candidates/${encodeURIComponent(id)}/actions`, {
+    actions,
+    actor: feedbackActorID(),
+  });
+}
+
 export async function fetchKnowledgePackages(): Promise<KnowledgePackage[]> {
   return (await read<Envelope<KnowledgePackage[]>>('/api/v1/knowledge-packages')).data;
 }
