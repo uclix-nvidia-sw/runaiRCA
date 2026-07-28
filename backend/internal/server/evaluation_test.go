@@ -290,7 +290,7 @@ func TestMatchingReviewDoesNotEraseAgentSemanticValidationFailure(t *testing.T) 
 	if candidate == nil {
 		t.Fatal("matching review did not generate a candidate")
 	}
-	failed, err := store.FailKnowledgeCandidateValidation(candidate.CandidateID)
+	failed, err := store.FailKnowledgeCandidateValidation(candidate.CandidateID, "probe binding no longer resolves")
 	if err != nil || failed.Status != knowledgeCandidateValidationFailed {
 		t.Fatalf("semantic validation failure was not recorded: candidate=%+v err=%v", failed, err)
 	}
@@ -298,7 +298,7 @@ func TestMatchingReviewDoesNotEraseAgentSemanticValidationFailure(t *testing.T) 
 		t.Fatalf("matching review resave failed: ok=%t err=%v", ok, err)
 	}
 	stored, _ := store.KnowledgeCandidate(candidate.CandidateID)
-	if stored.Status != knowledgeCandidateValidationFailed || stored.ValidationError != "agent semantic validation rejected compiled package" {
+	if stored.Status != knowledgeCandidateValidationFailed || stored.ValidationError != "probe binding no longer resolves" {
 		t.Fatalf("review resave erased independent semantic validation failure: %+v", stored)
 	}
 }

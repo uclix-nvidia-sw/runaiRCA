@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -226,11 +227,11 @@ func (s *Server) handleKnowledgeCandidateDecision(w http.ResponseWriter, r *http
 	case "approve", "shadow":
 		if err := s.validateKnowledgeCandidate(id); err != nil {
 			if errors.Is(err, errKnowledgeValidatorRejected) {
-				if _, transitionErr := s.store.FailKnowledgeCandidateValidation(id); transitionErr != nil {
+				if _, transitionErr := s.store.FailKnowledgeCandidateValidation(id, err.Error()); transitionErr != nil {
 					writeError(w, http.StatusServiceUnavailable, "could not persist knowledge validation failure")
 					return
 				}
-				writeError(w, http.StatusUnprocessableEntity, "knowledge validator rejected candidate")
+				writeError(w, http.StatusUnprocessableEntity, err.Error())
 				return
 			}
 			writeError(w, http.StatusServiceUnavailable, "knowledge validator unavailable or rejected candidate")
@@ -321,7 +322,8 @@ func (s *Server) validateKnowledgeCandidate(id string) error {
 		return errors.New("validator unavailable")
 	}
 	var result struct {
-		Valid *bool `json:"valid"`
+		Valid  *bool    `json:"valid"`
+		Errors []string `json:"errors"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		return err
@@ -330,6 +332,15 @@ func (s *Server) validateKnowledgeCandidate(id string) error {
 		return errors.New("validator returned invalid response")
 	}
 	if !*result.Valid {
+		// The agent names WHY it rejected; dropping that array left the
+		// operator with a bare "validation failed" to reverse-engineer.
+		if len(result.Errors) > 0 {
+			detail := strings.Join(result.Errors, "; ")
+			if len(detail) > 400 {
+				detail = detail[:400]
+			}
+			return fmt.Errorf("%w: %s", errKnowledgeValidatorRejected, detail)
+		}
 		return errKnowledgeValidatorRejected
 	}
 	return nil

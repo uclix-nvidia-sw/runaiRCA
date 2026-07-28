@@ -2151,13 +2151,17 @@ func (s *Store) persistKnowledgeValidationFailureLocked(candidate *KnowledgeCand
 			_ = tx.Rollback()
 		}
 	}()
-	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, validation_error = $2, updated_at = $3 WHERE candidate_id = $4 AND status = 'ready_for_review'`, candidate.Status, candidate.ValidationError, candidate.UpdatedAt, candidate.CandidateID)
+	// A validation failure is a safety demotion: record it wherever the row
+	// currently is. Gating on status = 'ready_for_review' turned any memory/DB
+	// drift into "could not persist knowledge validation failure" for the
+	// operator, with the candidate stuck Ready.
+	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, validation_error = $2, updated_at = $3 WHERE candidate_id = $4`, candidate.Status, candidate.ValidationError, candidate.UpdatedAt, candidate.CandidateID)
 	if err != nil {
 		log.Printf("Failed to mark knowledge candidate validation failure %s: %v", candidate.CandidateID, err)
 		return false
 	}
 	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		log.Printf("Knowledge candidate %s was not ready for validation failure", candidate.CandidateID)
+		log.Printf("Knowledge candidate %s row missing for validation failure", candidate.CandidateID)
 		return false
 	}
 	if !persistKnowledgeEventTx(ctx, tx, event) {

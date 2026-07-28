@@ -1586,7 +1586,7 @@ func (s *Store) RejectKnowledgeCandidate(id string, request KnowledgeDecisionReq
 // FailKnowledgeCandidateValidation records an explicit Agent semantic
 // rejection. Transport and 5xx failures never call this method, so a candidate
 // remains ready when validation infrastructure is unavailable.
-func (s *Store) FailKnowledgeCandidateValidation(id string) (KnowledgeCandidate, error) {
+func (s *Store) FailKnowledgeCandidateValidation(id, reason string) (KnowledgeCandidate, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -1596,9 +1596,12 @@ func (s *Store) FailKnowledgeCandidateValidation(id string) (KnowledgeCandidate,
 	if candidate.Status != knowledgeCandidateReady {
 		return KnowledgeCandidate{}, errors.New("knowledge candidate is not ready for review")
 	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "agent semantic validation rejected compiled package"
+	}
 	now := time.Now().UTC()
 	updated := cloneKnowledgeCandidate(candidate)
-	updated.Status, updated.ValidationError, updated.UpdatedAt = knowledgeCandidateValidationFailed, "agent semantic validation rejected compiled package", now
+	updated.Status, updated.ValidationError, updated.UpdatedAt = knowledgeCandidateValidationFailed, reason, now
 	event := s.newKnowledgeEventLocked(candidate.CandidateID, "", "candidate_validation_failed", "system", "agent semantic validation rejected", now)
 	if !s.persistKnowledgeValidationFailureLocked(&updated, event) {
 		return KnowledgeCandidate{}, errors.New("could not persist knowledge validation failure")
