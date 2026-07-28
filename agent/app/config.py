@@ -239,7 +239,7 @@ def load_settings() -> Settings:
         runai_queues_path=os.getenv("RUNAI_QUEUES_PATH", "/api/v1/queues").strip(),
         # Run:ai control-plane version endpoint — enables version-aware suppression of
         # already-fixed known issues. Best-effort; override per your Run:ai API.
-        runai_version_path=os.getenv("RUNAI_VERSION_PATH", "/api/v1/version").strip(),
+        runai_version_path=os.getenv("RUNAI_VERSION_PATH", "/api/v1/clusters").strip(),
         runai_timeout_seconds=_int_env("RUNAI_TIMEOUT_SECONDS", 120),
         runai_mcp_url=os.getenv("RUNAI_MCP_URL", "").strip().rstrip("/"),
         prometheus_url=os.getenv("PROMETHEUS_URL", "").strip().rstrip("/"),

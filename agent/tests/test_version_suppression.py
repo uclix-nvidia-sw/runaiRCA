@@ -52,3 +52,24 @@ def test_runai_version_from_results() -> None:
     ]
     assert _runai_version_from(results) == "2.23.31"
     assert _runai_version_from([SimpleNamespace(agent="runai", details={})]) == ""
+
+
+def test_extract_version_from_clusters_list_response() -> None:
+    # The REST API has no dedicated version endpoint (verified against the
+    # v2.20 docs and live runs where runai_version stayed empty): the version
+    # rides on each cluster object from GET /api/v1/clusters — the default
+    # RUNAI_VERSION_PATH now points there.
+    from app.collectors.runai import _extract_version
+
+    payload = {
+        "clusters": [
+            {
+                "uuid": "aaaa-bbbb",
+                "name": "prod",
+                "version": "2.23.31",
+                "status": {"state": "Connected"},
+            }
+        ]
+    }
+    assert _extract_version(payload) == "2.23.31"
+    assert _extract_version([{"name": "x", "version": "2.19.0"}]) == "2.19.0"
