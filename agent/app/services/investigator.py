@@ -376,7 +376,10 @@ async def _run_adhoc_kubernetes_query(
             name=name,
             label_selector=label_selector,
         )
-        return {**read, **({"time_range": time_range} if time_range else {})}
+        # k8s_read is a live snapshot. Unlike the named-Pod describe path it
+        # cannot apply the incident window, so never label it as historical
+        # evidence merely because the caller supplied that window.
+        return read
     except Exception as exc:  # noqa: BLE001 - failure feeds the bounded correction loop
         # Preserve query identity but never replay exception text: an API error
         # body can contain stale signals, secrets, or prompt-injection content.
@@ -867,6 +870,22 @@ def _clamp_confidence(value: object, fallback: object) -> float:
     return max(0.0, min(1.0, number))
 
 
+def _is_cluster_wide_target(target: object) -> bool:
+    """True when the request names no resource that can narrow collection."""
+    return not any(
+        str(getattr(target, field, "") or "").strip()
+        for field in (
+            "namespace",
+            "pod",
+            "node",
+            "workload_name",
+            "runai_workload_id",
+            "project",
+            "queue",
+        )
+    )
+
+
 async def investigate(
     settings: Settings,
     target: object,
@@ -973,6 +992,12 @@ async def investigate(
 
     adhoc: list[dict] = []
     try:
+        # A target-less request is a cluster investigation, not a request to
+        # skip collection.  Get every evidence plane's bounded discovery view
+        # first; only pod/name-dependent probes remain unavailable until that
+        # evidence identifies an entity for a narrower follow-up.
+        if _is_cluster_wide_target(target) and not evidence:
+            await asyncio.gather(*(run_probe(name, {}) for name in by_name))
         ran_queries_last_step = False
         step = 0
         # Bound LLM decision rounds while allowing every round to batch many
@@ -1530,6 +1555,7 @@ async def investigate(
         language = getattr(settings, "language", "en")
         for item in adhoc:
             error = item.get("error")
+            incident_window_verified = bool(item.get("time_range"))
             # Finding-first summary: name the problem signals in the data, not
             # the transport ("HTTP 200" tells the operator nothing).
             markers = [] if error else kubernetes_salient_markers(item.get("data"))
@@ -1537,6 +1563,12 @@ async def investigate(
                 summary = str(error)
             elif markers:
                 summary = signals_line(markers, language)
+                if not incident_window_verified:
+                    summary = (
+                        f"현재 스냅샷 전용: {summary}"
+                        if language == "ko"
+                        else f"current snapshot only: {summary}"
+                    )
             else:
                 summary = (
                     "특이 신호 없음 (HTTP {code})"
@@ -1572,6 +1604,7 @@ async def investigate(
                             "polarity": "unavailable" if error else "unknown",
                             "coverage": "unknown" if error else "partial",
                             "observation_window": item.get("time_range") or {},
+                            "incident_window_verified": incident_window_verified,
                         },
                     },
                 )
@@ -2163,6 +2196,7 @@ def _adhoc_prompt_result(item: dict) -> str:
     }
     projection = {
         "query": _adhoc_query_repr(item),
+        "time_scope": "incident_window_verified" if item.get("time_range") else "current_snapshot_only",
         "signals": kubernetes_salient_markers(data),
         "status": status_extract,
     }

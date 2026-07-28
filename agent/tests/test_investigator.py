@@ -416,6 +416,21 @@ async def test_adhoc_exception_does_not_abort_loop_or_replay_exception_body(monk
     assert "transport-secret" not in str(item)
 
 
+@pytest.mark.asyncio
+async def test_broad_adhoc_read_never_claims_the_incident_window(monkeypatch) -> None:
+    async def fake_read(*_args, **_kwargs):
+        return {"kind": "events", "status_code": 200, "error": None, "data": {"items": []}}
+
+    monkeypatch.setattr("app.services.investigator.k8s_read", fake_read)
+    item = await _run_adhoc_kubernetes_query(
+        make_settings(),
+        {"kind": "events", "namespace": "default"},
+        time_range={"start": "2026-07-21T07:51:37Z", "end": "2026-07-21T08:16:37Z"},
+    )
+
+    assert "time_range" not in item
+
+
 def test_investigation_prompt_orders_stable_prefix_and_keeps_latest_evidence() -> None:
     evidence: dict[str, CollectorResult] = {}
     by_name: dict[str, object] = {}
@@ -574,6 +589,40 @@ async def test_no_llm_falls_back_to_full_gather() -> None:
 
     assert {r.agent for r in results} == {"runai", "kubernetes", "loki"}
     assert all(c.calls == 1 for c in collectors)
+
+
+@pytest.mark.asyncio
+async def test_cluster_wide_request_collects_every_plane_before_llm_decision(monkeypatch) -> None:
+    collectors = _collectors()
+    target = replace(
+        make_target(),
+        cluster="",
+        project="",
+        queue="",
+        namespace="",
+        workload_name="",
+        runai_workload_id="",
+        node="",
+        pod="",
+    )
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="test-model",
+        llm_api_key="test-key",
+    )
+
+    async def decide(*_args, **_kwargs):
+        assert all(collector.calls == 1 for collector in collectors)
+        return {"action": "conclude", "reason": "discovery complete"}
+
+    monkeypatch.setattr("app.services.investigator.complete_json", decide)
+
+    results, _ = await investigate(
+        settings, target, collectors, InvestigationPlan(), {}, max_steps=1
+    )
+
+    assert {result.agent for result in results} == {"runai", "kubernetes", "loki"}
 
 
 @pytest.mark.asyncio
