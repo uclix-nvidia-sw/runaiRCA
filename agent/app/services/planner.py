@@ -27,6 +27,7 @@ from app.knowledge import (
     FamilyCatalog,
     _keyword_negated,
     component_for_target,
+    component_for_text,
     load_architecture,
     load_family_catalog,
     load_runai_alerts,
@@ -708,9 +709,32 @@ async def plan_investigation(
     # runai_control_plane_error even when the stuck daemonset is the container
     # toolkit), so this promotion runs LAST and wins the lead; the catalog
     # definition stays on the plan for its actions/narrative.
-    component_entry = component_for_target(
-        load_architecture(settings.architecture_file), target.pod, target.workload_name
-    )
+    architecture = load_architecture(settings.architecture_file)
+    component_entry = component_for_target(architecture, target.pod, target.workload_name)
+    planned_workload = target.workload_name or ""
+    if (
+        component_entry is None
+        and not target.pod
+        and not target.workload_name
+        and target.alert_name == "OperatorRequestedAnalysis"
+    ):
+        # A chat question has no pod/workload label; its only identity is prose
+        # ("Thanos Receive 가 OOMKilled…"). Recognize a NAMED platform component
+        # and aim the collectors at it: its home namespace leads the plan and
+        # its name becomes the workload stem for live pod resolution — without
+        # this, the run gathers nothing and the ontology case for that
+        # component stays unreachable. Operator questions ONLY: ordinary alert
+        # summaries mention components in negated/recovered prose, and this
+        # matcher intentionally has no negation handling.
+        component_entry = component_for_text(architecture, alert_text)
+        if component_entry:
+            entry_namespace = str(component_entry.get("namespace") or "")
+            if entry_namespace:
+                namespaces = [
+                    entry_namespace,
+                    *(ns for ns in namespaces if ns != entry_namespace),
+                ]
+            planned_workload = str(component_entry.get("component") or "")
     component = str(component_entry.get("component") or "") if component_entry else ""
     if component_entry and component_entry.get("family"):
         effect = str(
@@ -846,7 +870,7 @@ async def plan_investigation(
         focus=focus,
         namespaces=namespaces,
         node=target.node or "",
-        workload=target.workload_name or "",
+        workload=planned_workload,
         pod=target.pod or "",
         check_control_plane=check_control_plane,
         hypotheses=hypotheses,

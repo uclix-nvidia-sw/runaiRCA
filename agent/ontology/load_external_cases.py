@@ -195,12 +195,18 @@ def _is_generic(token: str) -> bool:
 def _symptom_keywords(payload: dict[str, Any]) -> list[str]:
     """Case-local symptom keywords = error_signatures plus any
     curated_signature_tokens the sanitizer injected for cases that have no error
-    string (cleaned, generic dropped, lowercased, deduped, capped).
-    normalized_symptoms/retrieval_keywords are prose — never used; the owner's
-    retrieval entry point is the error string."""
+    string, plus canonical_component_tokens (cleaned, generic dropped,
+    lowercased, deduped, capped). Component tokens are exact hyphenated names
+    (runai-backend-thanos-receive) that appear verbatim in pod-name evidence —
+    they give a case whose only error signature is a rare log line a reachable
+    entry point once the component is targeted. normalized_symptoms/
+    retrieval_keywords are prose — never used; the owner's retrieval entry
+    points are the error string and canonical identifiers, never prose."""
     context = payload.get("searchable_context") or {}
-    sigs = list(context.get("error_signatures") or []) + list(
-        context.get("curated_signature_tokens") or []
+    sigs = (
+        list(context.get("error_signatures") or [])
+        + list(context.get("curated_signature_tokens") or [])
+        + list(context.get("canonical_component_tokens") or [])
     )
     out: list[str] = []
     seen: set[str] = set()

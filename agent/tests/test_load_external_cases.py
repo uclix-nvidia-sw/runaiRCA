@@ -374,3 +374,19 @@ def test_confidence_bucket_handles_strings_and_numbers() -> None:
     assert lx._confidence_bucket(0.6) == "medium"
     assert lx._confidence_bucket(0.2) == "low"
     assert lx._confidence_bucket(None) == "low"
+
+
+def test_symptom_keywords_include_canonical_component_tokens() -> None:
+    # A case whose only error signature is a rare log line (the thanos-receive
+    # OOM case: "out-of-sequence memory-mapped chunk") is unreachable until
+    # that exact line is observed. Component tokens are exact hyphenated names
+    # that appear verbatim in pod-name evidence, so they must survive as
+    # retrieval keywords; bare generic words are still dropped.
+    p = _payload()
+    p["searchable_context"]["canonical_component_tokens"] = [
+        "runai-backend-thanos-receive",
+        "OOMKilled",  # generic single word — must still be dropped
+    ]
+    keywords = lx._symptom_keywords(p)
+    assert "runai-backend-thanos-receive" in keywords
+    assert "oomkilled" not in keywords

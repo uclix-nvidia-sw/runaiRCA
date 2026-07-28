@@ -693,6 +693,37 @@ def component_for_target(
     return best
 
 
+_COMPONENT_TEXT_NORM = re.compile(r"[^a-z0-9]+")
+
+
+def component_for_text(
+    components: dict[str, dict[str, Any]], text: str
+) -> dict[str, Any] | None:
+    """Component identity from prose, for targets that arrive without labels.
+
+    A chat question that NAMES a platform component ("Thanos Receive 가
+    OOMKilled 반복…") is as concrete as a pod-name target, but carries no
+    pod/namespace label for component_for_target to match. Normalize separators
+    on both sides and match a component's full name or a tail of at least two
+    words ("thanos receive" for runai-backend-thanos-receive) at word
+    boundaries; single words stay out — they over-match ordinary prose. The
+    longest matched phrase wins."""
+    haystack = " ".join(_COMPONENT_TEXT_NORM.sub(" ", str(text or "").lower()).split())
+    if not haystack:
+        return None
+    haystack = f" {haystack} "
+    best: dict[str, Any] | None = None
+    best_len = 0
+    for name, entry in components.items():
+        words = _COMPONENT_TEXT_NORM.sub(" ", name.lower()).split()
+        for start in range(len(words) - 1):
+            phrase = " ".join(words[start:])
+            if f" {phrase} " in haystack and len(phrase) > best_len:
+                best = entry
+                best_len = len(phrase)
+    return best
+
+
 def localized_failure_mode_actions(symptom: dict[str, Any], language: str) -> list[str]:
     """A symptom's actions, preferring the curated translation when present."""
     localized = symptom.get("actions_ko") if language == "ko" else None

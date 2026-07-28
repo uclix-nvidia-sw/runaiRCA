@@ -24,7 +24,12 @@ from app.collectors.kubernetes import (
     _target_pod_missing,
     k8s_read,
 )
-from app.knowledge import component_action_lines, component_for_target, load_architecture
+from app.knowledge import (
+    component_action_lines,
+    component_for_target,
+    component_for_text,
+    load_architecture,
+)
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
 from app.services.planner import plan_investigation
@@ -756,6 +761,45 @@ def test_component_for_target_matches_pod_names() -> None:
     assert workloads is not None and workloads["component"] == "runai-backend-workloads"
 
     assert component_for_target(COMPONENTS, "totally-unrelated-pod-abc12") is None
+
+
+def test_component_for_text_matches_prose_component_names() -> None:
+    # A chat question names the component in prose — no pod label anywhere.
+    question = "Thanos Receive 가 OOMKilled 반복되어서 메모리를 올렸는데도 자꾸 죽는데 어떻게?"
+    entry = component_for_text(COMPONENTS, question)
+    assert entry is not None and entry["component"] == "runai-backend-thanos-receive"
+    assert entry["namespace"] == "runai-backend"
+
+    # Single words never match: ordinary prose must not summon a component.
+    assert component_for_text(COMPONENTS, "the receive path keeps dying") is None
+    assert component_for_text(COMPONENTS, "GPU 학습이 계속 실패합니다") is None
+
+
+@pytest.mark.asyncio
+async def test_planner_targets_component_named_in_chat_question() -> None:
+    # Chat-adhoc analysis: no pod/namespace/workload labels, the question text
+    # is the only identity. The planner must resolve the named component and
+    # aim the collectors at its home namespace — otherwise the run collects
+    # nothing and the ontology case for that component stays unreachable.
+    target = replace(
+        make_target(),
+        namespace="",
+        project="",
+        queue="",
+        workload_name="",
+        pod="",
+        alert_name="OperatorRequestedAnalysis",
+    )
+    alert = Alert(
+        labels={"alertname": "OperatorRequestedAnalysis"},
+        annotations={"summary": "Thanos Receive 가 OOMKilled 반복되어서 자꾸 죽어요"},
+    )
+    plan = await plan_investigation(
+        make_settings(), target, alert, kg_context=None, similar_incidents=None
+    )
+    assert plan.component == "runai-backend-thanos-receive"
+    assert plan.namespaces[0] == "runai-backend"
+    assert plan.workload == "runai-backend-thanos-receive"
 
 
 def test_component_action_lines_walk_into_gpu_operator_stack() -> None:
