@@ -98,19 +98,29 @@ function formatNumber(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
 }
 
-function scoreEffect(item: UnknownRecord): string {
+// A floor is max(), not addition: without the running tally the table reads
+// "+1, +1, 최소 9점" against a final score of 9 and looks like it lost 2 points.
+function scoreEffect(item: UnknownRecord, running: number): { text: string; next: number } {
   const delta = numberValue(item.delta);
-  if (delta !== undefined) return `${delta >= 0 ? '+' : ''}${formatNumber(delta)}`;
+  if (delta !== undefined) {
+    return { text: `${delta >= 0 ? '+' : ''}${formatNumber(delta)}`, next: running + delta };
+  }
   const floor = numberValue(item.score_floor);
-  if (floor !== undefined) return `최소 ${formatNumber(floor)}점`;
+  if (floor !== undefined) {
+    if (floor > running) {
+      return { text: `${formatNumber(running)} → ${formatNumber(floor)} (바닥 보장, 가산 아님)`, next: floor };
+    }
+    return { text: `최소 ${formatNumber(floor)}점 (누적 ${formatNumber(running)}점 유지)`, next: running };
+  }
   const factor = numberValue(item.factor);
-  if (factor !== undefined) return `×${formatNumber(factor)}`;
-  return '—';
+  if (factor !== undefined) return { text: `×${formatNumber(factor)}`, next: running * factor };
+  return { text: '—', next: running };
 }
 
 function parseScoreRows(candidate: UnknownRecord | undefined): ConfidenceScoreRow[] {
   const breakdown = candidate?.score_breakdown;
   if (!Array.isArray(breakdown)) return [];
+  let running = 0;
   return breakdown.flatMap((value) => {
     const item = record(value);
     if (!item) return [];
@@ -119,7 +129,9 @@ function parseScoreRows(candidate: UnknownRecord | undefined): ConfidenceScoreRo
     const sourceGroups = strings(item.source_groups);
     const singleSource = stringValue(item.source_group);
     if (singleSource && !sourceGroups.includes(singleSource)) sourceGroups.push(singleSource);
-    return [{ stage, label, effect: scoreEffect(item), sourceGroups }];
+    const effect = scoreEffect(item, running);
+    running = effect.next;
+    return [{ stage, label, effect: effect.text, sourceGroups }];
   });
 }
 
