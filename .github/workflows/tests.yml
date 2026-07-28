@@ -55,7 +55,7 @@ jobs:
       # break main on tests/test_evidence_hygiene.py.
       - name: Full test suite
         working-directory: agent
-        run: pytest -q
+        run: pytest -q -n auto
       - name: Eval gate
         working-directory: agent
         run: python -m eval.run_eval --fixtures eval/fixtures.jsonl --min-top1 0.95
