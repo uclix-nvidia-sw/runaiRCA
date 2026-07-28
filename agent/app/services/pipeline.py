@@ -395,11 +395,15 @@ _ALERT_DISPOSITIVE_SIGNATURES: dict[str, tuple[str, ...]] = {
     ),
     "workload_startup_error": (
         "CrashLoopBackOff",
-        "OOMKilled",
         "CreateContainerConfigError",
         "CreateContainerError",
         "RunContainerError",
     ),
+    # OOMKilled is a RUNTIME termination everywhere else (typed container
+    # reason, failure_modes, families keywords). Filing it under startup here
+    # minted an alert_signature card no family could support — startup's
+    # keyword rule has no "oomkilled" — while seeding the wrong candidate.
+    "workload_runtime_error": ("OOMKilled",),
     "k8s_scheduling_error": ("FailedScheduling", "Unschedulable"),
     "k8s_storage_error": (
         "FailedMount",
