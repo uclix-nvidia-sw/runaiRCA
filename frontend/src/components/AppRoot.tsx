@@ -109,6 +109,22 @@ import { evidenceMetadata, type EvidenceMetadata, type EvidenceWindow } from '..
 import { analysisRunForDetail, selectedAnalysisRunID as selectedAnalysisRunIDForDetail } from '../utils/analysisRunSelection';
 import { parseCorrectionActions } from '../utils/operatorCorrection';
 
+// The report's "## 3. 권장 조치 (Recommended Actions)" numbered items, one per
+// line, for seeding the correction form. First line of each item only — the
+// operator is editing, not archiving.
+function reportActionLines(markdown: string): string {
+  const start = markdown.search(/^## 3\./m);
+  if (start < 0) return '';
+  const section = markdown.slice(start);
+  const next = section.slice(6).search(/^## /m);
+  const body = next < 0 ? section : section.slice(0, next + 6);
+  return body
+    .split('\n')
+    .map((line) => /^\s*\d+\.\s+(.*)$/.exec(line)?.[1] ?? '')
+    .filter(Boolean)
+    .join('\n');
+}
+
 function errorMessage(err: unknown, fallback: string) {
   return err instanceof Error ? err.message : fallback;
 }
@@ -947,6 +963,21 @@ function UnifiedWorkspace({
       if (cancelled) return;
       setCorrectionFamilies(families);
       setCorrectionCatalogStatus('ready');
+      // "수정" edits the RCA the operator is looking at: seed the form from
+      // the current analysis. Pristine fields only, so reopening the panel
+      // never clobbers an in-progress edit.
+      if (!correctionFamily && !correctionNewCause && !correctionSummary && !correctionActions) {
+        const currentFamily = String(incident?.root_cause_family ?? '');
+        if (currentFamily && families.includes(currentFamily)) {
+          setCorrectionFamily(currentFamily);
+        }
+        const report = (analysisRun ?? detail?.data ?? {}) as {
+          analysis_summary?: string;
+          analysis_detail?: string;
+        };
+        setCorrectionSummary(report.analysis_summary ?? '');
+        setCorrectionActions(reportActionLines(report.analysis_detail ?? ''));
+      }
     }).catch((err: unknown) => {
       if (cancelled) return;
       setCorrectionCatalogStatus('failed');
