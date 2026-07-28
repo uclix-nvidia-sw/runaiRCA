@@ -892,7 +892,7 @@ func TestKnowledgeApprovalValidatorFailureDoesNotChangeState(t *testing.T) {
 	server := NewServer()
 	server.knowledgeValidatorURL = "http://agent.internal"
 	server.client = &http.Client{Transport: knowledgeRoundTripper(func(*http.Request) (*http.Response, error) {
-		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewBufferString(`{"valid":false}`))}, nil
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(bytes.NewBufferString(`{"valid":false,"errors":["compiled package has no failure modes"]}`))}, nil
 	})}
 	snapshot := eligibleKnowledgeSnapshot()
 	candidate := knowledgeCandidateForSnapshot(snapshot)
@@ -907,7 +907,7 @@ func TestKnowledgeApprovalValidatorFailureDoesNotChangeState(t *testing.T) {
 		t.Fatalf("expected validator rejection 422, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 	stored, _ := server.store.KnowledgeCandidate(candidate.CandidateID)
-	if stored.Status != knowledgeCandidateValidationFailed || stored.ValidationError == "" {
+	if stored.Status != knowledgeCandidateValidationFailed || stored.ValidationError != "knowledge validator rejected candidate: compiled package has no failure modes" {
 		t.Fatalf("validator semantic rejection did not fail candidate: %+v", stored)
 	}
 	if _, ok := server.store.KnowledgePackage("KPK-" + snapshot.CaseID); ok {

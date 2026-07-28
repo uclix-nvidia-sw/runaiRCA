@@ -2689,6 +2689,12 @@ td span.occurrence-pill {
   font-size: 0.82rem;
 }
 
+.confidence-score-note {
+  margin: 0 0 0.42rem;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
 .confidence-subsection h3 span {
   color: var(--muted);
   font-size: 0.68rem;

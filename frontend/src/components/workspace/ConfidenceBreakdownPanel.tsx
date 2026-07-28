@@ -103,7 +103,8 @@ function formatNumber(value: number): string {
 function scoreEffect(item: UnknownRecord, running: number): { text: string; next: number } {
   const delta = numberValue(item.delta);
   if (delta !== undefined) {
-    return { text: `${delta >= 0 ? '+' : ''}${formatNumber(delta)}`, next: running + delta };
+    const next = running + delta;
+    return { text: `${formatNumber(running)} → ${formatNumber(next)} (${delta >= 0 ? '+' : ''}${formatNumber(delta)})`, next };
   }
   const floor = numberValue(item.score_floor);
   if (floor !== undefined) {
@@ -113,7 +114,10 @@ function scoreEffect(item: UnknownRecord, running: number): { text: string; next
     return { text: `최소 ${formatNumber(floor)}점 (누적 ${formatNumber(running)}점 유지)`, next: running };
   }
   const factor = numberValue(item.factor);
-  if (factor !== undefined) return { text: `×${formatNumber(factor)}`, next: running * factor };
+  if (factor !== undefined) {
+    const next = running * factor;
+    return { text: `${formatNumber(running)} → ${formatNumber(next)} (×${formatNumber(factor)})`, next };
+  }
   return { text: '—', next: running };
 }
 
@@ -337,11 +341,12 @@ export function ConfidenceBreakdownPanel({
 
           <div className="confidence-subsection">
             <h3>Ranking 점수 내역</h3>
+            <p className="confidence-score-note">아래는 9점의 구성요소가 아니라, 0점부터 위에서 아래 순서로 적용한 계산 기록입니다. 최솟값 규칙은 점수를 더하지 않고 해당 값까지 올립니다.</p>
             {view.scoreRows.length ? (
               <div className="confidence-table-scroll" role="region" aria-label="Ranking 점수 내역" tabIndex={0}>
                 <table className="confidence-table confidence-score-table">
                   <caption className="sr-only">결정론적 ranking 점수의 단계별 증감</caption>
-                  <thead><tr><th scope="col">단계</th><th scope="col">근거/규칙</th><th scope="col">점수 효과</th><th scope="col">Source Group</th></tr></thead>
+                  <thead><tr><th scope="col">단계</th><th scope="col">근거/규칙</th><th scope="col">누적 점수</th><th scope="col">Source Group</th></tr></thead>
                   <tbody>
                     {view.scoreRows.map((row, index) => (
                       <tr key={`${row.stage}-${row.label}-${index}`}>

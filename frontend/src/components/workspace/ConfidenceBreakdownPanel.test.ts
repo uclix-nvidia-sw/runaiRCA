@@ -8,7 +8,7 @@ describe('parseConfidenceBreakdown', () => {
       ranking_candidate: {
         family: 'image_pull_error',
         confidence: 'medium',
-        score: 6,
+        score: 9,
         independent_source_groups: ['kubernetes_api', 'registry'],
         score_breakdown: [{
           stage: 'evidence',
@@ -19,6 +19,10 @@ describe('parseConfidenceBreakdown', () => {
           stage: 'prior',
           label: 'feedback prior',
           factor: 1.25,
+        }, {
+          stage: 'signature',
+          label: 'typed runtime signature',
+          score_floor: 9,
         }],
         confidence_gate: {
           score_floor: 2,
@@ -49,7 +53,7 @@ describe('parseConfidenceBreakdown', () => {
 
     expect(view?.hasRankingDetails).toBe(true);
     expect(view?.family).toBe('image_pull_error');
-    expect(view?.rankingScore).toBe(6);
+    expect(view?.rankingScore).toBe(9);
     expect(view?.rankingConfidence).toBe('medium');
     expect(view?.preHarnessConfidence).toBe('medium');
     expect(view?.independentSourceGroups).toEqual(['kubernetes_api', 'registry']);
@@ -57,10 +61,11 @@ describe('parseConfidenceBreakdown', () => {
       {
         stage: 'evidence',
         label: 'kubernetes scoped supporting facts',
-        effect: '+4',
+        effect: '0 → 4 (+4)',
         sourceGroups: ['kubernetes_api'],
       },
-      { stage: 'prior', label: 'feedback prior', effect: '×1.25', sourceGroups: [] },
+      { stage: 'prior', label: 'feedback prior', effect: '4 → 5 (×1.25)', sourceGroups: [] },
+      { stage: 'signature', label: 'typed runtime signature', effect: '5 → 9 (바닥 보장, 가산 아님)', sourceGroups: [] },
     ]);
     expect(view?.gateRows.find((row) => row.label === '미해결 반증 없음')?.outcome).toBe('pass');
     expect(view?.selfCheck?.before).toBe('high');
