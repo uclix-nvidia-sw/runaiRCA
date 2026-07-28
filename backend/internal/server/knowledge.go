@@ -552,7 +552,17 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	}
 	quality, source := harnessQualityScore(metadata)
 	if quality < 80 {
-		return nil, "quality score must be at least 80"
+		// The operator-confirm path exists precisely for runs the automated
+		// assessment underrates (inconclusive probes deduct harness points).
+		// operatorConfirmed is only true after the reviewer's evaluation passed
+		// its own >=80% quality gate with a written confirmation note, so the
+		// operator's assessment supersedes the harness floor; the payload keeps
+		// the honest harness number with an explicit source. Hard gates and the
+		// supporting-evidence requirements below still veto as before.
+		if !operatorConfirmed {
+			return nil, "quality score must be at least 80"
+		}
+		source = "operator_confirmed_review"
 	}
 	if !harnessHardGatesPassed(harness) {
 		return nil, "all non-empty harness hard gates must pass"
