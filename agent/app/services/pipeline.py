@@ -3458,6 +3458,9 @@ _TRANSLATOR_SYSTEM = (
     "- 문장은 정중한 경어체로 끝맺으세요(예: '~하세요', '~합니다'). "
     "'~하라', '~해라' 같은 명령형 반말은 쓰지 마세요. 큐레이션된 한국어 문장이 "
     "경어체이므로 번역문의 어체가 다르면 한 보고서 안에서 문체가 섞입니다.\n"
+    "- 출력에는 한국어와 보존 대상 원문 토큰(명령어·에러 문자열·API 용어)만 "
+    "쓰세요. 일본어(히라가나·가타카나·일본식 한자어)나 중국어 등 다른 언어 "
+    "문자가 한 글자라도 섞이면 안 됩니다.\n"
     '- JSON 객체 하나로만, 코드펜스 없이 응답하세요: {"12": "<한국어>", ...}'
 )
 
@@ -3523,9 +3526,19 @@ def _preserved_spans(source: str) -> list[str]:
     return list(dict.fromkeys(spans))
 
 
+# Hiragana, katakana (incl. halfwidth), and the katakana middle dot: any hit
+# means the "Korean" line leaked Japanese. CJK ideographs are NOT matched —
+# preserved error strings may legitimately carry them.
+_JAPANESE_KANA = re.compile(r"[぀-ヿｦ-ﾟ]")
+
+
 def _valid_line_translation(source: str, translated: object) -> bool:
-    """Accept a translation only when every protected span survived verbatim."""
+    """Accept a translation only when every protected span survived verbatim
+    and no Japanese kana leaked in (a real reasoning-model failure mode; the
+    line falls back to its English source instead of shipping Japanese)."""
     if not isinstance(translated, str) or not translated.strip():
+        return False
+    if _JAPANESE_KANA.search(translated) and not _JAPANESE_KANA.search(source):
         return False
     return all(span in translated for span in _preserved_spans(source))
 
