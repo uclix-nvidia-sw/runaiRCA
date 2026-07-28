@@ -4,10 +4,14 @@ on:
   push:
     branches:
       - main
+    # Nothing here ships in an image or chart, so a docs- or CI-only merge
+    # should not cut a release. A mixed push still bumps: paths-ignore only
+    # skips when every changed file matches.
     paths-ignore:
       - "**.md"
       - "docs/**"
       - ".gitbook.yaml"
+      - ".github/**"
   workflow_dispatch:
 
 permissions:
