@@ -68,7 +68,13 @@ def _cases() -> list[Case]:
         for reason in reasons
     }
     for reason, family in _K8S_CONTAINER_REASON_FAMILY.items():
-        if reason in {"unschedulable", "schedulinggated"} or reason in typed_reasons:
+        # unschedulable/schedulinggated are exercised as scheduling-kind cases
+        # below; nodenotschedulable arrives on the node cordon artifact, not a
+        # container state — its real channel is covered by
+        # test_cordon_is_lifecycle_change_not_scheduler_fault.
+        if reason in {"unschedulable", "schedulinggated", "nodenotschedulable"} or (
+            reason in typed_reasons
+        ):
             continue
         typed_reasons[reason] = (
             family,

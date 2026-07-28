@@ -5836,6 +5836,11 @@ def _node_cordon_artifact(
             "observed_entity": {"kind": "node", "name": node},
             "observation_window": time_range if causal else {},
             "snapshot_role": snapshot_role,
+            # kubelet's official reason for the cordon flip. The typed channel
+            # routes this to platform_lifecycle_change (administrative action)
+            # instead of letting the summary's "unschedulable" text feed
+            # k8s_scheduling_error.
+            "scheduling_reason": "NodeNotSchedulable",
         }
         artifacts.append(
             artifact(

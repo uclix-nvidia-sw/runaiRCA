@@ -908,6 +908,14 @@
       actions:
         - "The implicated Deployment/DaemonSet/StatefulSet is mid-rollout (spec generation the status hasn't caught up to). Pods terminating/creating during this window are EXPECTED. Watch it converge: `kubectl -n <ns> rollout status <kind>/<name>`."
         - "If it is genuinely stuck, read WHY the new pods aren't going Ready: `kubectl -n <ns> describe <kind>/<name>` and the newest pod's events/logs — treat that specific reason (ImagePull, CrashLoop, scheduling) as the real sub-cause. Do NOT attribute it to node pressure unless the node conditions are actually True."
+    - name: Node Administratively Cordoned (SchedulingDisabled)
+      # No "unschedulable" token here on purpose: it belongs to the scheduling
+      # symptoms' vocabulary and would compete with them in fuzzy matching.
+      keywords: ["cordoned", "schedulingdisabled"]
+      actions:
+        - "The node reports Ready,SchedulingDisabled: spec.unschedulable=true was set by an administrator (`kubectl cordon` or a drain). This is an operational action, not a node or scheduler fault — the kubelet and node conditions are healthy, the node is only excluded from NEW scheduling."
+        - "Confirm the state and impact: `kubectl get node <node>` (STATUS Ready,SchedulingDisabled) and `kubectl get pods -A --field-selector spec.nodeName=<node>` — running pods keep running; only pending pods citing 'node(s) were unschedulable' are downstream of the cordon."
+        - "If the cordon was intentional maintenance, finish the work and restore scheduling with `kubectl uncordon <node>`. If nobody claims it, the API audit log (when enabled) records who patched spec.unschedulable and when."
     - name: Helm Release Recently Changed
       keywords: ["pending-upgrade", "pending-install", "helm.sh/release", "helm history", "helm upgrade"]
       actions:

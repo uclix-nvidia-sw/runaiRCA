@@ -48,6 +48,11 @@ _K8S_CONTAINER_REASON_FAMILY: dict[str, str] = {
     "oomkilled": "workload_runtime_error",
     "unschedulable": "k8s_scheduling_error",
     "schedulinggated": "k8s_scheduling_error",
+    # kubelet's official reason when spec.unschedulable flips: a cordon is an
+    # administrative lifecycle action, not a scheduler fault. Typing it here
+    # also stops the cordon snapshot from feeding k8s_scheduling_error through
+    # its "unschedulable" summary text.
+    "nodenotschedulable": "platform_lifecycle_change",
 }
 
 _FLOOR = 2.0          # min top score below which we fall back to insufficient_evidence
