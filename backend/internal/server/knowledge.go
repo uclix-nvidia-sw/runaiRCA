@@ -1111,8 +1111,15 @@ func traceV3FamilyLinkedProbeTemplateIDs(trace map[string]any, family string, ev
 		if !ok || stringValue(probe["execution_id"]) == "" || stringValue(probe["verdict"]) == "" || stringValue(probe["template_id"]) == "" {
 			continue
 		}
-		hasFamily, hasEvidence := false, false
-		for _, id := range sanitizeStringSlice(probe["hypothesis_ids"]) {
+		// A signature-promoted family never had a ledger hypothesis, so its
+		// walk probes carry empty hypothesis_ids — requiring a family-bound
+		// hypothesis here made the harness-claim fallback structurally
+		// probe-less ("none linked" on runs with a supporting probe). An
+		// unbound probe links through the claim evidence it verified; a probe
+		// bound to another family's hypothesis stays excluded.
+		bound := sanitizeStringSlice(probe["hypothesis_ids"])
+		hasFamily, hasEvidence := len(bound) == 0, false
+		for _, id := range bound {
 			hasFamily = hasFamily || hypothesisFamilies[id] == family
 		}
 		for _, id := range sanitizeStringSlice(probe["evidence_ids"]) {

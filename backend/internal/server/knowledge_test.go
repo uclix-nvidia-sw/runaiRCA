@@ -1356,3 +1356,29 @@ func TestOperatorConfirmationOverridesHarnessQualityFloor(t *testing.T) {
 		t.Fatalf("payload must keep the honest harness score, got %v", confirmed.Payload["quality_score"])
 	}
 }
+
+func TestHarnessClaimLinksUnboundProbesThroughClaimEvidence(t *testing.T) {
+	// Signature-promoted families have no ledger hypothesis, so walk probes
+	// execute with empty hypothesis_ids; the probe that verified the claim's
+	// own evidence must still link, while a probe bound to another family's
+	// hypothesis must not.
+	trace := map[string]any{
+		"hypotheses": []any{
+			map[string]any{"hypothesis_id": "H-other", "family": "node_kubelet_pressure"},
+		},
+		"probe_executions": []any{
+			map[string]any{
+				"execution_id": "P-1", "template_id": "k8s_troubleshooting:pod_crashing:p01",
+				"verdict": "supports", "hypothesis_ids": []any{}, "evidence_ids": []any{"E12"},
+			},
+			map[string]any{
+				"execution_id": "P-2", "template_id": "k8s_troubleshooting:node_pressure:p01",
+				"verdict": "supports", "hypothesis_ids": []any{"H-other"}, "evidence_ids": []any{"E12"},
+			},
+		},
+	}
+	ids := traceV3FamilyLinkedProbeTemplateIDs(trace, "workload_runtime_error", map[string]bool{"E12": true})
+	if len(ids) != 1 || ids[0] != "k8s_troubleshooting:pod_crashing:p01" {
+		t.Fatalf("unbound probe must link via claim evidence and foreign-bound probe must not, got %v", ids)
+	}
+}
