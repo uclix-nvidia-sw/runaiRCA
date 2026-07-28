@@ -55,30 +55,30 @@ type recurrenceStatsCacheEntry struct {
 }
 
 type Store struct {
-	mu                       sync.RWMutex
-	incidentSeq              atomic.Int64
-	alertSeq                 atomic.Int64
-	feedbackSeq              atomic.Int64
-	commentSeq               atomic.Int64
-	analysisRunSeq           atomic.Int64
-	evaluationSeq            atomic.Int64
-	knowledgeEventSeq        atomic.Int64
-	incidents                map[string]*Incident
-	incidentByKey            map[string]string
-	alerts                   map[string]*AlertRecord
-	alertByFinger            map[string]string
-	alertByGroup             map[string]string
-	memories                 map[string]*IncidentMemory
-	feedback                 map[string]*FeedbackRecord
-	comments                 map[string]*CommentRecord
-	analysisRuns             map[string]*AnalysisRun
-	evaluationReviews        map[string]*EvaluationReview
-	caseSnapshots            map[string]*CaseSnapshot
-	activeCaseByIncident     map[string]string
-	knowledgeCandidates      map[string]*KnowledgeCandidate
-	knowledgePackages        map[string]*KnowledgePackage
-	knowledgeEvents          map[string]*KnowledgeEvent
-	chatConversations        map[string]*ChatConversation
+	mu                   sync.RWMutex
+	incidentSeq          atomic.Int64
+	alertSeq             atomic.Int64
+	feedbackSeq          atomic.Int64
+	commentSeq           atomic.Int64
+	analysisRunSeq       atomic.Int64
+	evaluationSeq        atomic.Int64
+	knowledgeEventSeq    atomic.Int64
+	incidents            map[string]*Incident
+	incidentByKey        map[string]string
+	alerts               map[string]*AlertRecord
+	alertByFinger        map[string]string
+	alertByGroup         map[string]string
+	memories             map[string]*IncidentMemory
+	feedback             map[string]*FeedbackRecord
+	comments             map[string]*CommentRecord
+	analysisRuns         map[string]*AnalysisRun
+	evaluationReviews    map[string]*EvaluationReview
+	caseSnapshots        map[string]*CaseSnapshot
+	activeCaseByIncident map[string]string
+	knowledgeCandidates  map[string]*KnowledgeCandidate
+	knowledgePackages    map[string]*KnowledgePackage
+	knowledgeEvents      map[string]*KnowledgeEvent
+	chatConversations    map[string]*ChatConversation
 	// deletedEpisodes remembers hard-deleted alert episodes (fingerprint ->
 	// StartsAt). Alertmanager keeps re-sending a still-firing alert with its
 	// original StartsAt, so without this a purged incident reappeared minutes
@@ -2127,6 +2127,13 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 		run.MissingData = response.MissingData
 		run.Warnings = response.Warnings
 		run.Artifacts = response.Artifacts
+	} else if hadPriorSuccess {
+		warning := "latest re-analysis failed; previous RCA is preserved"
+		if reason := strings.TrimSpace(response.TerminalReason); reason != "" {
+			warning += ": " + reason
+		}
+		run.Warnings = append(run.Warnings, warning)
+		run.Warnings = append(run.Warnings, response.Warnings...)
 	}
 	if hadPriorSuccess && len(previousSuccessMetadata(run.Metadata)) > 0 {
 		run.Metadata = restorePreviousSuccessMetadata(run.Metadata)
@@ -2513,6 +2520,11 @@ func (s *Store) IncidentDetail(id string) (*IncidentDetail, bool) {
 		}
 		if reasoning, ok := metadata["ontology_reasoning"].(map[string]any); ok {
 			detail.OntologyReasoning = cloneAnyMap(reasoning)
+		}
+		if trace, ok := metadata["reasoning_trace_v3"].(map[string]any); ok {
+			detail.EvidenceTrace = cloneAnyMap(trace)
+		} else if trace, ok := metadata["trace_v3"].(map[string]any); ok {
+			detail.EvidenceTrace = cloneAnyMap(trace)
 		}
 		detail.AnalysisSummary = excerpt(run.AnalysisSummary, maxIncidentAggregateSummaryBytes)
 		detail.AnalysisDetail = excerpt(run.AnalysisDetail, maxIncidentAggregateDetailBytes)

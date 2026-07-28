@@ -1085,10 +1085,11 @@ func TestIncidentChatContextSummarizesAlerts(t *testing.T) {
 	}
 	context := incidentChatContext(&IncidentDetail{
 		Incident: Incident{
-			IncidentID: "INC-chat-context",
-			Title:      "Queue blocked",
-			Severity:   "warning",
-			Status:     "firing",
+			IncidentID:  "INC-chat-context",
+			Title:       "Queue blocked",
+			Severity:    "warning",
+			Status:      "firing",
+			IsAnalyzing: true,
 		},
 		Feedback: FeedbackSummary{
 			Positive: 1,
@@ -1104,8 +1105,22 @@ func TestIncidentChatContextSummarizesAlerts(t *testing.T) {
 			AnalysisSummary: strings.Repeat("summary ", 200),
 			AnalysisDetail:  strings.Repeat("detail ", 500),
 		}},
-		Alerts: alerts,
+		Alerts:         alerts,
+		AnalysisDetail: "## Evidence Trace\n\n- [E20] kubernetes · observed · scoped: target pod lifecycle",
+		EvidenceTrace: map[string]any{"evidence": []any{map[string]any{
+			"evidence_id": "E20", "entity": "pod:external-workload-integrator", "coverage": "scoped", "temporal_relation": "during_incident", "observation_window": map[string]any{"start": "2026-07-27T17:19:06Z", "end": "2026-07-27T17:19:06Z"},
+		}}},
+		Artifacts: []Artifact{
+			{EvidenceID: "E01", Agent: "kubernetes", Status: "partial", Summary: "unscoped list"},
+			{EvidenceID: "E20", Agent: "kubernetes", Status: "ok", Confidence: "high", Summary: "Target Pod lifecycle: OOMKilled at 2026-07-27T17:19:06Z"},
+		},
 	})
+	if context["is_analyzing"] != true {
+		t.Fatalf("chat context must expose a running analysis, got %+v", context)
+	}
+	if content := incidentChatContent(&IncidentDetail{Incident: Incident{IsAnalyzing: true}}); !strings.Contains(content, "Analysis status: analyzing") {
+		t.Fatalf("chat content must say that analysis is running, got %q", content)
+	}
 
 	contextAlerts, ok := context["alerts"].([]map[string]any)
 	if !ok || len(contextAlerts) != dashboardChatRecentLimit {
@@ -1145,6 +1160,22 @@ func TestIncidentChatContextSummarizesAlerts(t *testing.T) {
 	}
 	if summary, _ := similar[0]["analysis_summary"].(string); len(summary) > 803 || !strings.HasSuffix(summary, "...") {
 		t.Fatalf("similar incident summary should be capped, got len=%d", len(summary))
+	}
+	evidence, ok := context["evidence_trace"].([]map[string]any)
+	if !ok || len(evidence) != 2 || evidence[0]["evidence_id"] != "E20" {
+		t.Fatalf("chat must receive observed evidence IDs before incidental artifacts, got %+v", context["evidence_trace"])
+	}
+	if evidence[0]["summary"] != "Target Pod lifecycle: OOMKilled at 2026-07-27T17:19:06Z" {
+		t.Fatalf("chat evidence lost its operator-facing scope/timing summary: %+v", evidence[0])
+	}
+	if _, ok := evidence[0]["result"]; ok {
+		t.Fatalf("chat evidence must not include raw artifact results: %+v", evidence[0])
+	}
+	if evidence[0]["entity"] != "pod:external-workload-integrator" || evidence[0]["temporal_relation"] != "during_incident" {
+		t.Fatalf("chat evidence lost structured target/timing metadata: %+v", evidence[0])
+	}
+	if evidence[0]["citation"] != "direct" || evidence[1]["citation"] != "context_only" {
+		t.Fatalf("chat must distinguish cited evidence from collector context: %+v", evidence)
 	}
 }
 
@@ -1410,6 +1441,7 @@ func TestChatAnalysisRequestCreatesAnalysisRun(t *testing.T) {
 	})
 	payload, _ := json.Marshal(ChatRequest{
 		Message:    "이 RCA 분석 다시 돌려줘",
+		Analyze:    true,
 		IncidentID: incident.IncidentID,
 	})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
@@ -1437,38 +1469,29 @@ func TestChatAnalysisRequestCreatesAnalysisRun(t *testing.T) {
 	}
 }
 
-func TestWantsAnalysisRunDoesNotTreatReplayAsReanalysis(t *testing.T) {
-	if wantsAnalysisRun("분석 결과 다시 보여줘") {
-		t.Fatalf("replaying an analysis result should not start a new agent run")
-	}
-	for _, message := range []string{
-		"이 RCA 분석 다시 돌려줘",
-		"지금 알람 분석해줘",
-		"분석 새로 시작해줘",
-		"재분석 부탁해",
-		"이 인시던트 재분석",
-		"analyze this again please",
-		"start a new analysis for the runai namespace",
-		"이 pod 원인 찾아줘",
-		"장애 원인 파악해줘",
-		"진단 시작해줘",
-		"diagnose this pod",
-		"investigate the runai-scheduler crash",
-	} {
-		if !wantsAnalysisRun(message) {
-			t.Fatalf("expected analysis request for %q", message)
+func TestChatAnalysisKeywordsDoNotStartRun(t *testing.T) {
+	server := NewServer()
+	chatCalls := 0
+	agent := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat" {
+			t.Fatalf("keyword-only chat must not call %s", r.URL.Path)
 		}
+		chatCalls++
+		_ = json.NewEncoder(w).Encode(ChatResponse{Status: "ok", Answer: "Use the RCA button to start analysis."})
+	}))
+	defer agent.Close()
+	server.agentURL = agent.URL
+	incident, _ := server.store.UpsertAlert(AlertmanagerWebhook{GroupKey: "chat-keyword"}, Alert{
+		Status: "firing", Labels: map[string]string{"alertname": "RunAIQueueBlocked"}, Fingerprint: "fp-chat-keyword",
+	})
+	payload, _ := json.Marshal(ChatRequest{Message: "이 인시던트 재분석하고 원인 찾아줘", IncidentID: incident.IncidentID})
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload)))
+	if rec.Code != http.StatusOK || chatCalls != 1 {
+		t.Fatalf("keyword-only request must remain chat, code=%d calls=%d body=%s", rec.Code, chatCalls, rec.Body.String())
 	}
-	// Questions about the RCA we already have must stay in the Q&A path.
-	for _, message := range []string{
-		"원인이 뭐야?",
-		"root cause가 뭐였어?",
-		"진단 결과 보여줘",
-		"어제 분석 결과 요약해줘",
-	} {
-		if wantsAnalysisRun(message) {
-			t.Fatalf("question about an existing RCA must not start a run: %q", message)
-		}
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 0 {
+		t.Fatalf("keyword-only request must not create an analysis run: %+v", runs)
 	}
 }
 
@@ -1495,9 +1518,6 @@ func TestChatExplicitAnalyzeFlagStartsRunWithoutKeywords(t *testing.T) {
 	server.agentURL = agent.URL
 
 	message := "dgx02 노드 상태가 좀 이상해"
-	if wantsAnalysisRun(message) {
-		t.Fatalf("test premise broken: %q should not match the phrasing gate", message)
-	}
 	payload, _ := json.Marshal(ChatRequest{Message: message, Analyze: true})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
 	rec := httptest.NewRecorder()
@@ -1557,7 +1577,7 @@ func TestChatAnalysisRequestWithoutTargetUsesLatestAlert(t *testing.T) {
 		Annotations: map[string]string{"summary": "Workload pending"},
 		Fingerprint: "fp-chat-latest",
 	})
-	payload, _ := json.Marshal(ChatRequest{Message: "지금 알람 분석해줘"})
+	payload, _ := json.Marshal(ChatRequest{Message: "지금 알람 분석해줘", Analyze: true})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
 	rec := httptest.NewRecorder()
 
@@ -2124,6 +2144,58 @@ func TestFlappingAlertGroupingUsesNamespaceWorkloadAndWindow(t *testing.T) {
 	outsideWindowIncident, _ := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "same-am-group"}, makeAlert("runai-a", "trainer-7d9f8c6b5-eeee5", "fp-flap-5", base.Add(45*time.Minute)))
 	if outsideWindowIncident.IncidentID == firstIncident.IncidentID {
 		t.Fatalf("same-workload alert outside flapping window should start a new incident")
+	}
+}
+
+// Alerts that name no pod (TargetDown, node conditions) used to fall through to the
+// per-fingerprint key, where the flapping window never runs — every scrape target and
+// every re-fire got its own incident row.
+func TestPodlessAlertsStillGroup(t *testing.T) {
+	t.Setenv("FLAPPING_GROUP_WINDOW_MINUTES", "30")
+	store := NewStore()
+	base := time.Date(2026, 6, 26, 9, 0, 0, 0, time.UTC)
+	makeAlert := func(labels map[string]string, fingerprint string, at time.Time) Alert {
+		labels["severity"] = "warning"
+		labels["cluster"] = "lab"
+		return Alert{
+			Status:      "firing",
+			Labels:      labels,
+			Annotations: map[string]string{"summary": "One or more targets are unreachable."},
+			Fingerprint: fingerprint,
+			StartsAt:    at.Format(time.RFC3339),
+		}
+	}
+	targetDown := func(namespace, service string) map[string]string {
+		return map[string]string{"alertname": "TargetDown", "namespace": namespace, "service": service, "job": service}
+	}
+
+	webhookTarget, _ := store.UpsertAlert(AlertmanagerWebhook{}, makeAlert(targetDown("knative-serving", "webhook"), "fp-td-1", base))
+	autoscalerTarget, _ := store.UpsertAlert(AlertmanagerWebhook{}, makeAlert(targetDown("knative-serving", "autoscaler"), "fp-td-2", base))
+	if autoscalerTarget.IncidentID != webhookTarget.IncidentID {
+		t.Fatalf("targets of one namespace going down together must be one incident: %s != %s", autoscalerTarget.IncidentID, webhookTarget.IncidentID)
+	}
+	otherNamespace, _ := store.UpsertAlert(AlertmanagerWebhook{}, makeAlert(targetDown("kube-system", "kube-etcd"), "fp-td-3", base))
+	if otherNamespace.IncidentID == webhookTarget.IncidentID {
+		t.Fatalf("targets in a different namespace must not group")
+	}
+
+	nodeAlert := func(node string, at time.Time, fingerprint string) Alert {
+		return makeAlert(map[string]string{"alertname": "NodeNotReady", "node": node}, fingerprint, at)
+	}
+	dgx01, _ := store.UpsertAlert(AlertmanagerWebhook{}, nodeAlert("dgx01", base, "fp-node-1"))
+	dgx01Again, _ := store.UpsertAlert(AlertmanagerWebhook{}, nodeAlert("dgx01", base.Add(8*time.Minute), "fp-node-2"))
+	if dgx01Again.IncidentID != dgx01.IncidentID {
+		t.Fatalf("same node re-firing inside the window must group: %s != %s", dgx01Again.IncidentID, dgx01.IncidentID)
+	}
+	dgx02, _ := store.UpsertAlert(AlertmanagerWebhook{}, nodeAlert("dgx02", base, "fp-node-3"))
+	if dgx02.IncidentID == dgx01.IncidentID {
+		t.Fatalf("a different node must not group onto dgx01's incident")
+	}
+
+	// Nothing to group on (ad-hoc/chat analyses, Watchdog): stays per-fingerprint.
+	adhoc, _ := store.UpsertAlert(AlertmanagerWebhook{}, makeAlert(map[string]string{"alertname": "OperatorRequestedAnalysis"}, "fp-adhoc-1", base))
+	if !strings.HasPrefix(adhoc.CorrelationKey, "fingerprint:") {
+		t.Fatalf("subject-less alert should stay per-fingerprint, got %q", adhoc.CorrelationKey)
 	}
 }
 
@@ -2823,7 +2895,7 @@ func TestChatAnalysisRequestWithoutAnyAlertCreatesAdHocIncident(t *testing.T) {
 	})
 
 	message := "dgx02 노드 GPU가 이상한 것 같아. 분석해줘"
-	payload, _ := json.Marshal(ChatRequest{Message: message})
+	payload, _ := json.Marshal(ChatRequest{Message: message, Analyze: true})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
 	rec := httptest.NewRecorder()
 	server.routes().ServeHTTP(rec, req)
@@ -3284,7 +3356,7 @@ func TestChatAdHocAnalysisDedupesRepeatedSubmission(t *testing.T) {
 	server.agentURL = agent.URL
 
 	send := func(message, conversationID string) ChatResponse {
-		payload, _ := json.Marshal(ChatRequest{Message: message, ConversationID: conversationID})
+		payload, _ := json.Marshal(ChatRequest{Message: message, ConversationID: conversationID, Analyze: true})
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload))
 		rec := httptest.NewRecorder()
 		server.routes().ServeHTTP(rec, req)

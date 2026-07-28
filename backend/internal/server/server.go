@@ -198,8 +198,11 @@ type IncidentDetail struct {
 	Harness               map[string]any    `json:"harness,omitempty"`
 	ConfidenceDiagnostics map[string]any    `json:"confidence_diagnostics,omitempty"`
 	OntologyReasoning     map[string]any    `json:"ontology_reasoning,omitempty"`
-	Feedback              FeedbackSummary   `json:"feedback"`
-	Alerts                []AlertRecord     `json:"alerts"`
+	// EvidenceTrace stays internal to the incident-detail projection used by
+	// chat; the dashboard keeps owning full artifact/raw-result rendering.
+	EvidenceTrace map[string]any  `json:"-"`
+	Feedback      FeedbackSummary `json:"feedback"`
+	Alerts        []AlertRecord   `json:"alerts"`
 }
 
 type RecurrenceDay struct {
@@ -670,14 +673,21 @@ func correlationKey(webhook AlertmanagerWebhook, alert Alert) string {
 		}, ":")
 	}
 	namespace := first(labels["namespace"], labels["kubernetes_namespace"])
-	workload := workloadIdentity(alert)
 	alertName := first(labels["alertname"], labels["alert_name"])
-	if namespace != "" && workload != "" && alertName != "" {
+	// The subject is whatever the alert is actually about. A pod/workload wins;
+	// node-scoped alerts (XID, node unschedulable) carry no pod, so they key on the
+	// node and dgx01 stays apart from dgx02. Target/service-level alerts
+	// (TargetDown) have neither — they key on the namespace alone, so a namespace
+	// whose scrape targets all go down is ONE incident instead of a row per target.
+	// Requiring a workload here used to drop every one of those into the
+	// per-fingerprint bucket below, where the flapping window never runs.
+	subject := first(workloadIdentity(alert), nodeIdentity(alert))
+	if alertName != "" && (namespace != "" || subject != "") {
 		return strings.Join([]string{
 			"flap",
 			keyPart(first(cluster, "cluster-unknown")),
 			keyPart(namespace),
-			keyPart(workload),
+			keyPart(subject),
 			keyPart(alertName),
 		}, ":")
 	}
@@ -718,14 +728,19 @@ func diskPressureGroup(alert Alert) (diskPressureGroupInfo, bool) {
 		return diskPressureGroupInfo{}, false
 	}
 
-	node := first(
+	return diskPressureGroupInfo{Node: nodeIdentity(alert), Reason: reason}, true
+}
+
+// nodeIdentity returns the node an alert is about, for alerts that name no pod.
+func nodeIdentity(alert Alert) string {
+	labels := alert.Labels
+	return first(
 		labels["node"],
 		labels["node_name"],
 		labels["nodename"],
 		labels["kubernetes_node"],
 		labels["instance"],
 	)
-	return diskPressureGroupInfo{Node: node, Reason: reason}, true
 }
 
 func groupedIncidentTitle(alert Alert, alertCount int) string {

@@ -121,15 +121,6 @@ export function ChatDashboard({
                     ))}
                   </optgroup>
                 )}
-                {chat.alerts.length > 0 && (
-                  <optgroup label="Alerts">
-                    {chat.alerts.slice(0, 25).map((alert) => (
-                      <option key={alert.alert_id} value={`alert:${alert.alert_id}`}>
-                        {alert.alert_id} · {alert.alarm_title.slice(0, 48)}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
               </select>
             </span>
             {chat.activeConversation && (

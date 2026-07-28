@@ -1168,7 +1168,7 @@ function UnifiedWorkspace({
             <>
               <button
                 className={`ghost-button ${busyAction === 'analyze' ? 'is-busy' : ''}`}
-                disabled={Boolean(busyAction)}
+                disabled={Boolean(busyAction) || isAnalyzing}
                 onClick={() => void runWorkspaceAction('analyze', () => onAnalyze(incident.incident_id))}
                 type="button"
               >
@@ -1186,7 +1186,7 @@ function UnifiedWorkspace({
               )}
               <button
                 className="ghost-button"
-                disabled={Boolean(busyAction)}
+                disabled={Boolean(busyAction) || isAnalyzing}
                 onClick={() => setCorrectionOpen((open) => !open)}
                 ref={correctionTriggerRef}
                 type="button"
@@ -1246,7 +1246,7 @@ function UnifiedWorkspace({
               </button>
               <button
                 className={`ghost-button ${busyAction === 'analyze' ? 'is-busy' : ''}`}
-                disabled={Boolean(busyAction)}
+                disabled={Boolean(busyAction) || isAnalyzing}
                 onClick={() => void runWorkspaceAction('analyze', () => onAnalyze(alert.incident_id))}
                 type="button"
               >
@@ -1479,22 +1479,26 @@ function UnifiedWorkspace({
           )}
         </section>
 
-        {(missingData.length > 0 || warnings.length > 0 || tokenUsage || analysisDuration) && (
+        {!isAnalyzing && (missingData.length > 0 || warnings.length > 0 || tokenUsage || analysisDuration) && (
           <DiagnosticsPanel missingData={missingData} warnings={warnings} tokenUsage={tokenUsage} analysisDuration={analysisDuration} />
         )}
 
-        <ConfidenceBreakdownPanel
-          diagnostics={incident?.confidence_diagnostics}
-          harness={incident?.harness}
-          rootCauseFamily={incident?.root_cause_family}
-        />
+        {!isAnalyzing && (
+          <>
+            <ConfidenceBreakdownPanel
+              diagnostics={incident?.confidence_diagnostics}
+              harness={incident?.harness}
+              rootCauseFamily={incident?.root_cause_family}
+            />
 
-        <EvaluationPanel
-          runID={incident?.analysis_run_id}
-          analysisHash={incident?.analysis_hash}
-          harness={incident?.harness}
-          onSaved={onRefresh}
-        />
+            <EvaluationPanel
+              runID={incident?.analysis_run_id}
+              analysisHash={incident?.analysis_hash}
+              harness={incident?.harness}
+              onSaved={onRefresh}
+            />
+          </>
+        )}
 
         <FeedbackPanel
           targetType={targetType}

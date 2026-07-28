@@ -978,6 +978,46 @@ async def test_chat_without_detail_reports_runtime_state() -> None:
     assert "No specific incident or alert RCA content is attached yet" not in response.answer
 
 
+@pytest.mark.asyncio
+async def test_chat_renders_compact_incident_evidence_trace() -> None:
+    response = await AnalysisOrchestrator(make_settings()).chat(
+        ChatRequest(
+            message="근거 ID와 시간을 알려줘",
+            incident_content="RCA: target pod OOMKilled.",
+            context={
+                "incident": {
+                    "evidence_trace": [
+                        {
+                            "evidence_id": "E20",
+                            "source": "kubernetes",
+                            "status": "observed",
+                            "citation": "direct",
+                            "entity": "pod:external-workload-integrator",
+                            "temporal_relation": "during_incident",
+                            "observation_window": {"start": "2026-07-27T17:19:06Z", "end": "2026-07-27T17:19:06Z"},
+                            "summary": "Target Pod lifecycle: OOMKilled at 2026-07-27T17:19:06Z",
+                        },
+                        {
+                            "evidence_id": "E01",
+                            "source": "kubernetes",
+                            "status": "ok",
+                            "citation": "context_only",
+                            "summary": "Current pod snapshot only.",
+                        }
+                    ]
+                }
+            },
+        )
+    )
+
+    assert "Evidence Trace" in response.answer
+    assert "[E20]" in response.answer
+    assert "2026-07-27T17:19:06Z" in response.answer
+    assert "pod:external-workload-integrator" in response.answer
+    assert "direct" in response.answer
+    assert "context_only" in response.answer
+
+
 def test_kg_grounding_lines_formats_and_gates() -> None:
     from app.services.kg_enrichment import KGContext
     from app.services.orchestrator import _kg_grounding_lines

@@ -472,6 +472,7 @@ _CHAT_STRINGS = {
         ),
         "state": "## Current Agent State",
         "memory": "## Related RCA Memory",
+        "evidence": "## Evidence Trace",
         "missing": "## Missing Data",
         "warnings": "## Warnings",
         "next": "## Next Step",
@@ -497,6 +498,7 @@ _CHAT_STRINGS = {
         ),
         "state": "## 현재 에이전트 상태",
         "memory": "## 관련 RCA 메모리",
+        "evidence": "## Evidence Trace",
         "missing": "## 누락된 데이터",
         "warnings": "## 경고",
         "next": "## 다음 단계",
@@ -563,6 +565,7 @@ def _chat_answer_from_context(
     similar = context.get("similar_incidents")
     missing = _context_list(context, "missing_data")
     warnings = _context_list(context, "warnings")
+    evidence_lines = _evidence_lines(context, masker)
     runtime_lines = _runtime_snapshot_lines(context)
 
     lines = [
@@ -607,6 +610,8 @@ def _chat_answer_from_context(
     memory_lines = _memory_lines(memory or similar, masker)
     if memory_lines:
         lines.extend([text["memory"], "", *memory_lines, ""])
+    if evidence_lines:
+        lines.extend([text["evidence"], "", *evidence_lines, ""])
     if missing:
         lines.extend([text["missing"], "", *[f"- {item}" for item in missing[:8]], ""])
     if warnings:
@@ -769,6 +774,37 @@ def _memory_lines(memory: object, masker: Masker) -> list[str]:
             )
             rendered_summary = _short_sentence(masker.mask_text(str(summary)), limit=320)
             lines.append(f"- {rendered_id} ({rendered_similarity}): {rendered_summary}")
+    return lines
+
+
+def _evidence_lines(context: dict[str, object], masker: Masker) -> list[str]:
+    value = context.get("evidence_trace")
+    if value is None and isinstance(context.get("incident"), dict):
+        value = context["incident"].get("evidence_trace")  # type: ignore[index]
+    if not isinstance(value, list):
+        return []
+    lines: list[str] = []
+    for item in value[:12]:
+        if not isinstance(item, dict):
+            continue
+        evidence_id = str(item.get("evidence_id") or "").strip()
+        if not evidence_id:
+            continue
+        source = str(item.get("source") or item.get("agent") or "unknown")
+        status = str(item.get("status") or "unknown")
+        citation = str(item.get("citation") or "context_only")
+        summary = str(item.get("summary") or "").strip()
+        rendered = f"- [{evidence_id}] {source} · {status} · {citation}"
+        entity = str(item.get("entity") or "").strip()
+        relation = str(item.get("temporal_relation") or "").strip()
+        window = _dict_context(item.get("observation_window"))
+        start, end = str(window.get("start") or ""), str(window.get("end") or "")
+        scope = " · ".join(value for value in (entity, relation, start if start == end else f"{start}–{end}") if value)
+        if scope:
+            rendered += f" ({masker.mask_text(scope)})"
+        if summary:
+            rendered += f": {_compact_text(masker.mask_text(summary), 600)}"
+        lines.append(rendered)
     return lines
 
 

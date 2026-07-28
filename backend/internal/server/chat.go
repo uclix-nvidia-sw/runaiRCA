@@ -6,21 +6,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // ChatRequest is the operator chat payload accepted by /api/v1/chat.
 type ChatRequest struct {
-	Message         string         `json:"message"`
-	ConversationID  string         `json:"conversation_id,omitempty"`
-	Language        string         `json:"language,omitempty"`
-	Page            string         `json:"page,omitempty"`
-	Auto            bool           `json:"auto,omitempty"`
-	// Analyze is the operator pressing "run RCA" explicitly. Alertmanager does
-	// not fire for every real problem, so chat is a first-class analysis entry
-	// point and must not depend on the phrasing heuristic below.
-	Analyze bool `json:"analyze,omitempty"`
+	Message        string `json:"message"`
+	ConversationID string `json:"conversation_id,omitempty"`
+	Language       string `json:"language,omitempty"`
+	Page           string `json:"page,omitempty"`
+	Auto           bool   `json:"auto,omitempty"`
+	// Analyze is set only by the chat UI's explicit RCA button. A message must
+	// never create work merely because it contains words such as "analyze".
+	Analyze         bool           `json:"analyze,omitempty"`
 	IncidentID      string         `json:"incident_id,omitempty"`
 	AlertID         string         `json:"alert_id,omitempty"`
 	IncidentTitle   string         `json:"incident_title,omitempty"`
@@ -61,6 +61,7 @@ type ChatConversation struct {
 
 const (
 	dashboardChatRecentLimit = 5
+	chatEvidenceLimit        = 12
 	maxChatMessageBytes      = 8000
 	maxChatMetadataBytes     = 256
 	maxChatHistoryMessages   = 200
@@ -83,7 +84,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	userMessageAt := time.Now().UTC()
 	req = s.enrichChatRequest(req)
-	if req.Analyze || wantsAnalysisRun(req.Message) {
+	if req.Analyze {
 		targetType, targetID, inferred := s.chatAnalysisTarget(req)
 		adHoc := false
 		if targetType == "" || targetID == "" {
@@ -339,13 +340,13 @@ func recentRunSummaries(runs []AnalysisRun, limit int) []map[string]any {
 
 func alertSummary(alert AlertRecord) map[string]any {
 	return map[string]any{
-		"alert_id":         alert.AlertID,
-		"incident_id":      alert.IncidentID,
-		"title":            excerpt(alert.AlarmTitle, 120),
-		"severity":         alert.Severity,
-		"status":           alert.Status,
-		"fired_at":         alert.FiredAt,
-		"is_analyzing":     alert.IsAnalyzing,
+		"alert_id":     alert.AlertID,
+		"incident_id":  alert.IncidentID,
+		"title":        excerpt(alert.AlarmTitle, 120),
+		"severity":     alert.Severity,
+		"status":       alert.Status,
+		"fired_at":     alert.FiredAt,
+		"is_analyzing": alert.IsAnalyzing,
 	}
 }
 
@@ -379,59 +380,6 @@ func runSummary(run AnalysisRun) map[string]any {
 func adHocFingerprint(conversationID, message string) string {
 	digest := sha256.Sum256([]byte(conversationID + "\x00" + strings.TrimSpace(message)))
 	return "chat-adhoc-" + hex.EncodeToString(digest[:8])
-}
-
-func wantsAnalysisRun(message string) bool {
-	lowered := strings.ToLower(strings.TrimSpace(message))
-	if lowered == "" {
-		return false
-	}
-	if strings.Contains(lowered, "re-analyze") ||
-		strings.Contains(lowered, "reanalyze") ||
-		strings.Contains(lowered, "run analysis") ||
-		strings.Contains(lowered, "start analysis") ||
-		strings.Contains(lowered, "create analysis") ||
-		strings.Contains(lowered, "new analysis") ||
-		strings.Contains(lowered, "diagnose") ||
-		strings.Contains(lowered, "investigate") {
-		return true
-	}
-	// Verb "analyze" + "again" = re-run ("analyze this again"); the noun form
-	// ("show the analysis again") is a replay and does not contain "analyze".
-	if strings.Contains(lowered, "analyze") && strings.Contains(lowered, "again") {
-		return true
-	}
-	if strings.Contains(lowered, "analyze") && strings.Contains(lowered, "rca") {
-		return true
-	}
-	if strings.Contains(message, "재분석") {
-		return true
-	}
-	// "분석 결과"/"진단 결과" names the report we already produced, so an action
-	// verb attached to it ("요약해줘") is a replay, not a request to re-run.
-	if strings.Contains(message, "분석 결과") || strings.Contains(message, "진단 결과") {
-		return false
-	}
-	// "원인 찾아줘" is a request to work, "원인이 뭐야?" is a question about the
-	// RCA we already have — only the action verbs trigger a run.
-	if strings.Contains(message, "원인") {
-		for _, token := range []string{"찾아", "파악해", "밝혀"} {
-			if strings.Contains(message, token) {
-				return true
-			}
-		}
-	}
-	if !strings.Contains(message, "분석") && !strings.Contains(message, "진단") {
-		return false
-	}
-	// "다시" alone is NOT a token: "분석 결과 다시 보여줘" is a replay request,
-	// not a re-analysis ("다시 분석해줘" already matches via 해줘/돌려).
-	for _, token := range []string{"해줘", "돌려", "진행", "요청", "새로", "시작", "만들"} {
-		if strings.Contains(message, token) {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) chatAnalysisTarget(req ChatRequest) (string, string, bool) {
@@ -554,12 +502,20 @@ func incidentChatContent(detail *IncidentDetail) string {
 		"Incident ID: " + detail.IncidentID,
 		"Status: " + detail.Status,
 		"Severity: " + detail.Severity,
+		"Analysis status: " + analysisStatusForChat(detail),
 		"Analysis summary: " + detail.AnalysisSummary,
 		"Analysis detail: " + excerpt(detail.AnalysisDetail, 4000),
 		"Missing data: " + strings.Join(detail.MissingData, ", "),
 		"Warnings: " + strings.Join(detail.Warnings, ", "),
 		"Alerts: " + strings.Join(alerts, " | "),
 	}, "\n")
+}
+
+func analysisStatusForChat(detail *IncidentDetail) string {
+	if detail != nil && detail.IsAnalyzing {
+		return "analyzing"
+	}
+	return "not running"
 }
 
 func alertChatContent(alert *AlertRecord) string {
@@ -598,16 +554,128 @@ func incidentChatContext(detail *IncidentDetail) map[string]any {
 		"title":             excerpt(detail.Title, 120),
 		"severity":          detail.Severity,
 		"status":            detail.Status,
+		"is_analyzing":      detail.IsAnalyzing,
+		"active_run_id":     detail.ActiveAnalysisRunID,
 		"analysis_summary":  detail.AnalysisSummary,
 		"analysis_quality":  detail.AnalysisQuality,
 		"capabilities":      detail.Capabilities,
 		"missing_data":      detail.MissingData,
 		"warnings":          detail.Warnings,
+		"evidence_trace":    chatEvidenceTrace(detail.Artifacts, detail.AnalysisDetail, detail.EvidenceTrace),
 		"similar_incidents": compactSimilarIncidentContext(detail.SimilarIncidents),
 		"feedback":          feedbackChatContext(detail.Feedback),
 		"alerts":            alerts,
 		"omitted_alerts":    max(0, len(detail.Alerts)-len(alerts)),
 	}
+}
+
+// chatEvidenceTrace keeps evidence identifiers, scope/timing summaries, and
+// verdict metadata available to chat without exposing raw collector payloads.
+// The report's Evidence Trace is the agent's actual citation set, so it wins
+// over generic collector status (for example, a cited artifact can be status=ok).
+func chatEvidenceTrace(artifacts []Artifact, detail string, trace map[string]any) []map[string]any {
+	items := make([]map[string]any, 0, min(len(artifacts), chatEvidenceLimit))
+	seen := map[string]struct{}{}
+	traceByID := chatEvidenceTraceByID(trace)
+	cited := map[string]struct{}{}
+	citedIDs := evidenceIDsInDetail(detail)
+	for _, evidenceID := range citedIDs {
+		cited[evidenceID] = struct{}{}
+	}
+	appendArtifact := func(artifact Artifact) {
+		if len(items) == chatEvidenceLimit || strings.TrimSpace(artifact.EvidenceID) == "" {
+			return
+		}
+		if _, ok := seen[artifact.EvidenceID]; ok {
+			return
+		}
+		item := map[string]any{
+			"evidence_id": artifact.EvidenceID,
+			"agent":       artifact.Agent,
+			"source":      artifact.Source,
+			"type":        artifact.Type,
+			"status":      artifact.Status,
+			"confidence":  artifact.Confidence,
+			"citation":    "context_only",
+		}
+		if _, ok := cited[artifact.EvidenceID]; ok {
+			item["citation"] = "direct"
+		}
+		if summary := strings.TrimSpace(artifact.Summary); summary != "" {
+			item["summary"] = excerpt(summary, 600)
+		}
+		if len(artifact.Highlights) > 0 {
+			item["highlights"] = artifact.Highlights[:min(len(artifact.Highlights), 4)]
+		}
+		for key, value := range traceByID[artifact.EvidenceID] {
+			item[key] = value
+		}
+		items = append(items, item)
+		seen[artifact.EvidenceID] = struct{}{}
+	}
+	byID := make(map[string]Artifact, len(artifacts))
+	for _, artifact := range artifacts {
+		byID[artifact.EvidenceID] = artifact
+	}
+	for _, evidenceID := range citedIDs {
+		appendArtifact(byID[evidenceID])
+	}
+	appendMatching := func(observedOnly bool) {
+		for _, artifact := range artifacts {
+			if observedOnly && !strings.EqualFold(artifact.Status, "observed") {
+				continue
+			}
+			appendArtifact(artifact)
+		}
+	}
+	appendMatching(true)
+	appendMatching(false)
+	return items
+}
+
+func chatEvidenceTraceByID(trace map[string]any) map[string]map[string]any {
+	byID := map[string]map[string]any{}
+	items, _ := trace["evidence"].([]any)
+	for _, raw := range items {
+		entry, _ := raw.(map[string]any)
+		id, _ := entry["evidence_id"].(string)
+		if id == "" {
+			continue
+		}
+		projection := map[string]any{}
+		for _, key := range []string{"entity", "coverage", "temporal_relation", "polarity", "predicate", "quality"} {
+			if value, ok := entry[key]; ok && value != nil && fmt.Sprint(value) != "" {
+				projection[key] = value
+			}
+		}
+		if window, ok := entry["observation_window"].(map[string]any); ok {
+			start, end := fmt.Sprint(window["start"]), fmt.Sprint(window["end"])
+			if start != "" || end != "" {
+				projection["observation_window"] = map[string]any{"start": start, "end": end}
+			}
+		}
+		byID[id] = projection
+	}
+	return byID
+}
+
+func evidenceIDsInDetail(detail string) []string {
+	ids := []string{}
+	for _, line := range strings.Split(detail, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "- [E") {
+			continue
+		}
+		end := strings.Index(line, "]")
+		if end <= 3 {
+			continue
+		}
+		id := line[3:end]
+		if _, err := strconv.Atoi(strings.TrimPrefix(id, "E")); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func alertChatContext(alert *AlertRecord) map[string]any {

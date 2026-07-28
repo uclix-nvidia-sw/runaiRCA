@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 
 from app.collectors.base import AnalysisTarget, resolve_target
@@ -33,6 +34,7 @@ _log = logging.getLogger(__name__)
 _MAX_STEPS = 4
 _MAX_QUERIES_PER_STEP = 3
 _RESULT_CHARS = 1500
+_EVIDENCE_ID_PATTERN = re.compile(r"\bE\d+\b", re.IGNORECASE)
 
 AnalyzeFn = Callable[[AlertAnalysisRequest], Awaitable[AlertAnalysisResponse]]
 
@@ -110,8 +112,8 @@ async def answer_chat(
             action = str(decision.get("action") or "")
             if action == "answer":
                 text = _strip_tool_echo(str(decision.get("answer") or ""))
-                if text:
-                    return masker.mask_text(text), None
+                if _actionable_answer(text):
+                    return masker.mask_text(_ensure_direct_evidence_ids(text, question, request)), None
                 break
             if action == "query":
                 await _run_queries(settings, tools, target, decision, history)
@@ -121,7 +123,10 @@ async def answer_chat(
                 break
         # Loop ended without a direct answer (or hit the step cap): synthesize a
         # final answer from the grounding + whatever the tools/analysis returned.
-        return await _final_answer(settings, grounding, question, history)
+        answer, error = await _final_answer(settings, grounding, question, history)
+        if answer:
+            return masker.mask_text(_ensure_direct_evidence_ids(answer, question, request)), error
+        return None, error
     except Exception as exc:  # noqa: BLE001 - chat is best-effort; caller degrades
         _log.debug("agentic chat aborted", exc_info=True)
         return None, masker.mask_text(f"{exc.__class__.__name__}: {exc}")
@@ -248,9 +253,37 @@ async def _final_answer(
     )
     if text and text.strip():
         cleaned = _strip_tool_echo(text)
-        if cleaned:
+        if _actionable_answer(cleaned):
             return masker.mask_text(cleaned), None
-    return None, masker.mask_text(error or "the chat agent produced no answer")
+    return None, masker.mask_text(error or "the chat agent produced no actionable answer")
+
+
+def _actionable_answer(text: str) -> bool:
+    """A root-cause label alone is never an operator-facing chat response."""
+    return text.strip().casefold() not in {"", "insufficient_evidence"}
+
+
+def _ensure_direct_evidence_ids(answer: str, question: str, request: ChatRequest) -> str:
+    """Keep an evidence-ID answer auditable when the model omits its citation."""
+    asked = question.casefold()
+    if not any(token in asked for token in ("evidence id", "evidence_id", "증거 id", "증거id", "근거 id", "근거id")):
+        return answer
+    if _EVIDENCE_ID_PATTERN.search(answer):
+        return answer
+    context = request.context if isinstance(request.context, dict) else {}
+    incident = context.get("incident") if isinstance(context.get("incident"), dict) else {}
+    trace = context.get("evidence_trace") or incident.get("evidence_trace")
+    if not isinstance(trace, list):
+        return answer
+    direct = [
+        str(item.get("evidence_id") or "").strip()
+        for item in trace
+        if isinstance(item, dict) and str(item.get("citation") or "").casefold() == "direct"
+    ]
+    direct = list(dict.fromkeys(item for item in direct if _EVIDENCE_ID_PATTERN.fullmatch(item)))
+    if not direct:
+        return answer
+    return f"{answer.rstrip()}\n\n직접 근거 ID: {', '.join(f'[{item}]' for item in direct)}"
 
 
 def _strip_tool_echo(text: str) -> str:
@@ -362,7 +395,13 @@ def _system_prompt(
         "real root-cause investigation of a target.\n"
         "When a tool genuinely returns no evidence, say what you ran and label any "
         "remaining guidance as general and conditional; never claim a cause is present "
-        "or a remediation succeeded.\n"
+        "or a remediation succeeded. Never return only a root-cause-family token such as "
+        "insufficient_evidence: name the target, missing evidence, and next check.\n"
+        "In grounded Evidence Trace entries, only citation=direct can establish the current "
+        "RCA. citation=context_only records collection context and cannot prove a cause.\n"
+        "When the operator asks for an evidence ID, cite each supporting direct entry as "
+        "[E##]. Never call an incident ID an evidence ID, and never state that a field is "
+        "both explicitly observed and merely inferred.\n"
         'Respond with ONLY JSON, one of:\n'
         '{"action":"answer","answer":str}\n'
         '{"action":"query","reason":str,"queries":[{"tool":str,"args":{...}}]}'

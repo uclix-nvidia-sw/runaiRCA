@@ -49,6 +49,46 @@ async def test_direct_answer_no_tools(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_evidence_id_question_appends_direct_citation_when_llm_omits_it(monkeypatch) -> None:
+    _script(monkeypatch, [{"action": "answer", "answer": "OOMKilled가 직접 관찰됐습니다."}])
+
+    async def analyze_fn(_request):
+        raise AssertionError("analyze should not run for a direct answer")
+
+    text, error = await chat_agent.answer_chat(
+        _settings(),
+        ChatRequest(
+            message="evidence ID를 알려줘",
+            context={"incident": {"evidence_trace": [
+                {"evidence_id": "E20", "citation": "direct"},
+                {"evidence_id": "E01", "citation": "context_only"},
+            ]}},
+        ),
+        "ctx",
+        analyze_fn=analyze_fn,
+    )
+
+    assert error is None
+    assert "[E20]" in text
+    assert "[E01]" not in text
+
+
+@pytest.mark.asyncio
+async def test_bare_insufficient_evidence_falls_back_to_grounding(monkeypatch) -> None:
+    _script(monkeypatch, [{"action": "answer", "answer": "insufficient_evidence"}], final="insufficient_evidence")
+
+    async def analyze_fn(_request):
+        raise AssertionError("analyze should not run for a direct answer")
+
+    text, error = await chat_agent.answer_chat(
+        _settings(), ChatRequest(message="what evidence is missing?"), "target=dgx01", analyze_fn=analyze_fn
+    )
+
+    assert text is None
+    assert error == "the chat agent produced no actionable answer"
+
+
+@pytest.mark.asyncio
 async def test_direct_llm_answer_is_masked_before_return(monkeypatch) -> None:
     _script(
         monkeypatch,

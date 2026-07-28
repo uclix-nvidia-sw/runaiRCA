@@ -673,6 +673,7 @@ func TestAgentDeadlineTerminalResponsePreservesLastGoodRCAAndMetadata(t *testing
 			AnalysisSummary: "deadline fallback must not replace trusted RCA",
 			AnalysisDetail:  "terminal attempt exceeded its deadline",
 			AnalysisQuality: "degraded",
+			Warnings:        []string{"analysis exceeded the 1000s deadline and was stopped"},
 			Context: map[string]any{
 				"analysis_hash": "hash-deadline-attempt",
 				"harness":       map[string]any{"verdict": "failed"},
@@ -720,6 +721,10 @@ func TestAgentDeadlineTerminalResponsePreservesLastGoodRCAAndMetadata(t *testing
 	if harness["verdict"] != "pass" || usage["total_tokens"] != float64(42) ||
 		failed.Metadata[previousSuccessMetadataKey] != nil {
 		t.Fatalf("terminal retry did not restore last-good metadata: %+v", failed.Metadata)
+	}
+	if !strings.Contains(strings.Join(failed.Warnings, "\n"), "deadline_exceeded") ||
+		!strings.Contains(strings.Join(failed.Warnings, "\n"), "analysis exceeded the 1000s deadline") {
+		t.Fatalf("terminal retry discarded its failure reason: %+v", failed.Warnings)
 	}
 	detail, ok := server.store.IncidentDetail(incident.IncidentID)
 	if !ok || detail.AnalysisSummary != prior.AnalysisSummary ||
@@ -1992,5 +1997,27 @@ func TestSynthesisContextReachesRunMetadata(t *testing.T) {
 	synthesis, _ := completed.Metadata["synthesis"].(map[string]any)
 	if synthesis["status"] != "completed" || synthesis["duration_seconds"] != float64(12.5) {
 		t.Fatalf("synthesis diagnostics did not reach run metadata: %+v", completed.Metadata)
+	}
+}
+
+func TestIncidentDetailKeepsTraceMetadataForChatEvidence(t *testing.T) {
+	store := NewStore()
+	_, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "chat-trace"}, Alert{
+		Status: "firing", Labels: map[string]string{"alertname": "RunaiProjectControllerReconcileFailure"}, Fingerprint: "fp-chat-trace",
+	})
+	run := store.CreateAnalysisRun("chat", "incident", alert.IncidentID, alert.IncidentID, alert.AlertID, "Chat", "")
+	store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "Controller error.",
+		Context: map[string]any{"reasoning_trace_v3": map[string]any{"evidence": []any{map[string]any{
+			"evidence_id": "E13", "entity": "pod:runai-project-controller", "coverage": "scoped", "temporal_relation": "during_incident",
+		}}}},
+	})
+	detail, ok := store.IncidentDetail(alert.IncidentID)
+	if !ok || detail.EvidenceTrace == nil {
+		t.Fatalf("incident detail lost trace metadata: ok=%t detail=%+v", ok, detail)
+	}
+	items, _ := detail.EvidenceTrace["evidence"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("unexpected chat trace projection: %+v", detail.EvidenceTrace)
 	}
 }

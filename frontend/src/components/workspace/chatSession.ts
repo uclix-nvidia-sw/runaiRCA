@@ -42,8 +42,8 @@ export type ChatContextValue = {
 };
 
 // 'auto' follows the open page; 'cluster' forces whole-cluster (no context);
-// 'incident:<id>' / 'alert:<id>' pin the conversation to that target.
-export type ChatContextChoice = 'auto' | 'cluster' | `incident:${string}` | `alert:${string}`;
+// an explicit incident pins the conversation to its RCA.
+export type ChatContextChoice = 'auto' | 'cluster' | `incident:${string}`;
 
 const MAX_CONVERSATIONS = 30;
 
@@ -141,10 +141,6 @@ export function useRcaChat({
       incidentID = contextChoice.slice('incident:'.length);
       alertID = '';
       contextLabel = `Incident ${incidentID}`;
-    } else if (contextChoice.startsWith('alert:')) {
-      alertID = contextChoice.slice('alert:'.length);
-      incidentID = '';
-      contextLabel = `Alert ${alertID}`;
     }
     const userMessage = makeChatMessage('user', message);
     const baseConversation: ChatConversation = activeConversation ?? {
@@ -239,7 +235,6 @@ export function useRcaChat({
   return {
     activeConversation,
     activeConversationID,
-    alerts,
     chatContext,
     contextChoice,
     conversations,
