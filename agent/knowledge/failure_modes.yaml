@@ -847,13 +847,6 @@
       actions:
         - "Confirm the queue/project GPU quota against the requested GPU count."
         - "Check higher-priority workloads consuming the allocation (preemption)."
-    - name: Node Cordon Excludes It From Scheduling
-      name_ko: 노드 Cordon으로 인한 스케줄링 제외
-      keywords: [cordon, schedulingdisabled, "were unschedulable", "node.kubernetes.io/unschedulable"]
-      actions:
-        - "A cordoned node (spec.unschedulable=true / SchedulingDisabled) is excluded from scheduling, so Pending pods reporting 'N node(s) were unschedulable' may be blocked by an intentional or forgotten cordon. Check `kubectl get nodes` for SchedulingDisabled; run `kubectl uncordon <node>` if it is unintended leftover from maintenance/drain. If maintenance is intentionally in progress, the Pending state is expected."
-      actions_ko:
-        - "Cordon된 노드(spec.unschedulable=true / SchedulingDisabled)는 스케줄링에서 제외되므로, 'N node(s) were unschedulable'을 보고하는 Pending Pod는 의도했거나 잊힌 cordon 때문에 막혔을 수 있습니다. `kubectl get nodes`에서 SchedulingDisabled를 확인하고, 유지보수/drain 후 남은 의도치 않은 cordon이면 `kubectl uncordon <node>`를 실행하세요. 유지보수가 의도적으로 진행 중이면 Pending 상태는 예상된 동작입니다."
     # ALWAYS disambiguate which scheduler before diagnosing a scheduling failure:
     # Run:ai has its OWN scheduler; the Kubernetes default-scheduler is a different
     # component that does not understand GPU quota / pod-groups.
@@ -897,6 +890,7 @@
 - family: platform_lifecycle_change
   symptoms:
     - name: GPU Operator Stack Upgrade In Progress
+      requires_lifecycle_signal: true
       keywords: ["gpu-operator upgrade", "gpu-driver-upgrade", "driver-upgrade-state", "upgrade-failed", "operator is being upgraded", "helm upgrade gpu-operator"]
       actions:
         - "This is a lifecycle event, NOT a hardware/node fault: the NVIDIA GPU Operator stack is mid-rollout, so its operand DaemonSets (nvidia-driver → nvidia-container-toolkit → nvidia-device-plugin) and the dependent runai-container-toolkit cycle as pods drain and re-create. The downstream 'rollout stuck' / 'not ready' alert is a symptom of the upgrade, not a separate failure."
@@ -904,19 +898,26 @@
         - "Check every operand pod is Ready on every GPU node: `kubectl get pods -n gpu-operator -o wide` and `kubectl get ds -n gpu-operator` (DESIRED == READY). DESIRED 0 usually means NoSchedule node taints, not a fault."
         - "Only after the operator namespace is healthy, re-check the downstream: `kubectl -n runai rollout status ds/runai-container-toolkit`. If the upstream stack is Ready and this is still stuck, THEN dig into the node (driver load, containerd 'nvidia' runtime)."
     - name: Controller Rollout In Progress (generation != observedGeneration)
+      requires_lifecycle_signal: true
       keywords: ["mid-rollout", "observedgeneration", "rollingupdate"]
       actions:
         - "The implicated Deployment/DaemonSet/StatefulSet is mid-rollout (spec generation the status hasn't caught up to). Pods terminating/creating during this window are EXPECTED. Watch it converge: `kubectl -n <ns> rollout status <kind>/<name>`."
         - "If it is genuinely stuck, read WHY the new pods aren't going Ready: `kubectl -n <ns> describe <kind>/<name>` and the newest pod's events/logs — treat that specific reason (ImagePull, CrashLoop, scheduling) as the real sub-cause. Do NOT attribute it to node pressure unless the node conditions are actually True."
-    - name: Node Administratively Cordoned (SchedulingDisabled)
-      # No "unschedulable" token here on purpose: it belongs to the scheduling
-      # symptoms' vocabulary and would compete with them in fuzzy matching.
-      keywords: ["cordoned", "schedulingdisabled"]
+    # Rehomed from k8s_scheduling_error (2026-07-28): a cordon is an
+    # administrative action, not a scheduler fault. Whether the alert is the
+    # node itself (Ready,SchedulingDisabled) or a pod left Pending by it, the
+    # root cause is the same operator change and the fix is uncordon.
+    # No "unschedulable" token here on purpose: it belongs to the scheduling
+    # symptoms' vocabulary and would compete with them in fuzzy matching.
+    - name: Node Cordon Excludes It From Scheduling
+      name_ko: 노드 Cordon으로 인한 스케줄링 제외
+      keywords: [cordon, schedulingdisabled, "node.kubernetes.io/unschedulable"]
       actions:
-        - "The node reports Ready,SchedulingDisabled: spec.unschedulable=true was set by an administrator (`kubectl cordon` or a drain). This is an operational action, not a node or scheduler fault — the kubelet and node conditions are healthy, the node is only excluded from NEW scheduling."
-        - "Confirm the state and impact: `kubectl get node <node>` (STATUS Ready,SchedulingDisabled) and `kubectl get pods -A --field-selector spec.nodeName=<node>` — running pods keep running; only pending pods citing 'node(s) were unschedulable' are downstream of the cordon."
-        - "If the cordon was intentional maintenance, finish the work and restore scheduling with `kubectl uncordon <node>`. If nobody claims it, the API audit log (when enabled) records who patched spec.unschedulable and when."
+        - "A cordoned node (spec.unschedulable=true / SchedulingDisabled) is excluded from NEW scheduling only: the kubelet and node conditions stay healthy and running pods keep running, while Pending pods reporting 'N node(s) were unschedulable' are downstream of the cordon. Check `kubectl get nodes` for SchedulingDisabled; run `kubectl uncordon <node>` if it is unintended leftover from maintenance/drain. If maintenance is intentionally in progress, the state is expected; the API audit log (when enabled) records who patched spec.unschedulable and when."
+      actions_ko:
+        - "Cordon된 노드(spec.unschedulable=true / SchedulingDisabled)는 신규 스케줄링에서만 제외됩니다: kubelet과 노드 컨디션은 정상이고 실행 중인 Pod도 계속 돌며, 'N node(s) were unschedulable'을 보고하는 Pending Pod만 cordon의 하류 영향입니다. `kubectl get nodes`에서 SchedulingDisabled를 확인하고, 유지보수/drain 후 남은 의도치 않은 cordon이면 `kubectl uncordon <node>`를 실행하세요. 유지보수가 의도적으로 진행 중이면 예상된 상태이며, audit log가 켜져 있다면 누가 언제 spec.unschedulable을 변경했는지 기록됩니다."
     - name: Helm Release Recently Changed
+      requires_lifecycle_signal: true
       keywords: ["pending-upgrade", "pending-install", "helm.sh/release", "helm history", "helm upgrade"]
       actions:
         - "A Helm release around the alert window changed. Confirm it converged: `helm -n <ns> history <release>` — a revision stuck in pending-upgrade/pending-install/failed is the root cause; roll back or re-run the upgrade."

@@ -698,3 +698,59 @@ async def test_refuting_one_xid_keeps_other_supported_xids(monkeypatch) -> None:
     assert "Not enough evidence for concrete actions yet" not in response.analysis_detail
     assert "reset the NVLink fabric" in response.analysis_detail
     assert "do not use app-crash fix" not in response.analysis_detail
+
+
+@pytest.mark.asyncio
+async def test_manual_cordon_concludes_lifecycle_change_end_to_end() -> None:
+    # INC-1785215448065944607 end-to-end: the cordon evidence must carry the
+    # conclusion even though no planner hypothesis proposes an administrative
+    # action — ranking is evidence-driven over the catalog, not limited to the
+    # LLM ledger.
+    from dataclasses import replace as dc_replace
+
+    from app.collectors.kubernetes import _node_cordon_artifact
+    from tests.test_orchestrator import make_target
+
+    target = dc_replace(
+        make_target(),
+        namespace="",
+        pod="",
+        workload_name="",
+        node="k8s-lb-01",
+        alert_name="RunaiNodeUnschedulableOrNotReady",
+        fired_at="2026-07-28T05:05:00Z",
+        resolved_at="",
+    )
+    cordon = _node_cordon_artifact(
+        "kubernetes",
+        target,
+        [{"name": "node", "data": {"name": "k8s-lb-01", "unschedulable": True}}],
+        time_range={"start": "2026-07-28T05:05:00Z", "end": "2026-07-28T05:15:00Z"},
+    )[0]
+    result = CollectorResult(
+        agent="kubernetes",
+        status="ok",
+        summary="node/k8s-lb-01 is cordoned (SchedulingDisabled)",
+        artifacts=[cordon],
+        confidence="high",
+    )
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={
+                "alertname": "RunaiNodeUnschedulableOrNotReady",
+                "node": "k8s-lb-01",
+            },
+            annotations={
+                "summary": "Node k8s-lb-01 is either unschedulable or has unknown status"
+            },
+            fingerprint="fp-cordon-e2e",
+        )
+    )
+    state = pipeline.new_state(
+        make_settings(), request, collectors=[StaticCollector(result)]
+    )
+    response = await pipeline.run_pipeline(state)
+
+    assert _top_family(response) == "platform_lifecycle_change"
+    assert "uncordon" in response.analysis_detail.casefold()

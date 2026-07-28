@@ -362,14 +362,27 @@ def test_lifecycle_symptom_promotion_is_gated_by_active_signal() -> None:
         {
             "symptom": "Controller Rollout In Progress",
             "matched_keywords": ["mid-rollout"],
+            "requires_lifecycle_signal": True,
         },
     )]
 
-    # inactive (or absent) lifecycle -> lifecycle symptom is dropped, ranker stands
+    # inactive (or absent) lifecycle -> rollout symptom is dropped, ranker stands
     gated = _gate_lifecycle_symptoms(sym, {"active": False})
     assert gated == []
     assert _promote_signature_cause(ranked, [], [], gated)[0].family == "node_kubelet_pressure"
     assert _gate_lifecycle_symptoms(sym, None) == []
+
+    # a lifecycle symptom grounded in its own specific evidence (node cordon)
+    # is NOT rollout-flavored and passes without the signal
+    cordon = [(
+        "platform_lifecycle_change",
+        {
+            "symptom": "Node Cordon Excludes It From Scheduling",
+            "matched_keywords": ["cordon", "schedulingdisabled"],
+            "requires_lifecycle_signal": False,
+        },
+    )]
+    assert _gate_lifecycle_symptoms(cordon, None) == cordon
 
     # a NON-lifecycle symptom is never gated
     other = [(

@@ -75,7 +75,10 @@ def test_image_pull_signatures_separate_auth_repository_ambiguity_and_tag() -> N
     assert not any(family == "image_pull_error" for family, _symptom in unrelated)
 
 
-def test_node_cordon_summary_matches_k8s_scheduling_symptom() -> None:
+def test_node_cordon_summary_matches_lifecycle_symptom() -> None:
+    # Rehomed 2026-07-28: a cordon is an administrative action, so the curated
+    # cordon symptom lives under platform_lifecycle_change, not the
+    # kube-scheduler fault family.
     modes = load_failure_modes(YAML)
     summary = (
         "node/node1 is cordoned (SchedulingDisabled — spec.unschedulable=true), "
@@ -85,7 +88,7 @@ def test_node_cordon_summary_matches_k8s_scheduling_symptom() -> None:
 
     hits = match_failure_mode_symptoms(modes, summary, "")
     assert any(
-        family == "k8s_scheduling_error"
+        family == "platform_lifecycle_change"
         and symptom["symptom"] == "Node Cordon Excludes It From Scheduling"
         for family, symptom in hits
     )

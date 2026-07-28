@@ -545,6 +545,13 @@ def _alert_signature_evidence_result(
 ) -> CollectorResult | None:
     """Materialize explicit alert failure signatures as typed, citable evidence."""
     codes, matched_by_family = _asserted_alert_signatures(request)
+    # "Unschedulable" in a NODE alert's prose describes the node's own
+    # administrative state (cordon), not a pod-scheduling failure — a
+    # node-target alert cannot mint pod-scheduling evidence
+    # (INC-1785215448065944607: a manual cordon scored k8s_scheduling_error
+    # from its alert title alone).
+    if not (target.pod or target.workload_name):
+        matched_by_family.pop("k8s_scheduling_error", None)
     asserted_texts = _asserted_alert_texts(request)
     asserted_known_issues: list[dict[str, Any]] = []
     for entry in match_runai_known_issues(
@@ -1678,18 +1685,24 @@ _LIFECYCLE_FAMILY = "platform_lifecycle_change"
 def _gate_lifecycle_symptoms(
     matches: list[tuple[str, dict]], lifecycle: dict[str, object] | None
 ) -> list[tuple[str, dict]]:
-    """Drop lifecycle symptom matches unless the lifecycle signal is active.
+    """Drop rollout-flavored lifecycle symptoms unless the signal is active.
 
     ``_promote_signature_cause`` runs after the ranker and can override its top
-    family from a curated symptom keyword. The lifecycle symptoms match the
-    change collector's generic ``mid-rollout`` text, so WITHOUT this gate a
+    family from a curated symptom keyword. Rollout symptoms match the change
+    collector's generic ``mid-rollout`` text, so WITHOUT this gate a
     coincidental unrelated rollout in the alert namespace could promote
-    ``platform_lifecycle_change`` over a genuine fault — the exact ungated
-    over-attribution the ranker's component-chain gate was built to prevent.
+    ``platform_lifecycle_change`` over a genuine fault. Those symptoms carry
+    ``requires_lifecycle_signal: true`` in failure_modes.yaml; lifecycle
+    symptoms grounded in their own specific evidence (a node cordon) pass
+    ungated — the family-wide drop silently unplugged the cordon playbook.
     """
     if lifecycle and lifecycle.get("active"):
         return matches
-    return [(fam, sym) for fam, sym in matches if fam != _LIFECYCLE_FAMILY]
+    return [
+        (fam, sym)
+        for fam, sym in matches
+        if fam != _LIFECYCLE_FAMILY or not sym.get("requires_lifecycle_signal")
+    ]
 
 
 async def rank_stage(state: PipelineState) -> PipelineState:

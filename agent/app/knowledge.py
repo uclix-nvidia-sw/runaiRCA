@@ -1106,6 +1106,12 @@ def _load_failure_modes(path: str) -> dict[str, list[dict[str, Any]]]:
                     "reason": str(symptom.get("reason") or ""),
                     "reason_ko": str(symptom.get("reason_ko") or ""),
                     "exclusive_actions": bool(symptom.get("exclusive_actions", False)),
+                    # Rollout-flavored lifecycle symptoms match the change
+                    # collector's generic text and may only promote while the
+                    # rollout signal is active (_gate_lifecycle_symptoms).
+                    "requires_lifecycle_signal": bool(
+                        symptom.get("requires_lifecycle_signal", False)
+                    ),
                     # Optional link into runai_architecture.yaml: which platform
                     # component this symptom implicates (drives check paths).
                     "component": str(symptom.get("component") or ""),
