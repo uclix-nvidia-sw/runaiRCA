@@ -884,7 +884,16 @@ nodes:
 
   - id: crash_oomkilled
     <<: *workload_startup
-    probes: [{<<: *probe_workload_startup, id: k8s_troubleshooting:crash_oomkilled:p01}]
+    # The shared startup probe's verdict vocabulary cannot see an OOM: its
+    # support tokens are startup reasons and its "Running" refuter is wrong
+    # here — a restarted pod is Running while lastState still records the OOM.
+    probes:
+      - <<: *probe_workload_startup
+        id: k8s_troubleshooting:crash_oomkilled:p01
+        supports_when: ["the previous container state records an OOMKilled termination"]
+        refutes_when: ["the container terminated deliberately with no forced kill"]
+        support_signal_any: ["OOMKilled"]
+        refute_signal_any: []
     question: "Does the previous container state record OOMKilled before the restart, and was memory use near its cgroup limit? Healthy termination has a deliberate exit or no forced kill. If no typed OOM state exists, investigate the actual exit, probe, node pressure, or GPU/runtime error instead."
     match:
       any: [oomkilled, out of memory, exit code 137]

@@ -56,3 +56,37 @@ def test_scoped_probe_evaluation_rejects_partial_remote_signal() -> None:
     )
 
     assert assessment.verdict == "inconclusive"
+
+
+def test_oom_probe_supports_from_last_state_even_while_running() -> None:
+    # INC-1785219127694654485: the crash_oomkilled probe reused the startup
+    # anchor's vocabulary — no OOM support token, and "Running" as a refuter —
+    # so a restarted pod whose lastState records the OOM came back
+    # inconclusive despite perfect evidence. The tree now gives that probe its
+    # own vocabulary; replay the exact shape here.
+    import yaml
+
+    tree = yaml.safe_load(open("knowledge/k8s_troubleshooting_tree.yaml"))
+    nodes = tree["nodes"] if isinstance(tree, dict) else tree
+    oom_probe = next(
+        probe
+        for node in nodes
+        if isinstance(node, dict) and node.get("id") == "crash_oomkilled"
+        for probe in node.get("probes") or []
+    )
+    outcome = {
+        "result": {
+            "containers": [
+                {
+                    "state": {"running": {"startedAt": "2026-07-28T06:00:00Z"}},
+                    "lastState": {
+                        "terminated": {"reason": "OOMKilled", "exitCode": 137}
+                    },
+                    "restartCount": 4,
+                }
+            ]
+        }
+    }
+    assessment = evaluate_probe(oom_probe, outcome)
+    assert assessment.verdict == "supports"
+    assert assessment.support_signals == ("OOMKilled",)
