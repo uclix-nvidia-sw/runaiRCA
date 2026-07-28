@@ -6077,6 +6077,12 @@ def _runai_crd_health_artifacts(
             "coverage": coverage,
             "observed_entity": {"kind": kind, "name": name, "namespace": namespace},
             "observation_window": time_range if scoped else {},
+            # Typed phase for the ranker: a bare "Pending"/"Unschedulable" on a
+            # Run:ai CRD is the Run:ai scheduler's admission verdict, not
+            # kube-scheduler's — without this a message-less finding either
+            # supports nothing or drifts to k8s_scheduling_error via the
+            # "unschedulable" keyword.
+            "runai_phase": reason,
         }
         if scoped:
             observation["evidence_window"] = {"start": transitioned_at, "end": transitioned_at}
