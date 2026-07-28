@@ -578,6 +578,55 @@ func TestHarnessClaimEvidenceFallbackCompilesKnowledge(t *testing.T) {
 	}
 }
 
+func TestHarnessClaimFallbackRetainsOnlyFamilyLinkedProbe(t *testing.T) {
+	snapshot := eligibleKnowledgeSnapshot()
+	harness := snapshot.Snapshot["metadata"].(map[string]any)["harness"].(map[string]any)
+	harness["diagnosis_state"] = "supported"
+	harness["claims"] = []any{map[string]any{
+		"family": snapshot.RootCauseFamily, "kind": "root_cause", "claim_id": "C01",
+		"confidence": "medium", "supporting_evidence": []any{"E-1"}, "contradicting_evidence": []any{},
+	}}
+	trace := knowledgeTraceForTest(snapshot)
+	trace["hypotheses"].([]any)[0].(map[string]any)["evidence_for"] = []any{}
+	trace["hypotheses"] = append(trace["hypotheses"].([]any), map[string]any{
+		"hypothesis_id": "H-other", "family": "gpu_hardware_error",
+	})
+	trace["probe_executions"] = append(trace["probe_executions"].([]any), map[string]any{
+		"execution_id": "P-other", "template_id": "gpu:xid:p01", "verdict": "supports",
+		"hypothesis_ids": []any{"H-other"}, "evidence_ids": []any{"E-1"},
+	})
+
+	candidate := knowledgeCandidateForSnapshot(snapshot)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("harness fallback should remain ready: %+v", candidate)
+	}
+	if got := candidate.ProbeTemplateIDs; len(got) != 1 || got[0] != "k8s_troubleshooting:scheduling_capacity:p01" {
+		t.Fatalf("fallback retained an unlinked or wrong-family probe: %+v", got)
+	}
+}
+
+func TestKnowledgeApprovalUpgradesLegacyCandidateWithMissingProbeIDs(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	candidate := knowledgeCandidateForSnapshot(snapshot)
+	if candidate == nil || len(candidate.ProbeTemplateIDs) != 1 {
+		t.Fatalf("fixture must include a linked probe: %+v", candidate)
+	}
+	legacyPayload := cloneCaseSnapshotPayload(candidate.Payload)
+	legacyPayload["compiled"].(map[string]any)["probe_template_ids"] = map[string]any{snapshot.RootCauseFamily: []string{}}
+	candidate.Payload = legacyPayload
+	candidate.ContentHash = knowledgeContentHash(candidate.Trace, candidate.Payload)
+	hydrateKnowledgeCandidate(candidate)
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	store.knowledgeCandidates[candidate.CandidateID] = candidate
+	confirmKnowledgeSnapshot(store, snapshot)
+
+	updated, pkg, err := store.ApproveKnowledgeCandidate(candidate.CandidateID, KnowledgeDecisionRequest{Actor: "operator"})
+	if err != nil || len(updated.ProbeTemplateIDs) != 1 || len(pkg.ProbeTemplateIDs) != 1 || pkg.ProbeTemplateIDs[0] != "k8s_troubleshooting:scheduling_capacity:p01" {
+		t.Fatalf("legacy candidate did not receive its trace-derived probe on approval: candidate=%+v package=%+v err=%v", updated, pkg, err)
+	}
+}
+
 func TestHarnessClaimEvidenceFallbackFailsClosedWithoutCleanSupport(t *testing.T) {
 	tests := []struct {
 		name    string
