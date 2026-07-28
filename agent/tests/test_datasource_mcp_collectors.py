@@ -797,8 +797,10 @@ async def test_kubernetes_collector_uses_mcp_before_service_account_token(
     assert all("tailLines" not in args and "sinceTime" not in args for args in pod_log_arguments)
     assert "events_list" in calls or "resources_list" in calls
     inspection = next(a for a in result.artifacts if a.type == "pod_inspection")
+    # kubectl shape is the READ, "MCP · " is the transport: this gather ran
+    # entirely over MCP, and the label must say so.
     assert inspection.query == (
-        "kubectl describe pod trainer-0 -n runai-vision; "
+        "MCP · kubectl describe pod trainer-0 -n runai-vision; "
         "kubectl get pod trainer-0 -n runai-vision -o yaml"
     )
     assert inspection.result["object"]["spec"]["containers"][0]["name"] == "main"

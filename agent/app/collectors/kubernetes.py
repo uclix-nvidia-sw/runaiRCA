@@ -2076,6 +2076,16 @@ class KubernetesCollector:
                 )
             )
 
+        if used_mcp:
+            # The base gather is transport-exclusive: when MCP succeeded, EVERY
+            # read above went through the MCP server, but shared artifact
+            # builders label queries in kubectl shape. Without this prefix one
+            # report shows "MCP resources_get node" next to "kubectl get pod …"
+            # and reads as half-MCP half-direct-API.
+            for item in artifacts:
+                if item.query and item.query.startswith("kubectl"):
+                    item.query = f"MCP · {item.query}"
+
         return CollectorResult(
             agent=self.name,
             status=status,
