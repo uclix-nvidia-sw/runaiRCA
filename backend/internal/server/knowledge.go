@@ -1175,6 +1175,21 @@ func promotionPayload(candidate, validated *KnowledgeCandidate) (map[string]any,
 	return cloneCaseSnapshotPayload(validated.Payload), true
 }
 
+// revalidationError names WHICH promotion-time recheck failed. The old blanket
+// "failed content-hash revalidation" hid the common case — the operator's
+// evaluation changed — behind hash jargon nobody could act on.
+func revalidationError(validated *KnowledgeCandidate, payloadOK bool) error {
+	switch {
+	case validated == nil:
+		return errors.New("no operator evaluation currently confirms this analysis; re-evaluate the incident")
+	case validated.Status != knowledgeCandidateReady:
+		return errors.New("analysis no longer compiles into promotable knowledge: " + validated.ValidationError)
+	case !payloadOK:
+		return errors.New("compiled knowledge changed since this candidate was generated; re-evaluate the incident to mint a fresh candidate")
+	}
+	return nil
+}
+
 func knowledgeFingerprint(payload map[string]any) string {
 	digest := sha256.Sum256(mustJSON(map[string]any{"family": payload["family"], "mechanism": payload["mechanism"], "root_cause_family": payload["root_cause_family"]}))
 	return hex.EncodeToString(digest[:])
@@ -1359,8 +1374,8 @@ func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRe
 	snapshot := s.caseSnapshots[candidate.CaseID]
 	validated := s.knowledgeCandidateForSnapshotLocked(snapshot)
 	payload, ok := promotionPayload(candidate, validated)
-	if validated == nil || validated.Status != knowledgeCandidateReady || !ok {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate failed content-hash revalidation")
+	if err := revalidationError(validated, ok); err != nil {
+		return KnowledgeCandidate{}, KnowledgePackage{}, err
 	}
 	now := time.Now().UTC()
 	actor, note := knowledgeActor(request.Actor), strings.TrimSpace(request.Note)
@@ -1417,8 +1432,8 @@ func (s *Store) ShadowKnowledgeCandidate(id string, request KnowledgeDecisionReq
 	}
 	validated := s.knowledgeCandidateForSnapshotLocked(s.caseSnapshots[candidate.CaseID])
 	payload, ok := promotionPayload(candidate, validated)
-	if validated == nil || validated.Status != knowledgeCandidateReady || !ok {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate failed content-hash revalidation")
+	if err := revalidationError(validated, ok); err != nil {
+		return KnowledgeCandidate{}, KnowledgePackage{}, err
 	}
 	now := time.Now().UTC()
 	actor, note := knowledgeActor(request.Actor), strings.TrimSpace(request.Note)
@@ -1458,8 +1473,8 @@ func (s *Store) ActivateShadowKnowledgeCandidate(id string, request KnowledgeDec
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge shadow package not found")
 	}
 	validated := s.knowledgeCandidateForSnapshotLocked(s.caseSnapshots[candidate.CaseID])
-	if validated == nil || validated.Status != knowledgeCandidateReady || validated.ContentHash != candidate.ContentHash {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate failed content-hash revalidation")
+	if err := revalidationError(validated, validated != nil && validated.ContentHash == candidate.ContentHash); err != nil {
+		return KnowledgeCandidate{}, KnowledgePackage{}, err
 	}
 	now := time.Now().UTC()
 	actor, note := knowledgeActor(request.Actor), strings.TrimSpace(request.Note)

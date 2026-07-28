@@ -426,7 +426,12 @@ func (s *Store) invalidateKnowledgeForReviewLocked(runID, analysisHash string, n
 		if snapshot == nil || snapshot.RunID != runID || snapshot.AnalysisHash != analysisHash {
 			continue
 		}
-		if s.knowledgeCandidateForSnapshotLocked(snapshot) == nil {
+		// A Ready candidate is a cached projection of the incident's current
+		// evaluation. A recompute that fails (confirmation withdrawn, quality
+		// gate lost) must withdraw the candidate exactly like one that
+		// vanishes, or the queue keeps advertising an approval that
+		// revalidation will always refuse.
+		if validated := s.knowledgeCandidateForSnapshotLocked(snapshot); validated == nil || validated.Status != knowledgeCandidateReady {
 			invalidCases[snapshot.CaseID] = true
 		}
 	}

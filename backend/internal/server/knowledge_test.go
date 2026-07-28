@@ -1266,3 +1266,52 @@ func TestRefineKnowledgeCandidateActionsAppliesAndStampsMarker(t *testing.T) {
 		t.Fatalf("refined candidate must leave the pending queue: %d", len(pending))
 	}
 }
+
+// A Ready candidate is a cached projection of the incident's live evaluation.
+// Withdrawing the operator confirmation must withdraw the candidate from the
+// review queue too; before this test the queue kept advertising Ready while
+// approval failed with a misleading "content-hash revalidation" error.
+func TestWithdrawnConfirmationWithdrawsReadyCandidate(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.ApprovalState = "active"
+	// Compile succeeds only through the operator-confirmed override: demote
+	// the trace hypothesis out of selected/supported status.
+	trace := snapshot.Snapshot["metadata"].(map[string]any)["reasoning_trace_v3"].(map[string]any)
+	trace["hypotheses"].([]any)[0].(map[string]any)["status"] = "rejected"
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+
+	review := &EvaluationReview{
+		ReviewID: "EVR-1", RunID: snapshot.RunID, AnalysisHash: snapshot.AnalysisHash,
+		Reviewer: "operator", CaseType: "known", ExpectedFamily: snapshot.RootCauseFamily,
+		Scores: qualifyingKnowledgeReviewScores(), ResolutionOutcome: "resolved",
+		OperatorConfirmed: true,
+	}
+	store.evaluationReviews[evaluationKey(snapshot.RunID, snapshot.AnalysisHash, review.Reviewer)] = review
+	candidate := store.knowledgeCandidateForSnapshotLocked(snapshot)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("expected confirmed-override candidate to be ready, got %+v", candidate)
+	}
+	store.knowledgeCandidates[candidate.CandidateID] = candidate
+
+	// The operator re-saves the evaluation without the confirmation tick.
+	review.OperatorConfirmed = false
+	store.invalidateKnowledgeForReviewLocked(snapshot.RunID, snapshot.AnalysisHash, time.Now().UTC())
+	stored := store.knowledgeCandidates[candidate.CandidateID]
+	if stored.Status != knowledgeCandidateValidationFailed || stored.ValidationError != knowledgeReviewInvalidationError {
+		t.Fatalf("unconfirmed candidate must be withdrawn from review, got %s (%q)", stored.Status, stored.ValidationError)
+	}
+	if _, _, err := store.ApproveKnowledgeCandidate(candidate.CandidateID, KnowledgeDecisionRequest{Actor: "operator"}); err == nil {
+		t.Fatal("approving a withdrawn candidate must fail")
+	}
+
+	// Re-confirming restores the same candidate for review.
+	review.OperatorConfirmed = true
+	store.generateKnowledgeCandidateForReviewedRunLocked(snapshot.RunID, snapshot.AnalysisHash)
+	if restored := store.knowledgeCandidates[candidate.CandidateID]; restored.Status != knowledgeCandidateReady {
+		t.Fatalf("re-confirmation must restore the candidate, got %s", restored.Status)
+	}
+	if _, _, err := store.ApproveKnowledgeCandidate(candidate.CandidateID, KnowledgeDecisionRequest{Actor: "operator"}); err != nil {
+		t.Fatalf("approval after re-confirmation failed: %v", err)
+	}
+}
