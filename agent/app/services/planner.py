@@ -473,6 +473,37 @@ def _bind_probe_hypotheses(
     return bound
 
 
+def refresh_diagnostic_directive_from_evidence(
+    settings: Settings,
+    plan: InvestigationPlan,
+    kg_context: dict,
+    evidence_text: str,
+    *,
+    seed_family: str = "",
+    run_id: str = "",
+) -> bool:
+    """Re-route declared probes when scoped base evidence reveals the branch.
+
+    A generic alert title cannot select a FailedScheduling branch until the
+    target Event is collected. This changes only the neutral directive and its
+    probe bindings; the collector scope and plan otherwise stay intact.
+    """
+    if not evidence_text.strip():
+        return False
+    catalog = load_family_catalog(settings.families_file)
+    directive = _diagnostic_directive(
+        settings, kg_context, evidence_text, catalog, seed_family
+    )
+    if not directive or directive.get("path") == plan.diagnostic_directive.get("path"):
+        return False
+    hypotheses = _ensure_walk_family_hypothesis(
+        plan.hypotheses, directive, catalog.families
+    )
+    plan.hypotheses = _assign_hypothesis_ids(hypotheses, run_id)
+    plan.diagnostic_directive = _bind_probe_hypotheses(directive, plan.hypotheses, run_id)
+    return True
+
+
 def _alert_haystack(target: AnalysisTarget, alert) -> str:
     parts = [target.alert_name or "", target.workload_name or ""]
     labels = getattr(alert, "labels", None) or {}

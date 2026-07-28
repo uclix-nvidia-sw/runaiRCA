@@ -382,3 +382,19 @@ def test_shipped_scheduling_family_has_actionable_symptoms() -> None:
         )
     )
     assert "Preempted By Higher Priority" in text
+
+
+def test_shipped_quota_guidance_names_the_scheduler_decision_and_priority_comparison() -> None:
+    modes = load_failure_modes("knowledge/failure_modes.yaml")
+    text = "\n".join(
+        general_guidance_lines(
+            "project GPU quota changed",
+            modes,
+            [],
+            language="ko",
+            families=["runai_scheduling_quota"],
+        )
+    )
+    assert "spec.schedulerName" in text
+    assert "피해 workload" in text
+    assert "deserved quota" in text

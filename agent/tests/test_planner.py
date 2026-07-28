@@ -8,7 +8,10 @@ from app.collectors.base import AnalysisTarget
 from app.schemas import Alert, SimilarIncidentContext
 from app.services import pipeline
 from app.services.decision_tree import load_tree
-from app.services.planner import plan_investigation
+from app.services.planner import (
+    plan_investigation,
+    refresh_diagnostic_directive_from_evidence,
+)
 from tests.test_orchestrator import make_settings
 
 
@@ -690,6 +693,38 @@ async def test_typedb_diagnostic_graph_is_injected_as_neutral_collector_directiv
         ]
         for probe in directive["probes"]
     )
+
+
+@pytest.mark.asyncio
+async def test_scoped_base_evidence_rebinds_generic_alert_to_scheduling_probe() -> None:
+    settings = make_settings()
+    target = _target(
+        alert_name="KubePodNotReady",
+        namespace="default",
+        pod="scheduling-error",
+    )
+    alert = Alert(
+        labels={"alertname": "KubePodNotReady", "namespace": "default", "pod": "scheduling-error"},
+        annotations={"analysis_run_id": "ANL-rebind"},
+    )
+    kg = {"diagnostic_tree": load_tree("knowledge/k8s_troubleshooting_tree.yaml")}
+    plan = await plan_investigation(settings, target, alert, kg, [])
+
+    changed = refresh_diagnostic_directive_from_evidence(
+        settings,
+        plan,
+        kg,
+        "FailedScheduling: 0/7 nodes had untolerated taint and did not match node affinity/selector",
+        run_id="ANL-rebind",
+    )
+
+    assert changed is True
+    assert "scheduling_taint" in plan.diagnostic_directive["path"]
+    assert plan.diagnostic_directive["provisional_family"] == "k8s_scheduling_error"
+    assert "k8s_troubleshooting:scheduling_taint:p01" in {
+        probe["template_id"] for probe in plan.diagnostic_directive["probes"]
+    }
+    assert any(hypothesis["family"] == "k8s_scheduling_error" for hypothesis in plan.hypotheses)
 
 
 @pytest.mark.asyncio

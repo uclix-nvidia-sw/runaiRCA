@@ -115,7 +115,13 @@
     - name: Quota Or Request Changed
       keywords: [preempt, "project quota", "queue quota", "gpu quota"]
       actions:
-        - "Review whether the queue/project quota or the workload's GPU request changed recently."
+        - "Before changing quota, capture the affected Pod's spec.schedulerName, the oldest FailedScheduling Event, and the Run:ai scheduler decision. runai-scheduler and default-scheduler require different diagnoses."
+        - "If the decision says preempted, compare the victim and preempting workloads' project/queue, priority, and requested versus deserved/over-quota GPUs. Do not raise priority until that policy decision is confirmed."
+        - "If it says reclaim, fairshare, or over-quota, compare the workload request with its project's deserved quota and over-quota usage; move a workload that needs stable GPUs within deserved quota rather than masking a reclaim with retries."
+      actions_ko:
+        - "할당량을 바꾸기 전에 대상 Pod의 spec.schedulerName, 가장 이른 FailedScheduling Event, Run:ai scheduler decision을 확보하세요. runai-scheduler와 default-scheduler는 진단 경로가 다릅니다."
+        - "decision에 preempted가 있으면 피해 workload와 선점 workload의 project/queue, priority, requested·deserved·over-quota GPU를 비교하세요. 정책 결정이 확인되기 전에는 우선순위를 올리지 마세요."
+        - "reclaim·fairshare·over-quota가 보이면 workload request와 project의 deserved quota 및 over-quota 사용량을 비교하세요. 안정적인 GPU가 필요한 workload는 재시도로 reclaim을 가리지 말고 deserved quota 안으로 옮기세요."
     - name: Bind Failed After Scheduling Decision
       component: binder
       keywords: ["failed to bind", "bind error", "binding rejected"]
