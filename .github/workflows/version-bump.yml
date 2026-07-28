@@ -119,6 +119,7 @@ jobs:
           exit 1
 
       - name: Tag bumped release
+        id: tag
         if: ${{ steps.commit.outputs.pushed == 'true' }}
         shell: bash
         env:
@@ -128,11 +129,22 @@ jobs:
           tag="v${NEW_VERSION}"
           if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
             echo "${tag} already exists; keeping the existing release tag."
+            echo "created=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git tag -a "${tag}" -m "Release ${tag}"
           git push origin "${tag}"
+          echo "created=true" >> "$GITHUB_OUTPUT"
 
-      # container-images.yml and helm-chart.yml both trigger from v*.*.* tags.
-      # Publishing from that immutable release tag avoids the previous duplicate
-      # workflow_dispatch builds and makes the Git tag the release source of truth.
+      # GitHub intentionally does not trigger sibling workflows for a tag
+      # created with GITHUB_TOKEN. Dispatch them explicitly from that immutable
+      # release ref so a successful version bump always publishes its artifacts.
+      - name: Publish release artifacts
+        if: ${{ steps.tag.outputs.created == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW_VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh workflow run "Container Images" --ref "v${NEW_VERSION}"
+          gh workflow run "Helm Chart" --ref "v${NEW_VERSION}"
