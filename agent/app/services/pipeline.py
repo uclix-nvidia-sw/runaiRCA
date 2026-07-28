@@ -907,7 +907,7 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         refresh_diagnostic_directive_from_evidence(
             settings,
             state.plan,
-            state.kg_context.as_dict(),
+            state.kg_context.as_dict() if state.kg_context is not None else {},
             _observed_text(state.results, state.request),
             seed_family=state.effective_seed_family,
             run_id=str(state.request.alert.annotations.get("analysis_run_id") or ""),
