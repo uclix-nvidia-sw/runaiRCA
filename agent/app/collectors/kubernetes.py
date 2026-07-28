@@ -3904,8 +3904,9 @@ def _container_lifecycle_artifact(
     target_identity_verified = _container_lifecycle_target_verified(
         pod_summary, target, resolved_pod_anchor=resolved_pod_anchor
     )
+    observed_termination_times = _container_termination_times(container_diagnostics)
     terminated_times = _container_termination_times_in_range(
-        container_diagnostics, time_range
+        observed_termination_times, time_range
     )
     current_restart_loop = (
         target_identity_verified
@@ -4045,15 +4046,9 @@ def _container_lifecycle_target_verified(
     )
 
 
-def _container_termination_times_in_range(
-    container_diagnostics: list[dict[str, object]], time_range: dict[str, str] | None
+def _container_termination_times(
+    container_diagnostics: list[dict[str, object]],
 ) -> list[tuple[object, str]]:
-    if not time_range:
-        return []
-    start = parse_incident_time(time_range.get("start"))
-    end = parse_incident_time(time_range.get("end"))
-    if start is None or end is None or end < start:
-        return []
     timestamps: list[tuple[object, str]] = []
     for diagnostic in container_diagnostics:
         for state_key in ("state", "lastTerminated"):
@@ -4064,9 +4059,21 @@ def _container_termination_times_in_range(
                 continue
             finished_at = state.get("finishedAt")
             parsed = parse_incident_time(finished_at)
-            if parsed is not None and start <= parsed <= end:
+            if parsed is not None:
                 timestamps.append((parsed, str(finished_at)))
     return sorted(timestamps, key=lambda item: item[0])
+
+
+def _container_termination_times_in_range(
+    timestamps: list[tuple[object, str]], time_range: dict[str, str] | None
+) -> list[tuple[object, str]]:
+    if not time_range:
+        return []
+    start = parse_incident_time(time_range.get("start"))
+    end = parse_incident_time(time_range.get("end"))
+    if start is None or end is None or end < start:
+        return []
+    return [item for item in timestamps if start <= item[0] <= end]
 
 
 def _container_is_waiting_with_restarts(diagnostic: dict[str, object]) -> bool:
@@ -4113,10 +4120,7 @@ def _target_waiting_fault_reason(container_diagnostics: list[dict[str, object]])
     """Return a closed-vocabulary kubelet reason from the target container."""
     for diagnostic in container_diagnostics:
         state = diagnostic.get("state") if isinstance(diagnostic, dict) else None
-        if not isinstance(state, dict) or str(state.get("phase") or "") not in {
-            "waiting",
-            "terminated",
-        }:
+        if not isinstance(state, dict) or str(state.get("phase") or "") != "waiting":
             continue
         reason = str(state.get("reason") or "").strip().casefold()
         if reason in _FOLLOWUP_WAITING:
@@ -4124,11 +4128,29 @@ def _target_waiting_fault_reason(container_diagnostics: list[dict[str, object]])
     return ""
 
 
+_CAUSAL_TERMINATED_REASONS = frozenset(
+    {
+        "oomkilled",
+        "createcontainererror",
+        "runcontainererror",
+        "containercannotrun",
+        "starterror",
+        "poststarthookerror",
+    }
+)
+
+
 def _target_current_terminated_reason(
     container_diagnostics: list[dict[str, object]],
     time_range: dict[str, str] | None,
 ) -> str:
-    """Return OOMKilled from a target's current termination state in this sample."""
+    """Return a machine-reported target termination for RCA replay.
+
+    A resolved incident is commonly analysed after the Pod recovered.  Its
+    current terminated state is therefore retained as historical evidence for
+    the same verified Pod; the caller's incident window still prevents an
+    unbounded snapshot from being promoted when no incident exists.
+    """
     if not time_range:
         return ""
     start = parse_incident_time(time_range.get("start"))
@@ -4141,7 +4163,8 @@ def _target_current_terminated_reason(
             continue
         if str(state.get("phase") or "").strip().casefold() != "terminated":
             continue
-        if str(state.get("reason") or "").strip().casefold() != "oomkilled":
+        reason = str(state.get("reason") or "").strip().casefold()
+        if reason not in _CAUSAL_TERMINATED_REASONS:
             continue
         if diagnostic.get("lastTerminated") is not None:
             continue
@@ -4151,7 +4174,7 @@ def _target_current_terminated_reason(
         except (TypeError, ValueError):
             continue
         if parse_incident_time(state.get("finishedAt")) is not None:
-            return "oomkilled"
+            return reason
     return ""
 
 

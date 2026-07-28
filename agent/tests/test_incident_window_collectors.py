@@ -2328,6 +2328,45 @@ def test_target_container_termination_in_causal_window_is_scoped_and_matchable()
         outside_window.result["observation"]["coverage"],
     ) == ("unknown", "partial")
 
+    stale_current_oom = kubernetes._container_lifecycle_artifact(
+        "kubernetes",
+        make_settings(),
+        target,
+        {"name": target.pod, "namespace": target.namespace},
+        [
+            {
+                "name": "main",
+                "restartCount": 0,
+                "state": {
+                    "phase": "terminated",
+                    "reason": "OOMKilled",
+                    "exitCode": 137,
+                    "finishedAt": "2026-07-10T00:44:00Z",
+                },
+            }
+        ],
+        time_range=causal_evidence_time_range(target),
+    )
+    assert (
+        stale_current_oom.result["observation"]["polarity"],
+        stale_current_oom.result["observation"]["coverage"],
+    ) == ("present", "scoped")
+    assert "evidence_window" not in stale_current_oom.result["observation"]
+    # Historical re-analysis must retain the verified Pod's machine-reported
+    # termination even when Alertmanager fired after that termination.
+    stale_current_oom.evidence_id = "E-stale-oom"
+    assert pipeline._dispositive_typed_state(
+        [
+            CollectorResult(
+                agent="kubernetes",
+                status="ok",
+                summary="stale OOMKilled",
+                artifacts=[stale_current_oom],
+            )
+        ],
+        {"E-stale-oom"},
+    )[0] == "workload_runtime_error"
+
 
 def test_runai_crd_health_transition_is_scoped_and_matchable() -> None:
     target = replace(
