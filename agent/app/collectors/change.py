@@ -94,11 +94,13 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
         )
     namespace = str(target.namespace or "").strip()
     requested_namespace = str(args.get("namespace") or "").strip()
-    if not namespace:
+    # node_condition is node-scoped: a node-only alert (cordon/NotReady) has no
+    # namespace and must still be able to ask about its node's changes.
+    if not namespace and not (source == "node_condition" and str(target.node or "").strip()):
         return _query_error("the alert has no namespace scope", source=source)
     if requested_namespace and requested_namespace != namespace:
         return _query_error("namespace must match the alert namespace scope", source=source)
-    if not _namespace_allowed(settings, namespace):
+    if namespace and not _namespace_allowed(settings, namespace):
         return _query_error("alert namespace is outside the configured allowlist", source=source)
     node = str(target.node or "").strip()
     requested_node = str(args.get("node") or "").strip()
@@ -483,11 +485,15 @@ class ChangeCollector:
             return cached[0]
 
         token = _read_file(self._settings.kubernetes_token_path)
-        if not token or not namespace or not _namespace_allowed(self._settings, namespace):
+        # A node-only alert (cordon, NotReady) has no namespace but real
+        # node-scope changes; only bail when there is NO scope at all.
+        if not token or (not namespace and not node) or (
+            namespace and not _namespace_allowed(self._settings, namespace)
+        ):
             reason = (
                 "Kubernetes service account token is not available."
                 if not token
-                else "no in-scope namespace was resolved for change detection."
+                else "no in-scope namespace or node was resolved for change detection."
             )
             result = self._empty(f"{NO_EVIDENCE} {reason}", missing=["change.unconfigured"])
             self._cache_result(cache_key, result)
@@ -504,29 +510,46 @@ class ChangeCollector:
         warnings: list[str] = []
         scope_missing: list[str] = []
 
-        controllers = await self._recent_controllers(
-            ns,
-            node,
-            headers,
-            verify,
-            window_end,
-            warnings,
-            window_seconds=window_seconds,
-            historical_window=historical_window,
+        controllers = (
+            await self._recent_controllers(
+                ns,
+                node,
+                headers,
+                verify,
+                window_end,
+                warnings,
+                window_seconds=window_seconds,
+                historical_window=historical_window,
+            )
+            if namespace
+            else []
         )
-        pods = await self._recent_pods(
-            ns, headers, verify, window_end, warnings, window_seconds=window_seconds
+        pods = (
+            await self._recent_pods(
+                ns, headers, verify, window_end, warnings, window_seconds=window_seconds
+            )
+            if namespace
+            else []
         )
         node_changes = await self._node_conditions(
             node, headers, verify, window_end, warnings, window_seconds=window_seconds
         )
+        node_changes += await self._node_events(
+            node, limit, headers, verify, window_end, warnings, window_seconds=window_seconds
+        )
         if node and not self._settings.kubernetes_cluster_scope_enabled:
             scope_missing.append("change.node_condition_scope")
-        events = await self._recent_events(
-            ns, limit, headers, verify, window_end, warnings, window_seconds=window_seconds
+        if not namespace:
+            scope_missing.append("change.namespace_scope")
+        events = (
+            await self._recent_events(
+                ns, limit, headers, verify, window_end, warnings, window_seconds=window_seconds
+            )
+            if namespace
+            else []
         )
         helm = []
-        if _helm_change_detection_enabled(self._settings):
+        if namespace and _helm_change_detection_enabled(self._settings):
             helm = await self._recent_helm_releases(
                 namespace,
                 ns,
@@ -997,6 +1020,35 @@ class ChangeCollector:
         if not isinstance(data, dict):
             return []
         out: list[dict] = []
+        # A cordon IS a change: spec.unschedulable has no condition entry, but
+        # the managedFields update that set it carries the manager and time —
+        # the only in-cluster record of WHEN (and roughly who: kubectl vs a
+        # controller) without API audit logs.
+        if _dict(data.get("spec")).get("unschedulable"):
+            cordon_time, cordon_manager = "", ""
+            for managed in _list(_dict(data.get("metadata")).get("managedFields")):
+                managed = _dict(managed)
+                if '"f:unschedulable"' not in json.dumps(managed.get("fieldsV1") or {}):
+                    continue
+                stamp = str(managed.get("time") or "")
+                if stamp > cordon_time:
+                    cordon_time = stamp
+                    cordon_manager = str(managed.get("manager") or "unknown")
+            if cordon_time and _within_window(
+                cordon_time, now, window_seconds=window_seconds
+            ):
+                out.append(
+                    {
+                        "timestamp": cordon_time,
+                        "kind": "NodeCordon",
+                        "name": node,
+                        "reason": "NodeNotSchedulable",
+                        "summary": (
+                            f"Node {node} was cordoned (spec.unschedulable set by "
+                            f"'{cordon_manager}' at {cordon_time})."
+                        ),
+                    }
+                )
         for cond in _list(_dict(data.get("status")).get("conditions")):
             cond = _dict(cond)
             transition = cond.get("lastTransitionTime")
@@ -1022,6 +1074,56 @@ class ChangeCollector:
                 }
             )
         return out
+
+    async def _node_events(
+        self,
+        node,
+        limit,
+        headers,
+        verify,
+        now,
+        warnings,
+        *,
+        window_seconds: int = _RECENT_WINDOW_SECONDS,
+    ) -> list[dict]:  # noqa: ANN001
+        """Node-scope system changes the namespaced sweep never sees.
+
+        kubelet posts them as Events ON the Node object (Rebooted, Starting,
+        NodeNotSchedulable/NodeSchedulable, NodeReady, InvalidDiskCapacity…) —
+        the closest thing to a node-level change feed without a host agent."""
+        if not (node and self._settings.kubernetes_cluster_scope_enabled):
+            return []
+        data = await self._get(
+            "/api/v1/events",
+            {
+                "fieldSelector": f"involvedObject.kind=Node,involvedObject.name={node}",
+                "limit": limit,
+            },
+            headers, verify, warnings, "node_events",
+        )
+        if not isinstance(data, dict):
+            return []
+        out: list[dict] = []
+        for item in _list(data.get("items")):
+            item = _dict(item)
+            involved = _dict(item.get("involvedObject"))
+            # Never trust the field selector alone: only events ON this node.
+            if involved.get("kind") != "Node" or involved.get("name") != node:
+                continue
+            ts = item.get("lastTimestamp") or item.get("eventTime")
+            if not _within_window(ts, now, window_seconds=window_seconds):
+                continue
+            out.append(
+                {
+                    "timestamp": ts,
+                    "kind": f"NodeEvent/{item.get('type', 'Normal')}",
+                    "name": node,
+                    "reason": item.get("reason"),
+                    "summary": f"Node {node}: {item.get('reason')}: {item.get('message')}",
+                }
+            )
+        out.sort(key=lambda e: e.get("timestamp") or "", reverse=True)
+        return out[:10]
 
     async def _recent_events(
         self,
@@ -1276,7 +1378,11 @@ def _partition_target_changes(
             continue
         if namespace in dependency_set:
             relation = "declared_dependency"
-        elif kind == "NodeCondition" and node and name == node:
+        elif (
+            (kind in ("NodeCondition", "NodeCordon") or kind.startswith("NodeEvent/"))
+            and node
+            and name == node
+        ):
             relation = "target_node"
         elif namespace == primary_namespace and (
             (pod and name == pod)

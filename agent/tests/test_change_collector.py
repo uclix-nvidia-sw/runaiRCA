@@ -903,3 +903,55 @@ async def test_change_query_refuses_lookback_outside_contract(
     query = await change_query(_Settings(), _target(), {"kind": "event", "lookback_seconds": 59})
 
     assert query["error"] == "lookback_seconds must be between 60 and 86400"
+
+
+@pytest.mark.asyncio
+async def test_node_only_alert_detects_cordon_and_node_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A cordon alert has no namespace. The collector previously bailed with
+    # "no in-scope namespace" and contributed nothing — even though the cordon
+    # itself is the change (INC-1785215448065944607). Node scope alone must
+    # surface the spec.unschedulable managedFields update and node Events.
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, base_url, path, timeout_seconds, params, headers, verify):
+        if "/nodes/" in path:
+            data = {
+                "metadata": {
+                    "managedFields": [
+                        {
+                            "manager": "kubectl",
+                            "operation": "Update",
+                            "time": _iso(-60),
+                            "fieldsV1": {"f:spec": {"f:unschedulable": {}}},
+                        }
+                    ]
+                },
+                "spec": {"unschedulable": True},
+                "status": {"conditions": []},
+            }
+        elif path == "/api/v1/events":
+            assert "involvedObject.kind=Node" in (params or {}).get("fieldSelector", "")
+            data = {"items": [{
+                "type": "Normal", "reason": "NodeNotSchedulable",
+                "message": "Node k8s-lb-01 status is now: NodeNotSchedulable",
+                "lastTimestamp": _iso(-55),
+                "involvedObject": {"kind": "Node", "name": "k8s-lb-01"},
+            }]}
+        else:
+            data = {"items": []}
+        return JsonResponse(url=f"{base_url}{path}", status_code=200, data=data)
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    result = await ChangeCollector(_Settings()).collect(
+        _target(namespace="", node="k8s-lb-01")
+    )
+    assert result.status == "ok"
+    cordon_change = next(c for c in result.details["changes"] if c["kind"] == "NodeCordon")
+    assert cordon_change["relation"] == "target_node"
+    kinds = {c["kind"] for c in result.details["changes"]}
+    assert "NodeCordon" in kinds
+    assert "NodeEvent/Normal" in kinds
+    cordon = next(c for c in result.details["changes"] if c["kind"] == "NodeCordon")
+    assert "kubectl" in cordon["summary"]
