@@ -898,6 +898,20 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
             "Collector evidence gathered",
             collectors=[result.agent for result in state.results],
         )
+    # A generic alert title cannot choose the exact tree branch until base
+    # evidence arrives (for example KubePodNotReady -> FailedScheduling).
+    # Rebind ontology probes before optional follow-ups and domain drill-down.
+    if state.plan is not None:
+        from app.services.planner import refresh_diagnostic_directive_from_evidence
+
+        refresh_diagnostic_directive_from_evidence(
+            settings,
+            state.plan,
+            state.kg_context.as_dict(),
+            _observed_text(state.results, state.request),
+            seed_family=state.effective_seed_family,
+            run_id=str(state.request.alert.annotations.get("analysis_run_id") or ""),
+        )
     evidence_sufficient = _investigation_evidence_sufficient(state)
     alert_evidence = _alert_signature_evidence_result(
         state.request,
@@ -2487,10 +2501,9 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         request=request,
     )
 
-    synthesis_failed = state.synthesis_status == "failed"
     state.response = AlertAnalysisResponse(
-        status="failed" if synthesis_failed else "ok",
-        terminal_reason="synthesis_failed" if synthesis_failed else None,
+        status="ok",
+        terminal_reason=None,
         thread_ts=request.thread_ts,
         analysis=state.detail,
         analysis_summary=state.summary,
@@ -3503,6 +3516,7 @@ def _valid_line_translation(source: str, translated: object) -> bool:
 # keeps each reply small enough to finish, and a batch that fails only costs
 # its own lines.
 _TRANSLATION_BATCH_CHARS = 2000
+_TRANSLATION_BATCH_CONCURRENCY = 4
 
 
 def _translation_batches(pending: dict[str, str]) -> list[dict[str, str]]:
@@ -3599,11 +3613,13 @@ async def _translate_report_lines_ko(
         return detail, 0
     translations: dict[str, str] = {}
     try:
-        for batch in _translation_batches(pending):
-            if not await _translate_line_batch(
-                settings, batch, translations, diagnostics
-            ):
-                break
+        semaphore = asyncio.Semaphore(_TRANSLATION_BATCH_CONCURRENCY)
+
+        async def translate(batch: dict[str, str]) -> None:
+            async with semaphore:
+                await _translate_line_batch(settings, batch, translations, diagnostics)
+
+        await asyncio.gather(*(translate(batch) for batch in _translation_batches(pending)))
     except Exception as exc:  # noqa: BLE001 - synthesis is best-effort
         message = _masked_exception_text(exc)
         if diagnostics is not None:

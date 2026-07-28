@@ -8,6 +8,7 @@ orchestrator waits for ALL collectors and runs Korean LLM synthesis when configu
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace
@@ -253,10 +254,10 @@ async def test_korean_synthesis_falls_back_on_bad_json(monkeypatch) -> None:
             )
         )
     )
-    # A configured primary synthesis failure is a failed run, not a successful
-    # RCA disguised by the deterministic diagnostic payload.
-    assert response.status == "failed"
-    assert response.terminal_reason == "synthesis_failed"
+    # Localization is presentation-only: keep the evidence-backed deterministic
+    # RCA available, but mark its quality degraded and expose the warning.
+    assert response.status == "ok"
+    assert response.terminal_reason is None
     assert response.analysis_quality == "degraded"
     assert response.context["synthesis"]["status"] == "failed"
     assert "invalid JSON" in response.context["synthesis"]["error"]
@@ -710,6 +711,31 @@ async def test_long_report_is_translated_in_batches(monkeypatch) -> None:
     assert missing == 0
     assert len(batches) > 1
     assert len(result.split("\n")) == len(lines)  # line count preserved exactly
+    assert "Collector" not in result
+
+
+@pytest.mark.asyncio
+async def test_long_report_translation_batches_run_in_parallel(monkeypatch) -> None:
+    lines = [f"Collector {index} reported a scoped observation." for index in range(120)]
+    in_flight = 0
+    max_in_flight = 0
+
+    async def fake_complete_with_error(*_args, **kwargs):
+        nonlocal in_flight, max_in_flight
+        pending = json.loads(kwargs["user"])
+        in_flight += 1
+        max_in_flight = max(max_in_flight, in_flight)
+        await asyncio.sleep(0)
+        in_flight -= 1
+        return json.dumps({key: f"수집기 관측 {key}." for key in pending}), None
+
+    monkeypatch.setattr("app.services.pipeline.complete_with_error", fake_complete_with_error)
+    result, missing = await _translate_report_lines_ko(
+        replace(make_settings(), language="ko"), "\n".join(lines)
+    )
+
+    assert missing == 0
+    assert max_in_flight > 1
     assert "Collector" not in result
 
 
