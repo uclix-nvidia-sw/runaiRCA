@@ -6,6 +6,7 @@ from typing import Any
 
 from ontology import ingest
 from ontology.incident import OntologyIncident
+from ontology.normalization import workload_uid
 
 
 class _Result:
@@ -236,6 +237,7 @@ def test_workload_topology_projection_writes_stable_edges() -> None:
     assert "isa exposes" in joined
     assert "isa uses_storage" in joined
     assert 'has namespace_name' in joined
+    assert 'has workload_uid "runai-backend/runai-backend-workloads"' in joined
 
     # No workload identity or no topology artifact -> writes nothing.
     empty = _Tx()
@@ -244,3 +246,35 @@ def test_workload_topology_projection_writes_stable_edges() -> None:
         empty, SimpleNamespace(workload_name="w", namespace="", artifacts=[{"type": "pod_inspection"}])
     )
     assert empty.queries == []
+
+
+def test_workload_ingest_keys_same_name_by_namespace() -> None:
+    tx = _Tx()
+    for namespace in ("team-a", "team-b"):
+        ingest._write_incident(
+            tx,
+            OntologyIncident(
+                incident_id=f"INC-{namespace}",
+                namespace=namespace,
+                workload_name="trainer",
+            ),
+        )
+
+    emitted = "\n".join(tx.queries)
+    assert 'isa workload, has workload_uid "team-a/trainer"' in emitted
+    assert 'isa workload, has workload_uid "team-b/trainer"' in emitted
+    assert 'has workload_uid "team-a/trainer"' in emitted
+    assert 'has workload_uid "team-b/trainer"' in emitted
+
+
+def test_workload_uid_uses_a_sentinel_for_missing_namespace() -> None:
+    assert workload_uid("", "trainer") == "__missing_namespace__/trainer"
+    assert workload_uid("team-a", "trainer") == "team-a/trainer"
+
+    tx = _Tx()
+    ingest._write_incident(
+        tx, OntologyIncident(incident_id="INC-missing-ns", workload_name="trainer")
+    )
+    assert 'isa workload, has workload_uid "__missing_namespace__/trainer"' in "\n".join(
+        tx.queries
+    )

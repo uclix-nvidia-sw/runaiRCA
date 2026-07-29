@@ -30,6 +30,7 @@ attribute condition_type, value string;
 attribute keyword, value string;
 attribute workload_type, value string;
 attribute workload_id, value string;
+attribute workload_uid, value string;
 attribute gpu_allocated, value double;
 attribute gpu_requested, value double;
 attribute cluster_name, value string;
@@ -145,6 +146,7 @@ entity node,
 
 entity workload,
     owns name,
+    owns workload_uid @key,
     owns workload_type,
     owns workload_id,
     owns namespace_name,

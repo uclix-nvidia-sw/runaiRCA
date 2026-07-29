@@ -24,6 +24,7 @@ from app.config import load_settings
 from app.knowledge import load_architecture
 from app.ontology.typedb_client import escape_typeql as esc
 from app.ontology.typedb_client import open_driver
+from ontology.normalization import workload_uid
 
 ARCHITECTURE_FILE = Path("knowledge/runai_architecture.yaml")
 
@@ -79,6 +80,7 @@ def _ensure_component(tx: Any, entry: dict[str, Any]) -> None:
 
 
 def _ensure_service(tx: Any, component: str, namespace: str, service: str) -> None:
+    workload = workload_uid(namespace, component)
     if not _exists(tx, f'$x isa service, has name "{esc(service)}";'):
         tx.query(f'insert $x isa service, has name "{esc(service)}";').resolve()
     if namespace:
@@ -90,24 +92,29 @@ def _ensure_service(tx: Any, component: str, namespace: str, service: str) -> No
             f'match $s isa service, has name "{esc(service)}"; '
             f'insert $s has namespace_name "{esc(namespace)}";'
         ).resolve()
-    if not _exists(tx, f'$x isa workload, has name "{esc(component)}";'):
-        tx.query(f'insert $x isa workload, has name "{esc(component)}";').resolve()
+    if not _exists(tx, f'$x isa workload, has workload_uid "{esc(workload)}";'):
+        tx.query(
+            f'insert $x isa workload, has workload_uid "{esc(workload)}", '
+            f'has name "{esc(component)}";'
+        ).resolve()
     if namespace:
         tx.query(
-            f'match $w isa workload, has name "{esc(component)}", has namespace_name $old; '
+            f'match $w isa workload, has workload_uid "{esc(workload)}", has namespace_name $old; '
             'delete has $old of $w;'
         ).resolve()
         tx.query(
-            f'match $w isa workload, has name "{esc(component)}"; '
+            f'match $w isa workload, has workload_uid "{esc(workload)}"; '
             f'insert $w has namespace_name "{esc(namespace)}";'
         ).resolve()
     if not _exists(
         tx,
-        f'$s isa service, has name "{esc(service)}"; $w isa workload, has name "{esc(component)}"; '
+        f'$s isa service, has name "{esc(service)}"; '
+        f'$w isa workload, has workload_uid "{esc(workload)}"; '
         '$x isa exposes, links (endpoint: $s, backend: $w);',
     ):
         tx.query(
-            f'match $s isa service, has name "{esc(service)}"; $w isa workload, has name "{esc(component)}"; '
+            f'match $s isa service, has name "{esc(service)}"; '
+            f'$w isa workload, has workload_uid "{esc(workload)}"; '
             'insert (endpoint: $s, backend: $w) isa exposes;'
         ).resolve()
 

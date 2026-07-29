@@ -287,31 +287,51 @@ def test_query_kg_surfaces_workload_topology_and_storage_blast_radius() -> None:
                 if "isa exposes" in query:
                     return [{"sn": "runai-backend-workloads"}]
                 if "isa uses_storage" in query and 'isa pvc, has name "data-0"' in query:
-                    return [{"on": "runai-backend-workloads"}, {"on": "other-workload"}]
+                    return [
+                        {
+                            "on": "runai-backend-workloads",
+                            "ou": "runai-backend/runai-backend-workloads",
+                        },
+                        {"on": "other-workload", "ou": "runai-backend/other-workload"},
+                    ]
                 if "isa uses_storage" in query:
                     return [{"pn": "data-0"}]
                 return []
 
             yield run
 
-    target = replace(_target(), workload_name="runai-backend-workloads")
+    target = replace(
+        _target(), namespace="runai-backend", workload_name="runai-backend-workloads"
+    )
     data = _query_kg(FakeClient(), target, [])  # type: ignore[arg-type]
 
     topology = data["workload_topology"]
+    assert data["workload_topology_status"] == "complete"
     assert topology["services"] == ["runai-backend-workloads"]
     assert topology["pvcs"] == ["data-0"]
     # The workload itself is excluded from its own storage blast radius.
     assert topology["shared_storage_workloads"] == ["other-workload"]
 
     lines = _knowledge_base_lines(
-        {"enabled": True, "available": True, "workload_topology": topology}, [], "", ""
+        {
+            "enabled": True,
+            "available": True,
+            "workload_topology": topology,
+            "workload_topology_status": data["workload_topology_status"],
+        },
+        [],
+        "",
+        "",
     )
     joined = "\n".join(lines)
     assert "Workload topology" in joined
-    assert (
+    assert lines == [
+        "",
+        "### Knowledge Base (Ontology)",
+        "",
         "- Workload topology (stable identity): Service(s) runai-backend-workloads; "
-        "PVC(s) data-0 — PVC shared with 1 other workload(s): other-workload"
-    ) in lines
+        "PVC(s) data-0 — PVC shared with 1 other workload(s): other-workload",
+    ]
     assert "PVC shared with 1 other workload(s): other-workload" in joined
 
 
@@ -329,7 +349,7 @@ def test_query_kg_discloses_unsearched_fourth_pvc() -> None:
             yield run
 
     data = _query_kg(
-        FakeClient(), replace(_target(), workload_name="workload"), []
+        FakeClient(), replace(_target(), namespace="runai", workload_name="workload"), []
     )  # type: ignore[arg-type]
 
     topology = data["workload_topology"]
@@ -339,6 +359,89 @@ def test_query_kg_discloses_unsearched_fourth_pvc() -> None:
     assert "shared-storage checked only on PVC(s) data-1, data-2, data-3" in "\n".join(
         _knowledge_base_lines({"enabled": True, "available": True, "workload_topology": topology})
     )
+
+
+def test_query_kg_uses_namespace_exact_workload_topology() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                self.queries.append(query)
+                if 'has workload_uid "team-a/trainer"' in query and "isa exposes" in query:
+                    return [{"sn": "service-a"}]
+                if 'has workload_uid "team-a/trainer"' in query and "isa uses_storage" in query:
+                    return [{"pn": "pvc-a"}]
+                if 'has workload_uid "team-b/trainer"' in query:
+                    raise AssertionError("must not query the same name in another namespace")
+                return []
+
+            yield run
+
+    client = FakeClient()
+    data = _query_kg(
+        client, replace(_target(), namespace="team-a", workload_name="trainer"), []
+    )  # type: ignore[arg-type]
+
+    assert data["workload_topology"] == {
+        "services": ["service-a"],
+        "pvcs": ["pvc-a"],
+        "shared_storage_workloads": [],
+        "shared_storage_pvcs": ["pvc-a"],
+        "shared_storage_truncated": False,
+    }
+    assert any('has workload_uid "team-a/trainer"' in query for query in client.queries)
+
+
+def test_query_kg_skips_ambiguous_workload_topology_without_namespace() -> None:
+    class FakeClient:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                self.queries.append(query)
+                return []
+
+            yield run
+
+    client = FakeClient()
+    data = _query_kg(
+        client, replace(_target(), workload_name="trainer"), []
+    )  # type: ignore[arg-type]
+
+    assert data["workload_topology"] == {}
+    assert data["workload_topology_status"] == "skipped_missing_namespace"
+    assert not any("workload_uid" in query for query in client.queries)
+    assert _knowledge_base_lines({"enabled": True, "available": True, **data}) == [
+        "",
+        "### Knowledge Base (Ontology)",
+        "",
+        "- Workload topology (stable identity): lookup skipped because the alert has no namespace.",
+    ]
+
+
+def test_query_kg_renders_empty_workload_topology_after_lookup() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            yield lambda query: []
+
+    data = _query_kg(
+        FakeClient(), replace(_target(), namespace="team-a", workload_name="trainer"), []
+    )  # type: ignore[arg-type]
+
+    assert data["workload_topology"] == {}
+    assert data["workload_topology_status"] == "complete"
+    assert _knowledge_base_lines({"enabled": True, "available": True, **data}) == [
+        "",
+        "### Knowledge Base (Ontology)",
+        "",
+        "- Workload topology (stable identity): no Services or PVCs found.",
+    ]
 
 
 def test_location_history_cap_is_rendered_as_at_least() -> None:

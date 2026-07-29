@@ -6566,6 +6566,7 @@ def _knowledge_base_lines(
             )
             body.append(f"  - {incident_id} ({where}): {summary}")
     topology = kg_context.get("workload_topology") or {}
+    topology_status = kg_context.get("workload_topology_status") or ""
     if topology.get("services") or topology.get("pvcs"):
         parts = []
         if topology.get("services"):
@@ -6583,6 +6584,12 @@ def _knowledge_base_lines(
             searched = ", ".join(topology.get("shared_storage_pvcs") or [])
             line += f" — shared-storage checked only on PVC(s) {searched}"
         body.append(active_masker.mask_text(line))
+    elif topology_status == "complete":
+        body.append("- Workload topology (stable identity): no Services or PVCs found.")
+    elif topology_status == "skipped_missing_namespace":
+        body.append(
+            "- Workload topology (stable identity): lookup skipped because the alert has no namespace."
+        )
     prior = kg_context.get("prior_incidents") or []
     if prior:
         body.append(f"- This alert recurred in {len(prior)} prior incident(s):")

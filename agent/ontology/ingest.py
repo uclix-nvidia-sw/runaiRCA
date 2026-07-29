@@ -42,7 +42,7 @@ from ontology.load_knowledge import (
     _relate_indicates,
     _relate_resolved_by,
 )
-from ontology.normalization import confidence_score
+from ontology.normalization import confidence_score, workload_uid
 
 _log = logging.getLogger(__name__)
 _MASKER = build_masker((r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b",))
@@ -1090,18 +1090,20 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
     # node + workload; cluster/namespace/project/queue ride as attributes
     # (2026-07-27 simplification — they were entities with write-only relations).
     _ensure(tx, "node", "name", inc.node)
-    _ensure(tx, "workload", "name", inc.workload_name)
+    workload = workload_uid(inc.namespace, inc.workload_name)
+    _ensure(tx, "workload", "workload_uid", workload)
     _ensure(tx, "incident", "incident_id", inc.incident_id)
     _ensure(tx, "alert", "alert_id", inc.alert_id)
     if inc.node:
         _replace_attr(tx, "node", "name", inc.node, "cluster_name", inc.cluster)
     if inc.workload_name:
+        _replace_attr(tx, "workload", "workload_uid", workload, "name", inc.workload_name)
         for attr, value in (
             ("namespace_name", inc.namespace),
             ("project_name", inc.project),
             ("queue_name", inc.queue),
         ):
-            _replace_attr(tx, "workload", "name", inc.workload_name, attr, value)
+            _replace_attr(tx, "workload", "workload_uid", workload, attr, value)
 
     # incident attributes (replace-in-place so re-projection updates, not duplicates)
     for attr, value in (
@@ -1147,7 +1149,7 @@ def _write_incident(tx: Any, inc: OntologyIncident) -> None:
     # is missing). Pods are intentionally NOT entities — controller-suffixed
     # pod names change on every restart and were accumulating dead vertices;
     # the stable workload identity carries the topology.
-    _relate(tx, ("node", "name", inc.node), ("workload", "name", inc.workload_name),
+    _relate(tx, ("node", "name", inc.node), ("workload", "workload_uid", workload),
             "runs_on", "host", "guest")
     _write_workload_topology(tx, inc)
 
@@ -1173,6 +1175,7 @@ def _write_workload_topology(tx: Any, inc: OntologyIncident) -> None:
     )
     if not topology:
         return
+    workload = workload_uid(inc.namespace, inc.workload_name)
     for name in topology.get("services") or []:
         service = str(name).strip()
         if not service:
@@ -1180,7 +1183,7 @@ def _write_workload_topology(tx: Any, inc: OntologyIncident) -> None:
         _ensure(tx, "service", "name", service)
         if inc.namespace:
             _replace_attr(tx, "service", "name", service, "namespace_name", inc.namespace)
-        _relate(tx, ("service", "name", service), ("workload", "name", inc.workload_name),
+        _relate(tx, ("service", "name", service), ("workload", "workload_uid", workload),
                 "exposes", "endpoint", "backend")
     for name in topology.get("pvcs") or []:
         claim = str(name).strip()
@@ -1189,7 +1192,7 @@ def _write_workload_topology(tx: Any, inc: OntologyIncident) -> None:
         _ensure(tx, "pvc", "name", claim)
         if inc.namespace:
             _replace_attr(tx, "pvc", "name", claim, "namespace_name", inc.namespace)
-        _relate(tx, ("workload", "name", inc.workload_name), ("pvc", "name", claim),
+        _relate(tx, ("workload", "workload_uid", workload), ("pvc", "name", claim),
                 "uses_storage", "consumer", "storage")
 
 

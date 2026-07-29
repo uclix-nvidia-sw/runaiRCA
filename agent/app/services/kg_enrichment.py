@@ -26,6 +26,7 @@ from app.collectors.base import AnalysisTarget
 from app.config import Settings
 from app.knowledge import _keyword_hits
 from app.ontology.typedb_client import TypeDBClient, escape_typeql
+from ontology.normalization import workload_uid
 
 _log = logging.getLogger(__name__)
 
@@ -62,7 +63,7 @@ select $iid, $sum;
 # the storage blast radius.
 _WORKLOAD_SERVICES_QUERY = """
 match
-  $w isa workload, has name "{workload}";
+  $w isa workload, has workload_uid "{workload_uid}";
   (endpoint: $s, backend: $w) isa exposes;
   $s isa service, has name $sn;
 select $sn;
@@ -70,7 +71,7 @@ select $sn;
 
 _WORKLOAD_PVCS_QUERY = """
 match
-  $w isa workload, has name "{workload}";
+  $w isa workload, has workload_uid "{workload_uid}";
   (consumer: $w, storage: $p) isa uses_storage;
   $p isa pvc, has name $pn;
 select $pn;
@@ -80,8 +81,8 @@ _SHARED_PVC_QUERY = """
 match
   $p isa pvc, has name "{pvc}";
   (consumer: $o, storage: $p) isa uses_storage;
-  $o isa workload, has name $on;
-select $on;
+  $o isa workload, has name $on, has workload_uid $ou;
+select $on, $ou;
 """
 
 _PRIOR_QUERY = """
@@ -233,6 +234,8 @@ class KGContext:
     location_history_truncated: bool = False
     # Stable-identity Service/PVC attachments of the target workload.
     workload_topology: dict[str, Any] = field(default_factory=dict)
+    # Complete lookup, or why the topology lookup was skipped.
+    workload_topology_status: str = ""
     case_cards: list[dict[str, Any]] = field(default_factory=list)
     # family -> [{symptom, keywords[], actions[]}]  (curated knowledge layer)
     knowledge: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -252,6 +255,7 @@ class KGContext:
             "location_history": self.location_history,
             "location_history_truncated": self.location_history_truncated,
             "workload_topology": self.workload_topology,
+            "workload_topology_status": self.workload_topology_status,
             "case_cards": self.case_cards,
             "knowledge": self.knowledge,
             "reasoning": self.reasoning,
@@ -316,6 +320,7 @@ async def enrich(
         location_history=data.get("location_history") or [],
         location_history_truncated=bool(data.get("location_history_truncated")),
         workload_topology=data.get("workload_topology") or {},
+        workload_topology_status=str(data.get("workload_topology_status") or ""),
         case_cards=data["case_cards"],
         knowledge=data["knowledge"],
         reasoning=data["reasoning"],
@@ -822,19 +827,27 @@ def _query_kg(
         # Topology around the stem workload identity: exposing Services, used
         # PVCs, and the storage blast radius (other workloads on the same PVC).
         workload_topology: dict[str, Any] = {}
-        if target.workload_name:
-            workload = escape_typeql(target.workload_name)
+        workload_topology_status = ""
+        # Namespace-less alerts cannot name one graph workload safely: do not
+        # fall back to the ambiguous display name.
+        if target.workload_name and target.namespace:
+            workload_topology_status = "complete"
+            workload = workload_uid(target.namespace, target.workload_name)
             services = sorted(
                 {
                     str(r.get("sn"))
-                    for r in run(_WORKLOAD_SERVICES_QUERY.format(workload=workload))
+                    for r in run(
+                        _WORKLOAD_SERVICES_QUERY.format(workload_uid=escape_typeql(workload))
+                    )
                     if r.get("sn")
                 }
             )
             pvcs = sorted(
                 {
                     str(r.get("pn"))
-                    for r in run(_WORKLOAD_PVCS_QUERY.format(workload=workload))
+                    for r in run(
+                        _WORKLOAD_PVCS_QUERY.format(workload_uid=escape_typeql(workload))
+                    )
                     if r.get("pn")
                 }
             )
@@ -843,7 +856,8 @@ def _query_kg(
             for pvc in shared_storage_pvcs:
                 for r in run(_SHARED_PVC_QUERY.format(pvc=escape_typeql(pvc))):
                     other = str(r.get("on") or "")
-                    if other and other != target.workload_name and other not in shared:
+                    other_uid = str(r.get("ou") or "")
+                    if other and other_uid != workload and other not in shared:
                         shared.append(other)
             if services or pvcs:
                 workload_topology = {
@@ -853,6 +867,8 @@ def _query_kg(
                     "shared_storage_pvcs": shared_storage_pvcs,
                     "shared_storage_truncated": len(pvcs) > len(shared_storage_pvcs),
                 }
+        elif target.workload_name:
+            workload_topology_status = "skipped_missing_namespace"
 
         prior: list[dict[str, Any]] = []
         if target.alert_name:
@@ -1005,6 +1021,7 @@ def _query_kg(
         "location_history": location_history,
         "location_history_truncated": location_history_truncated,
         "workload_topology": workload_topology,
+        "workload_topology_status": workload_topology_status,
         "case_cards": case_cards,
         "knowledge": knowledge,
         "reasoning": reasoning,

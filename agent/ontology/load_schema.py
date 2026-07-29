@@ -110,6 +110,10 @@ DATA_MIGRATIONS = [
     # cleaned — ordinal suffixes can be legitimate workload names. Non-fatal
     # like every entry here; re-ingest rebuilds the stem identities.
     'match $w isa workload, has name $n; $n like ".*-[0-9a-f]{8,10}-[a-z0-9]{5}"; delete $w;',
+    # workload_uid becomes required by @key. Delete first because TypeDB cannot
+    # add it to live instances; workloads are 100% derived from Postgres and
+    # the next ingest reload rebuilds them.
+    "match $w isa workload; delete $w;",
 ]
 
 
