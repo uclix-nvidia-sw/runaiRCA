@@ -44,8 +44,14 @@ export function useDashboardData(
   const [realtimePayload, setRealtimePayload] = useState<RealtimeEventPayload>();
   const realtimeRefreshTimerRef = useRef<number | null>(null);
   const completedProgressRunsRef = useRef(new Set<string>());
+  const loadVersionRef = useRef(0);
 
   const load = useCallback(async (options: { silent?: boolean } = {}) => {
+    // Overlapping loads (mount + SSE refresh + filter change) can resolve out of
+    // order; only the latest invocation may touch state, and a failed silent
+    // refresh must not wipe data that is already on screen.
+    const version = ++loadVersionRef.current;
+    const isCurrent = () => version === loadVersionRef.current;
     let analysisLoaded = false;
     if (!options.silent) {
       setLoading(true);
@@ -56,32 +62,40 @@ export function useDashboardData(
         fetchIncidents(pageRequest(pageIndexes.incidents), incidentView, incidentFilters),
         fetchAlerts(pageRequest(pageIndexes.alerts), alertFilters),
       ]);
+      if (!isCurrent()) return analysisLoaded;
       setIncidents(incidentData.items);
       setIncidentPage(incidentData.page);
       setAlerts(alertData.items);
       setAlertPage(alertData.page);
       try {
         const nextAnalysisRuns = await fetchAnalysisRuns(pageRequest(pageIndexes.analysis));
+        if (!isCurrent()) return analysisLoaded;
         setAnalysisRuns(nextAnalysisRuns.items);
         setAnalysisPage(nextAnalysisRuns.page);
         analysisLoaded = true;
       } catch (err) {
-        setAnalysisRuns([]);
-        setAnalysisPage(emptyPage(pageIndexes.analysis));
+        if (!isCurrent()) return analysisLoaded;
+        if (!options.silent) {
+          setAnalysisRuns([]);
+          setAnalysisPage(emptyPage(pageIndexes.analysis));
+        }
         const message = err instanceof Error ? err.message : 'Failed to load analysis runs.';
         setError(`Analysis runs are unavailable: ${message}`);
       }
     } catch (err) {
-      setIncidents([]);
-      setAlerts([]);
-      setAnalysisRuns([]);
-      setIncidentPage(emptyPage(pageIndexes.incidents));
-      setAlertPage(emptyPage(pageIndexes.alerts));
-      setAnalysisPage(emptyPage(pageIndexes.analysis));
+      if (!isCurrent()) return analysisLoaded;
+      if (!options.silent) {
+        setIncidents([]);
+        setAlerts([]);
+        setAnalysisRuns([]);
+        setIncidentPage(emptyPage(pageIndexes.incidents));
+        setAlertPage(emptyPage(pageIndexes.alerts));
+        setAnalysisPage(emptyPage(pageIndexes.analysis));
+      }
       const message = err instanceof Error ? err.message : 'Failed to load dashboard data.';
       setError(message);
     } finally {
-      if (!options.silent) {
+      if (isCurrent()) {
         setLoading(false);
       }
     }
