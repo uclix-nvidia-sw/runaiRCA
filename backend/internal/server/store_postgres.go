@@ -1923,6 +1923,8 @@ func (s *Store) persistKnowledgeReviewInvalidationLocked(candidate *KnowledgeCan
 			_ = tx.Rollback()
 		}
 	}()
+	// Superseded candidates are revivable; excluding them would make that
+	// transition a silent zero-row update and discard the in-memory change.
 	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
 		SET status = $1, validation_error = $2, payload = $3, decided_at = $4,
 		    decided_by = $5, decision_note = $6, updated_at = $7
@@ -1985,7 +1987,7 @@ func (s *Store) persistKnowledgeReviewRevalidationLocked(candidate *KnowledgeCan
 		SET status = $1, package_id = '', validation_error = '', trace = $2,
 		    payload = $3, decided_at = NULL, decided_by = '', decision_note = '',
 		    updated_at = $4
-		WHERE candidate_id = $5 AND status = 'validation_failed'`,
+		WHERE candidate_id = $5 AND status IN ('validation_failed', 'superseded')`,
 		candidate.Status, mustJSON(candidate.Trace), mustJSON(candidate.Payload),
 		candidate.UpdatedAt, candidate.CandidateID)
 	if err != nil {

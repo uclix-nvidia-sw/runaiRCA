@@ -313,12 +313,11 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 		if candidate == nil {
 			continue
 		}
-		// A candidate's ID is content-derived, so a failed→ready transition (e.g. an
-		// operator confirmation makes a previously unpromotable analysis eligible)
-		// mints a NEW id and would otherwise leave the stale failed candidate behind
-		// as a confusing duplicate. Supersede any other non-decided candidate for the
-		// same case before recording the fresh one.
-		s.supersedeStaleCaseCandidatesLocked(snapshot.CaseID, candidate.CandidateID, time.Now().UTC())
+		// Candidate IDs are content-derived, so a failed→ready transition (for
+		// example, an operator confirmation) mints a new ID and would otherwise
+		// leave the stale failed candidate beside its successor. Supersede only
+		// after the successor is durably recorded: doing it first can leave the
+		// case with no live candidate when that write fails (INC-1785219127694654485-000002).
 		existing := s.knowledgeCandidates[candidate.CandidateID]
 		if existing != nil && existing.Status == knowledgeCandidateValidationFailed && candidate.Status == knowledgeCandidateValidationFailed {
 			now := time.Now().UTC()
@@ -339,14 +338,32 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 			if s.persistKnowledgeCandidateValidationRefreshLocked(&refreshed, event) {
 				*existing = refreshed
 				s.knowledgeEvents[event.EventID] = event
+				s.supersedeStaleCaseCandidatesLocked(snapshot.CaseID, candidate.CandidateID, now)
 			}
 			continue
 		}
+		// Superseded is relative: a newer generation replaced this one, so a
+		// recompute can revoke that premise. Rejected is an operator decision and
+		// remains terminal.
 		if existing != nil &&
-			existing.Status == knowledgeCandidateValidationFailed &&
-			existing.ValidationError == knowledgeReviewInvalidationError &&
+			(existing.Status == knowledgeCandidateSuperseded ||
+				(existing.Status == knowledgeCandidateValidationFailed && existing.ValidationError == knowledgeReviewInvalidationError)) &&
 			candidate.Status == knowledgeCandidateReady {
 			if !s.knowledgeCandidateSupportsValidSnapshotsLocked(existing) {
+				continue
+			}
+			liveCandidate := false
+			for _, other := range s.knowledgeCandidates {
+				if other == nil || other.CandidateID == existing.CandidateID ||
+					(other.CaseID != snapshot.CaseID && !containsString(other.SupportingCaseIDs, snapshot.CaseID)) {
+					continue
+				}
+				switch other.Status {
+				case knowledgeCandidateGenerated, knowledgeCandidateReady, knowledgeCandidateShadow, knowledgeCandidateActive:
+					liveCandidate = true
+				}
+			}
+			if liveCandidate {
 				continue
 			}
 			now := time.Now().UTC()
@@ -374,6 +391,7 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 			}
 			*existing = revalidated
 			s.knowledgeEvents[event.EventID] = event
+			s.supersedeStaleCaseCandidatesLocked(snapshot.CaseID, candidate.CandidateID, now)
 			continue
 		}
 		link := candidate
@@ -395,6 +413,7 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 			s.knowledgeCandidates[candidate.CandidateID] = candidate
 		}
 		s.knowledgeEvents[event.EventID] = event
+		s.supersedeStaleCaseCandidatesLocked(snapshot.CaseID, candidate.CandidateID, time.Now().UTC())
 	}
 }
 
