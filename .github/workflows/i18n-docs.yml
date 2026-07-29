@@ -11,12 +11,20 @@ on:
       - "docs/**"
       - "README.md"
       - "scripts/check-i18n.sh"
+      - "scripts/check-removed-ontology-docs.sh"
+      - "scripts/check-removed-ontology-docs.allowlist"
+      - "agent/ontology/schema.tql"
+      - "agent/ontology/functions.tql"
   pull_request:
     branches: ["**"]
     paths:
       - "docs/**"
       - "README.md"
       - "scripts/check-i18n.sh"
+      - "scripts/check-removed-ontology-docs.sh"
+      - "scripts/check-removed-ontology-docs.allowlist"
+      - "agent/ontology/schema.tql"
+      - "agent/ontology/functions.tql"
   workflow_dispatch:
 
 jobs:
@@ -28,3 +36,5 @@ jobs:
           fetch-depth: 0 # commit timestamps drive the staleness check
       - name: Check EN/KO doc parity and freshness
         run: bash scripts/check-i18n.sh
+      - name: Check docs for removed ontology names
+        run: bash scripts/check-removed-ontology-docs.sh
