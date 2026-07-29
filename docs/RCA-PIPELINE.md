@@ -278,8 +278,9 @@ collector) — see [Knowledge Base](KNOWLEDGE-BASE.md#typedb-ontology):
 
 - `enrich()`: node **blast radius** (how many workloads share the alerting node)
   and **prior same-alert incidents** with their stored RCA.
-- `graph_remediation()`: `fixes_for_family`, `fixes_for_xid`, and reverse
-  `leads_to` **root-XID chains** (fix the origin, not the downstream symptom).
+- `graph_remediation()`: symptom-keyed `_KNOWLEDGE_QUERY` (including promoted
+  `confirmed:{alert_name}` symptoms), `fixes_for_xid`, and reverse `leads_to`
+  **root-XID chains** (fix the origin, not the downstream symptom).
 
 Degrades to empty when TypeDB is off/unreachable; never raises.
 

@@ -247,7 +247,8 @@ medium은 `2`부터이고, high는 점수 `5`와 독립 live source group 2개�
 
 - `enrich()`: 노드 **blast radius(영향 범위)**(알림이 발생한 노드를 공유하는 워크로드 수)와
   저장된 RCA를 가진 **동일 알림의 이전 인시던트**.
-- `graph_remediation()`: `fixes_for_family`, `fixes_for_xid`, 그리고 역방향 `leads_to`
+- `graph_remediation()`: symptom 기반 `_KNOWLEDGE_QUERY`(승격된
+  `confirmed:{alert_name}` symptom 포함), `fixes_for_xid`, 그리고 역방향 `leads_to`
   **근본 XID 체인**(하류 증상이 아니라 기원을 수정).
 
 TypeDB가 꺼져 있거나 도달 불가능할 때는 빈 값으로 저하되며, 결코 예외를 발생시키지 않습니다.

@@ -153,8 +153,10 @@ flowchart LR
 | --- | --- | --- |
 | `causes_for_symptom` | Curated candidate families | Live match still required |
 | `dependencies_for_component` / `checks_for_component_path` | Dependency-aware checks | Not an outage assertion |
-| `affected_workloads_for_node` | Blast-radius context | Not causal proof |
-| Approved-case/action functions | Labelled historical context | Cannot satisfy evidence gate |
+| `_BLAST_QUERY` | Blast-radius context | Not causal proof |
+| `_PRIOR_QUERY` → `_CASE_CARD_QUERY` | Labelled historical CaseCard context | Cannot satisfy evidence gate |
+| `_KNOWLEDGE_QUERY` (including promoted `confirmed:{alert_name}` symptoms) | Symptom-specific remediation | Live match still required |
+| `_FN_DIAGNOSTIC_TRANSITIONS` | Diagnostic-tree transitions | Read-only planner guidance |
 
 Fine-grained signature matching is the retrieval entry point. It searches
 failure-mode symptoms, NVIDIA XID codes, alert text, and known issues across all
@@ -190,15 +192,16 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --incide
 kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 ```
 
-### In depth: function and Studio reference
+### In depth: runtime query and Studio reference
 
-| Function | What it asks |
+| Runtime path | What it asks |
 | --- | --- |
 | `causes_for_symptom` | Which curated families fit one live-matched symptom? |
 | `dependencies_for_component` / `checks_for_component_path` | What does this component depend on and what should be checked? |
-| `affected_workloads_for_node` | What is the node blast radius? |
-| `approved_incidents_for_cause` / `evidence_for_approved_cause` | Which approved cases are useful labelled context? |
-| `verified_actions_for_family` | Which operator-confirmed action is historical guidance? |
+| `_BLAST_QUERY` | What is the node blast radius? |
+| `_PRIOR_QUERY` → `_CASE_CARD_QUERY` | What CaseCard belongs to a prior same-alert incident? |
+| `_KNOWLEDGE_QUERY` (including promoted `confirmed:{alert_name}` symptoms) | Which action matches a live symptom? |
+| `_FN_DIAGNOSTIC_TRANSITIONS` | Which transitions continue this diagnostic tree? |
 
 ```typeql
 # A run-scoped claim and the evidence that supports it
