@@ -1958,7 +1958,9 @@ func (s *Store) persistKnowledgeReviewRevalidationLocked(candidate *KnowledgeCan
 			SET status = $1, package_id = '', validation_error = '', trace = $2,
 			    payload = $3, decided_at = NULL, decided_by = '', decision_note = '',
 			    updated_at = $4
-			WHERE candidate_id = $5 AND status = 'validation_failed'`,
+			-- Superseded candidates are revivable; excluding them would make that
+			-- transition a silent zero-row update and discard the in-memory change.
+			WHERE candidate_id = $5 AND status IN ('validation_failed', 'superseded')`,
 			candidate.Status, mustJSON(candidate.Trace), mustJSON(candidate.Payload),
 			candidate.UpdatedAt, candidate.CandidateID) {
 			return false
