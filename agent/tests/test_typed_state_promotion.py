@@ -90,6 +90,7 @@ def test_imagepullbackoff_lifecycle_state_promotes_image_pull_error_to_high() ->
     assert promoted[0].confidence_gate["force_high"] is True
     assert "signature" in promoted[0].evidence_agents
     assert promoted[0].score_breakdown[-1]["kind"] == "typed_container_state"
+    assert promoted[0].score_breakdown[-1]["evidence_ids"] == ["E01"]
 
 
 def test_repeated_typed_warning_event_qualifies_and_low_count_does_not() -> None:
