@@ -1610,7 +1610,7 @@ def match_failure_mode_symptoms(
             )
         ]
         matched.sort(key=lambda fs: fs[0] != top_family)
-        return matched
+        return _dedupe_symptom_names(matched)
     # A generic state marker (ImagePullBackOff, CrashLoopBackOff, FailedMount)
     # names the retry/lifecycle state, not its mechanism. Any concrete error
     # signature must lead it even when the alert name contributes two generic
@@ -1638,6 +1638,27 @@ def match_failure_mode_symptoms(
             continue
         kept.append((family, {**symptom, "matched_keywords": hits}))
         kept_hits.append(hits)
+    return _dedupe_symptom_names(kept)
+
+
+def _dedupe_symptom_names(
+    matches: list[tuple[str, dict[str, Any]]]
+) -> list[tuple[str, dict[str, Any]]]:
+    """Keep the first (best-ranked) entry per symptom NAME across families.
+
+    A symptom name is a global identity (one TypeDB entity, one YAML entry), so
+    the same name under two families is the same knowledge reached twice — a
+    stale ``indicates`` edge left behind by a family move in failure_modes.yaml
+    (live case: OOMKilled under both workload_startup_error and
+    workload_runtime_error rendered the identical guidance block twice)."""
+    seen: set[str] = set()
+    kept: list[tuple[str, dict[str, Any]]] = []
+    for family, symptom in matches:
+        name = str(symptom.get("symptom") or "")
+        if name and name in seen:
+            continue
+        seen.add(name)
+        kept.append((family, symptom))
     return kept
 
 

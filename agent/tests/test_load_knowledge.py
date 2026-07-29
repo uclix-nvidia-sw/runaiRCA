@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ontology.load_knowledge import _ensure_symptom
+from ontology.load_knowledge import _ensure_symptom, _relate_indicates
 
 
 class _Concept:
@@ -93,3 +93,53 @@ def test_ensure_symptom_replaces_old_reason_before_inserting_new_value() -> None
         if 'insert $s has reason "new reason";' in query
     )
     assert delete_index < insert_index
+
+
+class _FamilyRow:
+    def __init__(self, family: str) -> None:
+        self.family = family
+
+    def get(self, name: str) -> _Concept:
+        assert name == "f"
+        return _Concept(self.family)
+
+
+class _IndicatesTx(_Tx):
+    def __init__(self, families: list[str]) -> None:
+        super().__init__()
+        self.families = families
+
+    def query(self, query: str) -> _Result:
+        self.queries.append(query)
+        if "select $f;" in query:
+            return _Result([_FamilyRow(family) for family in self.families])
+        return _Result([])
+
+
+def test_relate_indicates_retires_the_stale_family_edge() -> None:
+    # The live INC-1785128597 duplicate: OOMKilled moved workload_startup_error
+    # -> workload_runtime_error in the YAML, but both families stayed in the
+    # catalog, so purge never touched the old edge and the symptom matched twice.
+    tx = _IndicatesTx(["workload_startup_error", "workload_runtime_error"])
+
+    _relate_indicates(tx, "OOMKilled", "workload_runtime_error")
+
+    assert any(
+        '$rc has subtype "workload_startup_error"; delete $rel;' in query
+        for query in tx.queries
+    )
+    # The current edge already exists — no delete for it, no re-insert.
+    assert not any(
+        '$rc has subtype "workload_runtime_error"; delete $rel;' in query
+        for query in tx.queries
+    )
+    assert not any("insert (symptom: $s, cause: $rc) isa indicates;" in q for q in tx.queries)
+
+
+def test_relate_indicates_inserts_for_a_new_symptom() -> None:
+    tx = _IndicatesTx([])
+
+    _relate_indicates(tx, "OOMKilled", "workload_runtime_error")
+
+    assert not any("delete $rel;" in query for query in tx.queries)
+    assert any("insert (symptom: $s, cause: $rc) isa indicates;" in q for q in tx.queries)

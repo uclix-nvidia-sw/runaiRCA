@@ -216,11 +216,24 @@ def _ensure_action(tx: Any, statement: str) -> None:
 
 
 def _relate_indicates(tx: Any, symptom_name: str, family: str) -> None:
-    if _exists(
+    # A symptom name is a single identity with exactly ONE family. When the
+    # YAML moves a symptom between families (OOMKilled: workload_startup_error
+    # -> workload_runtime_error), the old edge must be retired here — purge only
+    # removes families that LEFT the catalog, so an edge to a still-current
+    # family would otherwise survive forever and the symptom would match twice.
+    current = _selected_values(
         tx,
-        f'$x isa symptom, has name "{esc(symptom_name)}"; $rc isa {family}; '
-        f"(symptom: $x, cause: $rc) isa indicates;",
-    ):
+        f'$rel isa indicates, links (symptom: $s, cause: $rc); '
+        f'$s isa symptom, has name "{esc(symptom_name)}"; $rc has subtype $f;',
+        "f",
+    )
+    for stale in sorted(current - {family}):
+        tx.query(
+            f'match $rel isa indicates, links (symptom: $s, cause: $rc); '
+            f'$s isa symptom, has name "{esc(symptom_name)}"; '
+            f'$rc has subtype "{esc(stale)}"; delete $rel;'
+        ).resolve()
+    if family in current:
         return
     tx.query(
         f'match $s isa symptom, has name "{esc(symptom_name)}"; $rc isa {family}; '
