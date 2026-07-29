@@ -882,6 +882,7 @@ tbody tr:active td {
 
 .danger-button {
   color: #b42318;
+  border-color: #fecaca;
 }
 
 .danger-button:hover:not(:disabled) {
@@ -1185,7 +1186,8 @@ td span.occurrence-pill {
 
 .icon-button,
 .ghost-button,
-.primary-button {
+.primary-button,
+.danger-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1403,6 +1405,15 @@ td span.occurrence-pill {
   padding: 0.45rem 0.1rem 0.7rem;
 }
 
+.bulk-actions:has(.bulk-selection-count) {
+  border-radius: 0.55rem;
+  margin: 0 0.1rem 0.35rem;
+  padding: 0.45rem 0.6rem;
+  background: var(--surface-soft);
+  border-bottom: 0;
+  animation: view-enter var(--dur-2) var(--ease-out) both;
+}
+
 .bulk-selection-count,
 .bulk-selection-hint,
 .bulk-clear-button {
@@ -1415,7 +1426,11 @@ td span.occurrence-pill {
 }
 
 .bulk-selection-count {
-  color: var(--ink);
+  border-radius: 999px;
+  min-height: 1.8rem;
+  padding: 0 0.6rem;
+  background: var(--surface);
+  color: var(--nvidia-dark);
 }
 
 .bulk-clear-button {

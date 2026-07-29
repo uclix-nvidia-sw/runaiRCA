@@ -241,7 +241,7 @@ function BulkIncidentActions({
       {count > 0 ? (
         <>
           <span className="bulk-selection-count"><CheckSquare size={16} />{count} selected</span>
-          <button className="ghost-button compact-button" type="button" disabled={busy} onClick={() => void onAction(primary.action)}>
+          <button className="primary-button compact-button" type="button" disabled={busy} onClick={() => void onAction(primary.action)}>
             {primary.icon}{primary.label}
           </button>
           <button
