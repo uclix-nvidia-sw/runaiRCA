@@ -874,7 +874,16 @@ func (s *Store) dbSearchMemoryExcluding(query, excludedIncidentID string, limit 
 	if s.db == nil || !s.dbReady || !s.pgvectorReady {
 		return nil, false
 	}
-	literal := embeddingLiteral(s.embed(query))
+	queryEmbedding := s.embedResult(query)
+	if s.embedder != nil && s.embedder.endpoint != "" && queryEmbedding.basis != embeddingBasisRemote {
+		log.Printf("WARNING: embedding query fell back to hash; using sparse similarity to avoid cross-basis results: %v", queryEmbedding.err)
+		return nil, false
+	}
+	retrievalKind := "dense-lexical"
+	if queryEmbedding.basis == embeddingBasisRemote {
+		retrievalKind = "dense-semantic"
+	}
+	literal := embeddingLiteral(queryEmbedding.vector)
 	queryLimit := limit * 3
 	ctx, cancel := postgresOperationContext()
 	defer cancel()
@@ -928,6 +937,7 @@ func (s *Store) dbSearchMemoryExcluding(query, excludedIncidentID string, limit 
 		}
 		item.Similarity = math.Round(similarity*1000) / 1000
 		item.AnalysisDetail = excerpt(detail, 900)
+		item.RetrievalKind = retrievalKind
 		results = append(results, item)
 	}
 	if err := rows.Err(); err != nil {

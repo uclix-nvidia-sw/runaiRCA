@@ -63,6 +63,19 @@ for _group in _SYNONYM_GROUPS:
     for _term in _group:
         _SYNONYMS[_term] = frozenset(t for t in _group if t != _term)
 
+# Korean query stems bridge to English corpus terms. Small and curated like the
+# keyword lists themselves — extend as gaps show up.
+_KOREAN_STEM_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("선점", ("preempt", "preempted", "preemption")),
+    ("축출", ("evict", "evicted", "eviction")),
+    ("회수", ("reclaim", "reclaimed")),
+    ("메모리부족", ("oom", "oomkilled")),
+    ("이미지풀", ("imagepullbackoff", "errimagepull")),
+    ("크래시루프", ("crashloop", "crashloopbackoff")),
+    ("대기중", ("pending", "unschedulable")),
+    ("권한", ("permission", "denied", "forbidden")),
+)
+
 # Qualification gates (see module docstring).
 _RARE_DF_RATIO = 0.25
 _SIGNATURE_DF = 2
@@ -214,7 +227,12 @@ class BM25Index:
         rare_hit = [False] * self._n
         signature_hit = [False] * self._n
         for source in query_tokens:
-            for term in (source, *_SYNONYMS.get(source, ())):
+            bridge_terms: tuple[str, ...] = ()
+            for stem, terms in _KOREAN_STEM_GROUPS:
+                if source.startswith(stem):
+                    bridge_terms = terms
+                    break
+            for term in (source, *_SYNONYMS.get(source, ()), *bridge_terms):
                 df = self._df.get(term)
                 if not df:
                     continue

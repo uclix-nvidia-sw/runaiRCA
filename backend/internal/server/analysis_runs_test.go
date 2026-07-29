@@ -570,7 +570,7 @@ func TestAnalysisRunCompactsSimilarIncidentsForAgent(t *testing.T) {
 	if similar.AnalysisDetail != "" || similar.Labels != nil {
 		t.Fatalf("similar incident detail/labels should not be sent to agent: %+v", similar)
 	}
-	if similar.RootCauseFamily != "runai_scheduling_quota" || !similar.Approved {
+	if similar.RootCauseFamily != "runai_scheduling_quota" || !similar.Approved || similar.RetrievalKind != "sparse-identity" {
 		t.Fatalf("similar incident provenance should be preserved for the agent: %+v", similar)
 	}
 	if len(similar.AnalysisSummary) > 803 || !strings.HasSuffix(similar.AnalysisSummary, "...") {
