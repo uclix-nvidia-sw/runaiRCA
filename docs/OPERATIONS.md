@@ -22,8 +22,8 @@ receiver was routed. Confirm the live path:
 
 ```bash
 # Alerts and analysis runs the backend has actually received/started
-curl -s http://<backend-or-frontend>/api/v1/alerts | jq '.[0]'
-curl -s http://<backend-or-frontend>/api/v1/analysis-runs | jq '.[0]'
+curl -s http://<backend-or-frontend>/api/v1/alerts | jq '.data[0]'
+curl -s http://<backend-or-frontend>/api/v1/analysis-runs | jq '.data[0]'
 
 # Agent process liveness (means the API is up, NOT that a collector produced evidence)
 curl -s http://<agent>/healthz
@@ -114,7 +114,7 @@ created only from an active, Dashboard-approved CaseSnapshot carrying an explici
 that are not active remain intentionally unconverted. Re-analyze and approve the
 case to create an eligible trace-v3 snapshot, then run the backfill again.
 
-See [Knowledge Base → Querying the graph](KNOWLEDGE-BASE.md#querying-the-graph)
+See [Knowledge Base → TypeDB enrichment](KNOWLEDGE-BASE.md#5-in-depth-optional-typedb-enrichment)
 for TypeDB Studio access.
 
 ## Grafana MCP (Prometheus / Loki) diagnostics

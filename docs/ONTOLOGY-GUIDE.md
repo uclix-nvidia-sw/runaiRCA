@@ -82,7 +82,7 @@ erDiagram
 
 | Schema word | Meaning | Example |
 | --- | --- | --- |
-| Entity | A named thing | incident, component, evidence, action |
+| Entity | A named thing | incident, control_plane_component, evidence, action |
 | Attribute | A property | `incident_id`, confidence, masked summary |
 | Relation | A meaningful connection | `supported_by`, `depends_on` |
 | Role | A participant's job in a relation | diagnosis is the claim; evidence is the proof |
@@ -97,8 +97,9 @@ records `resolved` or `mitigated`.
 The current schema has **16 operational families + 3 auxiliary states**: the
 16 `failure_modes.yaml` families are operator-facing, while
 `platform_version_bug`, `expected_known_behavior`, and `insufficient_evidence`
-are supporting classification states. That is 19 `root_cause` subtypes total;
-the closed vocabulary is intentionally unchanged.
+are supporting classification states. Together with `cause_instance sub root_cause`,
+that is 20 `root_cause` subtypes total; the closed vocabulary is intentionally
+unchanged.
 
 Runbooks appear twice on purpose: one *executable* runbook holds every
 diagnostic step (the walk and all probe IDs live there), and per-domain

@@ -82,7 +82,7 @@ erDiagram
 
 | 스키마 용어 | 뜻 | 예시 |
 | --- | --- | --- |
-| Entity | 이름을 가진 대상 | incident, component, evidence, action |
+| Entity | 이름을 가진 대상 | incident, control_plane_component, evidence, action |
 | Attribute | 대상의 속성 | `incident_id`, confidence, 마스킹된 summary |
 | Relation | 의미 있는 연결 | `supported_by`, `depends_on` |
 | Role | relation 안에서 참여자의 역할 | diagnosis는 주장, evidence는 증명 |
@@ -95,8 +95,8 @@ symptom → 확인된 action), `has_symptom`은 인시던트가 보인 증상을
 
 현재 스키마는 **운영 family 16개 + 보조 상태 3개**입니다. `failure_modes.yaml`의
 16개는 운영자용 taxonomy이고, `platform_version_bug`, `expected_known_behavior`,
-`insufficient_evidence`는 보조 분류 상태입니다. `root_cause` subtype은 총 19개이며,
-닫힌 vocabulary 자체는 변경하지 않습니다.
+`insufficient_evidence`는 보조 분류 상태입니다. `cause_instance sub root_cause`까지
+포함하면 `root_cause` subtype은 총 20개이며, 닫힌 vocabulary 자체는 변경하지 않습니다.
 
 runbook은 의도적으로 두 겹입니다: 실행 가능한 runbook 하나가 모든 diagnostic
 step을 담고(walk와 모든 probe ID가 여기 있음), 도메인별 runbook

@@ -66,7 +66,7 @@ flowchart LR
 | `RUNAI_WORKLOADS_PATH` | Run:ai 워크로드 API 경로. 기본값 `/api/v1/workloads` |
 | `RUNAI_PROJECTS_PATH` | Run:ai 프로젝트 API 경로. 기본값 `/api/v1/projects` |
 | `RUNAI_QUEUES_PATH` | Run:ai 큐 API 경로. 기본값 `/api/v1/queues` |
-| `RUNAI_VERSION_PATH` | Run:ai 컨트롤 플레인 버전 API 경로. 기본값 `/api/v1/version` — 이미 수정된 알려진 이슈를 버전 기반으로 억제할 수 있게 합니다 |
+| `RUNAI_VERSION_PATH` | Run:ai 컨트롤 플레인 버전 API 경로. 기본값 `/api/v1/clusters` — 이미 수정된 알려진 이슈를 버전 기반으로 억제할 수 있게 합니다 |
 | `RUNAI_TIMEOUT_SECONDS` | Run:ai API 요청 타임아웃. 기본값 `120` |
 | `RUNAI_MCP_URL` | 공식 NVIDIA Run:ai MCP shared service URL(스트리머블 HTTP `/mcp`, 예: `http://runai-rca-runai-mcp:8080/mcp`). 설정하면 runai 수집기와 드릴다운이 집중된 읽기 전용 16개 도구 세트를 사용합니다. 엔드포인트는 OIDC로 보호되며, Helm은 이를 공유 ClusterIP 서비스로 배포하고 기본적으로 이 URL을 설정합니다(`runaiMcp.enabled: true`). 어떤 실패든 Run:ai 직접 HTTP 읽기로 폴백합니다. |
 | `RUNAI_LOG_NAMESPACES` | 쉼표로 구분된 Run:ai 컨트롤 플레인 로그 네임스페이스. 기본값 `runai,runai-backend` |
@@ -132,7 +132,7 @@ flowchart LR
 | `EMBEDDING_DIM` | 백엔드: 임베딩 벡터 차원. 기본값 `384`. 모델과 일치해야 하며, 변경하면 기존 행을 다시 임베딩해야 합니다 |
 | `EMBEDDING_API_KEY` | 백엔드: 임베딩 엔드포인트용 API 키(시크릿 키 `embeddingApiKey`) |
 | `ENABLE_TYPEDB` | TypeDB 온톨로지의 마스터 스위치. 기본값 `false`(Helm은 `typedb.enabled`에서 설정하며 기본적으로 켜짐). 연결 변수는 아래에 있으며, 자세한 내용은 [데이터 스토어](DATABASE.md)를 참고하세요 |
-| `TYPEDB_ADDRESS` | TypeDB 서버 주소. 기본값 `localhost:1729`. 클러스터 내부에서는 `<release>-typedb:1729` |
+| `TYPEDB_ADDRESS` | TypeDB 서버 주소. 기본값은 빈 값입니다. 주소가 비어 있으면 지식 그래프 보강이 비활성화됩니다. 클러스터 내부에서는 `<release>-typedb:1729` |
 | `TYPEDB_DATABASE` | TypeDB 데이터베이스 이름. 기본값 `runai_rca` |
 | `TYPEDB_USERNAME` / `TYPEDB_PASSWORD` | TypeDB 자격 증명. 기본값 `admin` / `password`(CE 기본값 — PoC 이후에는 재정의) |
 | `TYPEDB_TLS_ENABLED` | TypeDB 연결에 TLS를 사용합니다. 기본값 `false` |
@@ -175,6 +175,7 @@ helm upgrade --install runai-rca charts/runai-rca \
 | `{backend,agent,frontend}.replicaCount` | 무상태 런타임 컴포넌트를 스케일링합니다. 번들 Postgres는 레플리카 하나로 유지하세요 |
 | `{backend,agent,frontend,postgresql}.resources` | 프로덕션 스케줄링을 위한 CPU/메모리 requests 및 limits |
 | `backend.env.agentUrl` | 에이전트가 외부 또는 원격에 있을 때 백엔드에서 에이전트로 접근하는 URL을 재정의합니다 |
+| `backend.env.knowledgeValidatorUrl` | 승인 시 사용하는 Agent validator 기본 URL을 재정의합니다. 비어 있으면 클러스터 내부 Agent 서비스를 사용하고 백엔드가 `/knowledge/validate`를 덧붙입니다 |
 | `backend.env.language` / `agent.env.language` | RCA 언어를 `en` 또는 `ko`로 설정합니다 |
 | `backend.env.databaseConnectTimeoutSeconds` / `agentRequestTimeoutSeconds` / `manualAgentRequestTimeoutSeconds` | 백엔드 시작 DB 타임아웃, 자동/채팅 에이전트 타임아웃, 운영자가 트리거한 분석 타임아웃 |
 | `secrets.keys.*` | DB, Run:ai, Grafana, NVIDIA, LLM 자격 증명에 대한 기존 Secret 키 이름 |
@@ -237,7 +238,8 @@ helm upgrade --install runai-rca charts/runai-rca \
 ```
 
 `DATABASE_URL`이 구성되면 백엔드는 `incidents`, `alerts`, `incident_embeddings`,
-`rca_feedback`, `rca_comments`, `analysis_runs`를 생성하고 사용합니다. 인시던트에는
+`rca_feedback`, `analysis_runs`를 생성하고 사용합니다. `rca_comments`는 존재할 경우에만
+기존 행을 `rca_feedback`로 이관하기 위해 읽습니다. 인시던트에는
 `user_approved_at`, `archived_at`, `deleted_at` 라이프사이클 컬럼이 포함되고, 분석 실행에는
 `llm_usage` 같은 값을 담기 위한 `metadata` JSONB가 포함됩니다. `context.llm_usage`에는
 단계별 토큰 breakdown인 `nat` 하위 키(`{stage: {calls, prompt_tokens,

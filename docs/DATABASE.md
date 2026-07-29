@@ -45,8 +45,8 @@ feedback, similarity search, and the approved-knowledge learning pipeline. Use
 TypeDB only for optional topology and approved-history relationships; it is never
 a second operational source of truth.
 
-Tables are auto-created by the backend on startup (`backend/store_postgres.go`).
-Twelve backend-owned tables, grouped by what they serve. Two more —
+Tables are auto-created by the backend on startup (`backend/internal/server/store_postgres.go`).
+Thirteen backend-owned tables, grouped by what they serve. Two more —
 `rca_dataset` and `ontology_backfill_cursors` — are created by the agent's
 Python offline jobs, not the Go backend.
 
@@ -85,6 +85,7 @@ Python offline jobs, not the Go backend.
 | Table | Purpose | Key columns |
 |---|---|---|
 | `chat_conversations` | Chatbot threads, linked to incident/alert context | `conversation_id` (PK), `incident_id`, `alert_id`, `messages` (JSONB), `context_label` |
+| `deleted_alert_episodes` | Tombstones hard-deleted alert episodes so a later webhook does not restore them | `fingerprint` (PK), `fired_at`, `deleted_at` |
 | `rca_dataset` | Offline eval dataset — a CronJob accumulates operator-labeled incidents, exported to the curated set | `dataset_id` (PK), `incident_id`, `alertname`, `expected_family`, `approved`, `question` (JSONB) |
 | `ontology_backfill_cursors` | One-time backfill bookkeeping (snapshots → TypeDB) | `cursor_name` (PK), `approved_at`, `case_id` |
 

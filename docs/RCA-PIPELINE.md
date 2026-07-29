@@ -182,7 +182,7 @@ vice versa:
 The postgres agent queries the **Run:ai control-plane database itself** when
 `RUNAI_DB_DSN` is set (workloads/audit/authorization/… schemas) — not just the
 RCA store. The tool description is enriched with schema ownership from the
-[architecture topology](KNOWLEDGE-BASE.md#platform-architecture-topology), so the
+[architecture topology](KNOWLEDGE-BASE.md), so the
 loop knows where to look.
 
 It continues until the agent is done, repeats a query, or reaches the analysis
@@ -274,7 +274,7 @@ ranked alternative survives the same check, the pipeline emits
 ## 7. Ontology enrichment
 
 The **orchestrator** consults the optional TypeDB knowledge graph (not a parallel
-collector) — see [Knowledge Base](KNOWLEDGE-BASE.md#typedb-ontology):
+collector) — see [Knowledge Base](KNOWLEDGE-BASE.md#5-in-depth-optional-typedb-enrichment):
 
 - `enrich()`: node **blast radius** (how many workloads share the alerting node)
   and **prior same-alert incidents** with their stored RCA.
@@ -311,7 +311,7 @@ carries `status`, `duration_seconds`, `model` and `max_tokens`.
 The **Troubleshooting Playbook** section appends, for any implicated platform
 component, its failure effect, its BFS **dependency check order** (e.g.
 `cluster-sync → status-updater → runai-backend-traefik`), and its ready-to-run
-`kubectl` checks — from the [architecture topology](KNOWLEDGE-BASE.md#platform-architecture-topology).
+`kubectl` checks — from the [architecture topology](KNOWLEDGE-BASE.md).
 
 ## 9. Runtime harness
 

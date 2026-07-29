@@ -118,7 +118,7 @@ Backend Postgres가 패키지 승인, 활성화, 은퇴의 권위자입니다. `
 
 active와 shadow 패키지가 실제로 실시간 분석에 어떻게 반영되는지는 런타임 활성화 사다리
 (`DYNAMIC_KNOWLEDGE_MODE`: off/shadow/assist/authoritative)가 결정합니다 —
-[지식 베이스](KNOWLEDGE-BASE.md#3-how-knowledge-is-used-during-an-analysis) 참조.
+[지식 베이스](KNOWLEDGE-BASE.md#3-분석-중-지식이-사용되는-방법) 참조.
 
 Candidate 생성은 완전한 trace-v3 ledger 경로를 우선합니다. Ledger가 불완전해도 approved
 snapshot과 family가 일치하고 supporting evidence가 canonical하며 반증이 없고 비어 있지

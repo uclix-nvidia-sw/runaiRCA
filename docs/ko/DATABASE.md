@@ -42,8 +42,8 @@ flowchart LR
 파이프라인은 PostgreSQL을 사용합니다. TypeDB는 선택 사항인 토폴로지와 승인 이력 관계에만
 사용하며, 두 번째 운영 신뢰 원천이 아닙니다.
 
-테이블은 시작 시 백엔드가 자동 생성합니다(`backend/store_postgres.go`). 백엔드 소유 테이블은
-12개이며, 역할별로 묶으면 다음과 같습니다. 나머지 둘 — `rca_dataset`와
+테이블은 시작 시 백엔드가 자동 생성합니다(`backend/internal/server/store_postgres.go`). 백엔드 소유 테이블은
+13개이며, 역할별로 묶으면 다음과 같습니다. 나머지 둘 — `rca_dataset`와
 `ontology_backfill_cursors` — 는 Go 백엔드가 아니라 에이전트의 Python 오프라인 잡이 생성합니다.
 
 **수집 & 분석**
@@ -84,6 +84,7 @@ flowchart LR
 | 테이블 | 목적 | 주요 컬럼 |
 |---|---|---|
 | `chat_conversations` | 챗봇 대화 스레드. 인시던트/알림 컨텍스트에 연결 | `conversation_id` (PK), `incident_id`, `alert_id`, `messages` (JSONB), `context_label` |
+| `deleted_alert_episodes` | 하드 삭제된 알림 에피소드가 이후 웹훅으로 복원되지 않도록 남기는 tombstone | `fingerprint` (PK), `fired_at`, `deleted_at` |
 | `rca_dataset` | 오프라인 eval 데이터셋 — CronJob이 라벨된 인시던트를 누적, curated 세트로 export | `dataset_id` (PK), `incident_id`, `alertname`, `expected_family`, `approved`, `question` (JSONB) |
 | `ontology_backfill_cursors` | 일회성 백필 북킵(스냅샷 → TypeDB) | `cursor_name` (PK), `approved_at`, `case_id` |
 

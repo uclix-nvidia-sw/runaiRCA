@@ -186,7 +186,7 @@ separate agent. Full detail: [Knowledge Base](KNOWLEDGE-BASE.md).
   "which past incidents are similar".
 
 Verify what the graph holds with `python -m ontology.query` or TypeDB Studio —
-see [Knowledge Base → Querying the graph](KNOWLEDGE-BASE.md#querying-the-graph).
+see [Knowledge Base → TypeDB enrichment](KNOWLEDGE-BASE.md#5-in-depth-optional-typedb-enrichment).
 TypeDB runs as a single-node StatefulSet
 (`charts/runai-rca/templates/typedb.yaml`); Community Edition is single-node, so
 HA/clustering would require the paid Enterprise tier.

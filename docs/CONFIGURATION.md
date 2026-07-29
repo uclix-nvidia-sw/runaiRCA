@@ -67,7 +67,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `RUNAI_WORKLOADS_PATH` | Run:ai workloads API path, default `/api/v1/workloads` |
 | `RUNAI_PROJECTS_PATH` | Run:ai projects API path, default `/api/v1/projects` |
 | `RUNAI_QUEUES_PATH` | Run:ai queues API path, default `/api/v1/queues` |
-| `RUNAI_VERSION_PATH` | Run:ai control-plane version API path, default `/api/v1/version` — enables version-aware suppression of already-fixed known issues |
+| `RUNAI_VERSION_PATH` | Run:ai control-plane version API path, default `/api/v1/clusters` — enables version-aware suppression of already-fixed known issues |
 | `RUNAI_TIMEOUT_SECONDS` | Run:ai API request timeout, default `120` |
 | `RUNAI_MCP_URL` | Official NVIDIA Run:ai MCP shared-service URL (streamable HTTP at `/mcp`, e.g. `http://runai-rca-runai-mcp:8080/mcp`). When set, the runai collector + drill-down use its focused read-only set of 16 tools. The endpoint is OIDC-protected; Helm deploys it as a shared ClusterIP service and sets this URL by default (`runaiMcp.enabled: true`). Any failure falls back to direct Run:ai HTTP reads. |
 | `RUNAI_LOG_NAMESPACES` | Comma-separated Run:ai control-plane log namespaces, default `runai,runai-backend` |
@@ -133,7 +133,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `EMBEDDING_DIM` | Backend: embedding vector dimension, default `384`. Must match the model; changing it requires re-embedding existing rows |
 | `EMBEDDING_API_KEY` | Backend: API key for the embedding endpoint (secret key `embeddingApiKey`) |
 | `ENABLE_TYPEDB` | Master switch for the TypeDB ontology, default `false` (Helm sets it from `typedb.enabled`, default on). Connection vars below — full detail in [Data Stores](DATABASE.md) |
-| `TYPEDB_ADDRESS` | TypeDB server address, default `localhost:1729`; in-cluster `<release>-typedb:1729` |
+| `TYPEDB_ADDRESS` | TypeDB server address, default empty. An empty address disables knowledge-graph enrichment; in-cluster `<release>-typedb:1729` |
 | `TYPEDB_DATABASE` | TypeDB database name, default `runai_rca` |
 | `TYPEDB_USERNAME` / `TYPEDB_PASSWORD` | TypeDB credentials, default `admin` / `password` (CE defaults — override beyond PoC) |
 | `TYPEDB_TLS_ENABLED` | Use TLS for the TypeDB connection, default `false` |
@@ -240,8 +240,9 @@ helm upgrade --install runai-rca charts/runai-rca \
 ```
 
 When `DATABASE_URL` is configured, the backend creates and uses `incidents`,
-`alerts`, `incident_embeddings`, `rca_feedback`, `rca_comments`, and
-`analysis_runs`. Incidents include `user_approved_at`, `archived_at`, and
+`alerts`, `incident_embeddings`, `rca_feedback`, and `analysis_runs`.
+`rca_comments`, if present, is read only to migrate legacy rows into
+`rca_feedback`. Incidents include `user_approved_at`, `archived_at`, and
 `deleted_at` lifecycle columns; analysis runs include `metadata` JSONB for
 fields such as `llm_usage`. `context.llm_usage` may include a `nat` subkey with
 per-stage token breakdowns (`{stage: {calls, prompt_tokens, completion_tokens,

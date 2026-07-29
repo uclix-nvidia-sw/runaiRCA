@@ -20,8 +20,8 @@ Slack 알림만으로는 RCA 수신기가 라우팅되었음을 증명하지 못
 
 ```bash
 # Alerts and analysis runs the backend has actually received/started
-curl -s http://<backend-or-frontend>/api/v1/alerts | jq '.[0]'
-curl -s http://<backend-or-frontend>/api/v1/analysis-runs | jq '.[0]'
+curl -s http://<backend-or-frontend>/api/v1/alerts | jq '.data[0]'
+curl -s http://<backend-or-frontend>/api/v1/analysis-runs | jq '.data[0]'
 
 # Agent process liveness (means the API is up, NOT that a collector produced evidence)
 curl -s http://<agent>/healthz
