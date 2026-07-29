@@ -44,6 +44,19 @@ type embedder struct {
 	client   *http.Client
 }
 
+type embeddingBasis string
+
+const (
+	embeddingBasisHash   embeddingBasis = "hash"
+	embeddingBasisRemote embeddingBasis = "remote"
+)
+
+type embedResult struct {
+	vector []float32
+	basis  embeddingBasis
+	err    error
+}
+
 // newEmbedder reads embedding config from the environment. With no EMBEDDING_URL
 // it returns a hash-only embedder (default, offline). Kept out of NewServer so
 // the Store owns the config that its embed() calls depend on.
@@ -70,10 +83,18 @@ func newEmbedder() *embedder {
 // embed produces the stored dense vector for text via the store's embedder,
 // tolerating a nil embedder (e.g. Store literals in tests) by using the hash.
 func (s *Store) embed(text string) []float32 {
-	if s.embedder == nil {
-		return denseEmbedding(text, embeddingDim)
+	result := s.embedResult(text)
+	if result.err != nil {
+		log.Printf("WARNING: embedding endpoint failed, falling back to hash embedding: %v", result.err)
 	}
-	return s.embedder.embed(text)
+	return result.vector
+}
+
+func (s *Store) embedResult(text string) embedResult {
+	if s.embedder == nil {
+		return embedResult{vector: denseEmbedding(text, embeddingDim), basis: embeddingBasisHash}
+	}
+	return s.embedder.embedResult(text)
 }
 
 // embeddingDim is the pgvector column dimension the store persists and queries.
@@ -92,18 +113,32 @@ func (e *embedder) embed(text string) []float32 {
 }
 
 func (e *embedder) embedContext(ctx context.Context, text string) []float32 {
+	result := e.embedResultContext(ctx, text)
+	if result.err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		log.Printf("WARNING: embedding endpoint failed, falling back to hash embedding: %v", result.err)
+	}
+	return result.vector
+}
+
+func (e *embedder) embedResult(text string) embedResult {
+	return e.embedResultContext(context.Background(), text)
+}
+
+func (e *embedder) embedResultContext(ctx context.Context, text string) embedResult {
 	if e == nil || e.endpoint == "" {
-		return denseEmbedding(text, embeddingDim)
+		return embedResult{vector: denseEmbedding(text, embeddingDim), basis: embeddingBasisHash}
 	}
 	vector, err := e.remoteEmbedContext(ctx, text)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil
+			return embedResult{basis: embeddingBasisHash, err: err}
 		}
-		log.Printf("WARNING: embedding endpoint failed, falling back to hash embedding: %v", err)
-		return denseEmbedding(text, e.dim)
+		return embedResult{vector: denseEmbedding(text, e.dim), basis: embeddingBasisHash, err: err}
 	}
-	return normalize(vector)
+	return embedResult{vector: normalize(vector), basis: embeddingBasisRemote}
 }
 
 // remoteEmbed POSTs to {endpoint}/embeddings and returns the raw model vector.
@@ -289,6 +324,7 @@ func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident 
 			CommentCount:     len(summary.Comments),
 			Labels:           cloneMap(memory.Labels),
 			CreatedAt:        memory.CreatedAt,
+			RetrievalKind:    "sparse-identity",
 		})
 	}
 	sort.Slice(results, func(i, j int) bool {
@@ -620,6 +656,7 @@ func (s *Store) similarIncidentsLocked(
 			CommentCount:     len(summary.Comments),
 			Labels:           cloneMap(memory.Labels),
 			CreatedAt:        memory.CreatedAt,
+			RetrievalKind:    "sparse-identity",
 		})
 	}
 	sort.Slice(results, func(i, j int) bool {

@@ -75,6 +75,7 @@ type SimilarIncident struct {
 	CommentCount     int               `json:"comment_count"`
 	Labels           map[string]string `json:"labels,omitempty"`
 	CreatedAt        time.Time         `json:"created_at"`
+	RetrievalKind    string            `json:"retrieval_kind,omitempty"`
 }
 
 type FeedbackHint struct {

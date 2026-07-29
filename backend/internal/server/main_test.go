@@ -1619,7 +1619,7 @@ func TestSimilarIncidentsFallBackToSparseWithoutDatabase(t *testing.T) {
 	}
 
 	similar := store.SimilarIncidentsForAlert(alert, "INC-current", 1)
-	if len(similar) != 1 || similar[0].IncidentID != "INC-prior" {
+	if len(similar) != 1 || similar[0].IncidentID != "INC-prior" || similar[0].RetrievalKind != "sparse-identity" {
 		t.Fatalf("expected sparse fallback without database, got %+v", similar)
 	}
 }

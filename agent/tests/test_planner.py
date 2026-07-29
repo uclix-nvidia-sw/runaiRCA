@@ -9,6 +9,7 @@ from app.schemas import Alert, SimilarIncidentContext
 from app.services import pipeline
 from app.services.decision_tree import load_tree
 from app.services.planner import (
+    _best_similar,
     _similar_relevant,
     plan_investigation,
     refresh_diagnostic_directive_from_evidence,
@@ -41,6 +42,31 @@ def test_similar_relevant_accepts_korean_only_overlap() -> None:
     )
 
     assert _similar_relevant(prior, "타노스 리시브가 OOMKilled로 계속 죽습니다")
+
+
+@pytest.mark.parametrize(
+    ("retrieval_kind", "similarity", "expected"),
+    [
+        ("dense-semantic", 0.76, True),
+        ("sparse-identity", 0.76, False),
+        ("", 0.80, True),
+        ("", 0.79, False),
+    ],
+)
+def test_similarity_floors_follow_retrieval_kind(
+    retrieval_kind: str, similarity: float, expected: bool
+) -> None:
+    result = _best_similar(
+        [
+            SimilarIncidentContext(
+                incident_id="INC-kind",
+                similarity=similarity,
+                retrieval_kind=retrieval_kind,
+            )
+        ]
+    )
+
+    assert (result is not None) is expected
 
 
 @pytest.mark.asyncio

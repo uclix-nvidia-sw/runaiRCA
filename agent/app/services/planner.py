@@ -41,8 +41,13 @@ from app.services.decision_tree import resolve_tree, walk_tree
 
 _log = logging.getLogger(__name__)
 
-# A similar incident is only trustworthy above this cosine similarity.
-_SIMILARITY_FLOOR = 0.80
+# A similar incident is only trustworthy above its retrieval-kind floor.
+_SIMILARITY_FLOORS = {
+    "dense-semantic": 0.75,
+    "sparse-identity": 0.80,
+    "dense-lexical": 0.85,
+}
+_DEFAULT_SIMILARITY_FLOOR = 0.80
 
 # Keywords in the alert name / labels that genuinely implicate the Run:ai
 # control plane (scheduler/quota/admission/reconcile), independent of namespace.
@@ -216,13 +221,19 @@ def _node_first_hypotheses(
 
 def _best_similar(similar_incidents: list, alert_text: str = "") -> object | None:
     best = None
-    best_sim = _SIMILARITY_FLOOR
+    best_sim = 0.0
     for item in similar_incidents or []:
         sim = getattr(item, "similarity", 0) or 0
-        if sim >= best_sim and _similar_relevant(item, alert_text):
+        if sim >= _similarity_floor(item) and sim >= best_sim and _similar_relevant(item, alert_text):
             best_sim = sim
             best = item
     return best
+
+
+def _similarity_floor(item: object) -> float:
+    return _SIMILARITY_FLOORS.get(
+        str(getattr(item, "retrieval_kind", "") or ""), _DEFAULT_SIMILARITY_FLOOR
+    )
 
 
 def _similar_relevant(item: object, alert_text: str) -> bool:
@@ -959,7 +970,8 @@ async def _llm_refine(
         )
     sim_lines = [
         f"- {getattr(i, 'incident_id', '?')} sim={getattr(i, 'similarity', 0):.2f}: "
-        f"{getattr(i, 'analysis_summary', '') or getattr(i, 'title', '')}"
+        f"{getattr(i, 'analysis_summary', '') or getattr(i, 'title', '')} "
+        f"(kind={getattr(i, 'retrieval_kind', '') or 'unknown'} floor={_similarity_floor(i):.2f})"
         for i in similar_incidents[:5]
     ] or ["- none"]
 
@@ -995,7 +1007,7 @@ async def _llm_refine(
         f"Workload: {target.workload_name}  Pod: {target.pod}  "
         f"Project: {target.project}  Queue: {target.queue}\n"
         f"Knowledge graph: {kg_summary}\n"
-        f"Similar incidents (only >=0.80 are trustworthy):\n" + "\n".join(sim_lines) + "\n\n"
+        f"Similar incidents (per-kind trust floors):\n" + "\n".join(sim_lines) + "\n\n"
         f"Component catalog (canonical names only): {', '.join(sorted(architecture))}\n"
         f"Current deterministic plan:\n"
         f"focus={plan.focus}\nstrategy={plan.strategy}\n"

@@ -79,6 +79,7 @@ class SimilarIncidentContext(BaseModel):
     comment_count: int = 0
     root_cause_family: str = ""
     approved: bool = False
+    retrieval_kind: str = ""
 
 
 class FeedbackHintContext(BaseModel):
