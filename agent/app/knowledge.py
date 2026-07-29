@@ -652,6 +652,9 @@ def load_architecture(path: str) -> dict[str, dict[str, Any]]:
             continue
         out[name] = {
             "component": name,
+            "aliases": [
+                str(alias).strip() for alias in (entry.get("aliases") or []) if str(alias).strip()
+            ],
             "layer": str(entry.get("layer") or ""),
             "namespace": str(entry.get("namespace") or ""),
             "kind": str(entry.get("kind") or ""),
@@ -706,18 +709,23 @@ def component_for_text(
     pod/namespace label for component_for_target to match. Normalize separators
     on both sides and match a component's full name or a tail of at least two
     words ("thanos receive" for runai-backend-thanos-receive) at word
-    boundaries; single words stay out — they over-match ordinary prose. The
-    longest matched phrase wins."""
-    haystack = " ".join(_COMPONENT_TEXT_NORM.sub(" ", str(text or "").lower()).split())
+    boundaries. Curated aliases are explicit opt-ins and may be single words.
+    The longest matched phrase wins."""
+    haystack = " ".join(_COMPONENT_TEXT_NORM.sub(" ", str(text or "").casefold()).split())
     if not haystack:
         return None
     haystack = f" {haystack} "
     best: dict[str, Any] | None = None
     best_len = 0
     for name, entry in components.items():
-        words = _COMPONENT_TEXT_NORM.sub(" ", name.lower()).split()
+        words = _COMPONENT_TEXT_NORM.sub(" ", name.casefold()).split()
         for start in range(len(words) - 1):
             phrase = " ".join(words[start:])
+            if f" {phrase} " in haystack and len(phrase) > best_len:
+                best = entry
+                best_len = len(phrase)
+        for alias in entry.get("aliases") or []:
+            phrase = " ".join(_COMPONENT_TEXT_NORM.sub(" ", str(alias).casefold()).split())
             if f" {phrase} " in haystack and len(phrase) > best_len:
                 best = entry
                 best_len = len(phrase)

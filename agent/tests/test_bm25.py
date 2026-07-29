@@ -17,6 +17,19 @@ def test_tokenize_drops_stopwords_and_noise() -> None:
     assert tokenize("") == []
 
 
+def test_korean_tokens_can_match_a_korean_document() -> None:
+    assert tokenize("스케줄러 장애") == ["스케줄러", "장애"]
+    index = BM25Index(
+        [
+            ("scheduler", "스케줄러 장애 감지"),
+            ("quota", "GPU quota exceeded"),
+            ("network", "network timeout"),
+            ("storage", "volume mount error"),
+        ]
+    )
+    assert [key for key, _ in index.search("스케줄러 장애")] == ["scheduler"]
+
+
 def test_single_generic_shared_token_is_never_a_match() -> None:
     # "workload" appears in both docs (df/N too high for the signature rule and
     # only one query token hits) — one common word must not produce a match.

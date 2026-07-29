@@ -12,7 +12,7 @@ into the action sections, no match through a negated statement.
 
 from __future__ import annotations
 
-from app.knowledge import load_failure_modes, match_failure_mode_symptoms
+from app.knowledge import load_architecture, load_failure_modes, match_failure_mode_symptoms
 from app.plan import InvestigationPlan
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
@@ -125,6 +125,26 @@ def test_component_identity_reaches_the_guide() -> None:
     )
     assert "COMPONENT-EFFECT" in text
     assert "COMPONENT-CHECK" in text
+
+
+def test_llm_component_is_worded_as_an_interpretation() -> None:
+    text = guidance(
+        "무슨 일인지 모르겠어요",
+        language="ko",
+        component="runai-scheduler-default",
+        component_source="llm",
+        components=COMPONENTS,
+    )
+    assert "이 요청은 **runai-scheduler-default** 컴포넌트에 대한 것으로 해석되었습니다" in text
+    assert "알림 대상이" not in text
+
+
+def test_component_alias_from_question_reaches_the_guide() -> None:
+    text = guidance(
+        "Thanos Receive 가 OOMKilled 반복되어서 메모리를 올렸는데도 자꾸 죽는데",
+        components=load_architecture("knowledge/runai_architecture.yaml"),
+    )
+    assert "runai-backend-thanos-receive" in text
 
 
 def test_matched_alert_catalog_reaches_the_guide() -> None:

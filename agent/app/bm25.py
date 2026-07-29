@@ -22,7 +22,7 @@ import math
 import re
 from typing import Any
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_TOKEN_RE = re.compile(r"[a-z0-9가-힣]+")
 
 _STOPWORDS = frozenset(
     "a an and are as at be been by for from had has have in is it its no not "

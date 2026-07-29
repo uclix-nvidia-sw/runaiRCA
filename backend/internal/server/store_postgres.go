@@ -863,6 +863,14 @@ func (s *Store) loadMemories(ctx context.Context) {
 // signal the caller to fall back to the in-process sparse-vector search (when
 // the extension is unavailable or the query errors).
 func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool) {
+	return s.dbSearchMemoryExcluding(query, "", limit)
+}
+
+func (s *Store) dbSearchSimilarIncidents(query, incidentID string, limit int) ([]SimilarIncident, bool) {
+	return s.dbSearchMemoryExcluding(query, incidentID, limit)
+}
+
+func (s *Store) dbSearchMemoryExcluding(query, excludedIncidentID string, limit int) ([]SimilarIncident, bool) {
 	if s.db == nil || !s.dbReady || !s.pgvectorReady {
 		return nil, false
 	}
@@ -872,13 +880,17 @@ func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool
 	defer cancel()
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT incident_id, alert_id, title, severity, status, analysis_summary,
-		        analysis_detail, labels, created_at, (embedding <=> $1::vector) AS distance
-		   FROM incident_embeddings
-		  WHERE embedding IS NOT NULL
-		  ORDER BY embedding <=> $1::vector
-		  LIMIT $2`,
-		literal, queryLimit,
+		`SELECT e.incident_id, e.alert_id, e.title, e.severity, e.status, e.analysis_summary,
+		        e.analysis_detail, e.labels, e.created_at, (e.embedding <=> $1::vector) AS distance
+		   FROM incident_embeddings AS e
+		   JOIN incidents AS i ON i.incident_id = e.incident_id
+		  WHERE e.embedding IS NOT NULL
+		    AND i.user_approved_at IS NOT NULL
+		    AND i.deleted_at IS NULL
+		    AND ($2 = '' OR e.incident_id <> $2)
+		  ORDER BY e.embedding <=> $1::vector
+		  LIMIT $3`,
+		literal, excludedIncidentID, queryLimit,
 	)
 	if err != nil {
 		log.Printf("pgvector similarity search failed, falling back to jsonb: %v", err)

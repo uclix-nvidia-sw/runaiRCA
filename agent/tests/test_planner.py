@@ -9,6 +9,7 @@ from app.schemas import Alert, SimilarIncidentContext
 from app.services import pipeline
 from app.services.decision_tree import load_tree
 from app.services.planner import (
+    _similar_relevant,
     plan_investigation,
     refresh_diagnostic_directive_from_evidence,
 )
@@ -31,6 +32,15 @@ def _target(**overrides) -> AnalysisTarget:
     )
     base.update(overrides)
     return AnalysisTarget(**base)
+
+
+def test_similar_relevant_accepts_korean_only_overlap() -> None:
+    prior = SimilarIncidentContext(
+        incident_id="INC-korean",
+        title="타노스 리시브 OOMKilled 반복",
+    )
+
+    assert _similar_relevant(prior, "타노스 리시브가 OOMKilled로 계속 죽습니다")
 
 
 @pytest.mark.asyncio
@@ -368,6 +378,86 @@ async def test_llm_refinement_kept_on_success(monkeypatch) -> None:
     assert plan.hypotheses[0]["family"] == "runai_control_plane_error"
     # deterministic scope decisions are NOT overridden by the LLM
     assert plan.check_control_plane is False
+
+
+@pytest.mark.asyncio
+async def test_llm_component_adopts_a_catalog_component_when_deterministic_resolution_misses(
+    monkeypatch,
+) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+
+    async def fake_complete_json(*_args, **_kwargs):
+        return {"component": "runai-container-toolkit"}
+
+    monkeypatch.setattr("app.services.planner.complete_json", fake_complete_json)
+    plan = await plan_investigation(settings, _target(alert_name="UnrecognizedAlert"), None, {}, [])
+
+    assert plan.llm_refined is True
+    assert plan.component == "runai-container-toolkit"
+    assert plan.component_source == "llm"
+    assert plan.workload == "runai-container-toolkit"
+    assert plan.namespaces[0] == "runai"
+    assert plan.hypotheses[0]["family"] == "gpu_hardware_error"
+
+
+@pytest.mark.asyncio
+async def test_llm_component_drops_an_out_of_catalog_name(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+
+    async def fake_complete_json(*_args, **_kwargs):
+        return {"component": "thanos-receive"}
+
+    monkeypatch.setattr("app.services.planner.complete_json", fake_complete_json)
+    plan = await plan_investigation(settings, _target(alert_name="UnrecognizedAlert"), None, {}, [])
+
+    assert plan.component == ""
+    assert plan.component_source == ""
+
+
+@pytest.mark.asyncio
+async def test_llm_component_never_overrides_pod_identity(monkeypatch) -> None:
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+
+    async def fake_complete_json(*_args, **_kwargs):
+        return {"component": "runai-backend-thanos-receive"}
+
+    monkeypatch.setattr("app.services.planner.complete_json", fake_complete_json)
+    plan = await plan_investigation(
+        settings,
+        _target(pod="runai-container-toolkit-abc123"),
+        None,
+        {},
+        [],
+    )
+
+    assert plan.component == "runai-container-toolkit"
+    assert plan.component_source == ""
+
+
+@pytest.mark.asyncio
+async def test_deterministic_plan_does_not_adopt_an_llm_component() -> None:
+    plan = await plan_investigation(
+        make_settings(), _target(alert_name="UnrecognizedAlert"), None, {}, []
+    )
+
+    assert plan.llm_refined is False
+    assert plan.component == ""
+    assert plan.component_source == ""
 
 
 @pytest.mark.asyncio

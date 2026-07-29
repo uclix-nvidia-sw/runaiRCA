@@ -239,7 +239,7 @@ def _similar_tokens(text: str) -> set[str]:
     lowered = (text or "").lower()
     return {
         match.group(0)
-        for match in re.finditer(r"[a-z0-9]+", lowered)
+        for match in re.finditer(r"[a-z0-9가-힣]+", lowered)
         if len(match.group(0)) > 2
         and match.group(0) not in _SIMILAR_STOPWORDS
         and not _keyword_negated(lowered, match.start(), match.end())
@@ -608,6 +608,37 @@ def _alert_symptom_lead(
     return None
 
 
+def _component_plan_fields(
+    entry: dict,
+    namespaces: list[str],
+    workload: str,
+    hypotheses: list[dict[str, str]],
+    *,
+    derive_scope: bool,
+) -> tuple[str, list[str], str, list[dict[str, str]]]:
+    component = str(entry.get("component") or "")
+    if derive_scope:
+        namespace = str(entry.get("namespace") or "")
+        if namespace:
+            namespaces = [namespace, *(ns for ns in namespaces if ns != namespace)]
+        workload = component
+    if entry.get("family"):
+        effect = str(entry.get("failure_effect") or entry.get("purpose") or "")
+        reason = f"alert targets platform component '{component}' — {effect}".strip(" —")
+        hypotheses = [{"family": str(entry["family"]), "reason": reason}] + [
+            hypothesis for hypothesis in hypotheses if hypothesis["family"] != entry["family"]
+        ]
+    return component, namespaces, workload, hypotheses
+
+
+def _component_narrative(entry: dict, component: str, narrative: str) -> str:
+    return (
+        f"The alert target IS the platform component '{component}' "
+        f"({entry.get('failure_effect') or entry.get('purpose')}). "
+        "Check that component and its depends_on chain first. " + narrative
+    )
+
+
 async def plan_investigation(
     settings: Settings,
     target: AnalysisTarget,
@@ -712,12 +743,13 @@ async def plan_investigation(
     architecture = load_architecture(settings.architecture_file)
     component_entry = component_for_target(architecture, target.pod, target.workload_name)
     planned_workload = target.workload_name or ""
-    if (
+    component_from_text = (
         component_entry is None
         and not target.pod
         and not target.workload_name
         and target.alert_name == "OperatorRequestedAnalysis"
-    ):
+    )
+    if component_from_text:
         # A chat question has no pod/workload label; its only identity is prose
         # ("Thanos Receive 가 OOMKilled…"). Recognize a NAMED platform component
         # and aim the collectors at it: its home namespace leads the plan and
@@ -727,23 +759,15 @@ async def plan_investigation(
         # summaries mention components in negated/recovered prose, and this
         # matcher intentionally has no negation handling.
         component_entry = component_for_text(architecture, alert_text)
-        if component_entry:
-            entry_namespace = str(component_entry.get("namespace") or "")
-            if entry_namespace:
-                namespaces = [
-                    entry_namespace,
-                    *(ns for ns in namespaces if ns != entry_namespace),
-                ]
-            planned_workload = str(component_entry.get("component") or "")
-    component = str(component_entry.get("component") or "") if component_entry else ""
-    if component_entry and component_entry.get("family"):
-        effect = str(
-            component_entry.get("failure_effect") or component_entry.get("purpose") or ""
+    component = ""
+    if component_entry:
+        component, namespaces, planned_workload, hypotheses = _component_plan_fields(
+            component_entry,
+            namespaces,
+            planned_workload,
+            hypotheses,
+            derive_scope=component_from_text,
         )
-        reason = f"alert targets platform component '{component}' — {effect}".strip(" —")
-        hypotheses = [{"family": str(component_entry["family"]), "reason": reason}] + [
-            h for h in hypotheses if h["family"] != component_entry["family"]
-        ]
     if seed_valid:
         seed_reason = "seeded root-cause family; collect supporting and refuting evidence"
         hypotheses = [{"family": seed_family, "reason": seed_reason}] + [
@@ -852,11 +876,7 @@ async def plan_investigation(
             + narrative
         )
     if component_entry:
-        narrative = (
-            f"The alert target IS the platform component '{component}' "
-            f"({component_entry.get('failure_effect') or component_entry.get('purpose')}). "
-            "Check that component and its depends_on chain first. " + narrative
-        )
+        narrative = _component_narrative(component_entry, component, narrative)
     if seed_valid:
         narrative = (
             f"A seeded root-cause family selected {seed_family} as the leading hypothesis. "
@@ -892,7 +912,7 @@ async def plan_investigation(
     if llm_configured(settings, settings.llm_model_planner):
         try:
             refined = await _llm_refine(
-                settings, target, plan, kg_context, similar_incidents, guidance
+                settings, target, plan, kg_context, similar_incidents, guidance, architecture
             )
             if refined:
                 plan = refined
@@ -924,7 +944,9 @@ async def _llm_refine(
     kg_context: dict,
     similar_incidents: list,
     guidance: str = "",
+    architecture: dict[str, dict] | None = None,
 ) -> InvestigationPlan | None:
+    architecture = architecture or {}
     kg_summary = "none"
     if kg_context.get("available"):
         prior = kg_context.get("prior_incidents") or []
@@ -947,7 +969,8 @@ async def _llm_refine(
         "incidents, refine the investigation plan. Be honest: if nothing matches, keep "
         "strategy breadth_first and describe HOW to approach. Do not force-fit a prior "
         "incident. Keys: focus (str), hypotheses (list of {family, reason}), strategy "
-        "('targeted' or 'breadth_first'), narrative (str). "
+        "('targeted' or 'breadth_first'), narrative (str), optional component (one exact "
+        "canonical name from the supplied catalog, or omit when unsure). "
         "You may WIDEN the search when your re-reasoning calls for it — you can never "
         "narrow it below what the deterministic router already chose. Optional key "
         "check_control_plane (bool): set true to ALSO read Run:ai control-plane "
@@ -973,6 +996,7 @@ async def _llm_refine(
         f"Project: {target.project}  Queue: {target.queue}\n"
         f"Knowledge graph: {kg_summary}\n"
         f"Similar incidents (only >=0.80 are trustworthy):\n" + "\n".join(sim_lines) + "\n\n"
+        f"Component catalog (canonical names only): {', '.join(sorted(architecture))}\n"
         f"Current deterministic plan:\n"
         f"focus={plan.focus}\nstrategy={plan.strategy}\n"
         f"hypotheses={plan.hypotheses}\nnarrative={plan.narrative}\n"
@@ -986,6 +1010,11 @@ async def _llm_refine(
     strategy = data.get("strategy")
     narrative = data.get("narrative")
     hypotheses = _coerce_hypotheses(data.get("hypotheses"), masker)
+    component_entry = (
+        architecture.get(data.get("component"))
+        if not plan.component and isinstance(data.get("component"), str)
+        else None
+    )
 
     # Scope may only WIDEN, never narrow: when the LLM re-reasons the cause toward the
     # platform, it can turn control-plane reading ON, but it cannot switch off evidence
@@ -1000,25 +1029,43 @@ async def _llm_refine(
             if ns and ns not in namespaces:
                 namespaces.append(ns)
 
+    hypotheses = hypotheses or plan.hypotheses
+    component = plan.component
+    workload = plan.workload
+    if component_entry:
+        component, namespaces, workload, hypotheses = _component_plan_fields(
+            component_entry,
+            namespaces,
+            workload,
+            hypotheses,
+            derive_scope=True,
+        )
+    refined_narrative = (
+        _plan_text(masker, narrative, limit=800)
+        if isinstance(narrative, str) and narrative.strip()
+        else plan.narrative
+    )
+    if component_entry:
+        refined_narrative = _component_narrative(component_entry, component, refined_narrative)
+
     return InvestigationPlan(
         focus=_plan_text(masker, focus, limit=240)
         if isinstance(focus, str) and focus.strip()
         else plan.focus,
         namespaces=namespaces,
         node=plan.node,
-        workload=plan.workload,
+        workload=workload,
         pod=plan.pod,
         check_control_plane=check_control_plane,
-        hypotheses=hypotheses or plan.hypotheses,
+        hypotheses=hypotheses,
         strategy=strategy if strategy in ("targeted", "breadth_first") else plan.strategy,
         used_similarity=plan.used_similarity,
         used_ontology=plan.used_ontology,
         llm_refined=True,
-        narrative=_plan_text(masker, narrative, limit=800)
-        if isinstance(narrative, str) and narrative.strip()
-        else plan.narrative,
+        narrative=refined_narrative,
         matched_alert=plan.matched_alert,
-        component=plan.component,
+        component=component,
+        component_source="llm" if component_entry else plan.component_source,
         diagnostic_directive=plan.diagnostic_directive,
         case_cards=plan.case_cards,
     )

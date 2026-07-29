@@ -75,6 +75,15 @@ func TestPostgresConnectReportsPGVectorEnabledAndLoadsState(t *testing.T) {
 	if got := state.RecordedPGVectorSearchLimit(); got != 15 {
 		t.Fatalf("expected pgvector search to overfetch before dedupe, got limit %d", got)
 	}
+	for _, fragment := range []string{
+		"JOIN incidents AS i ON i.incident_id = e.incident_id",
+		"i.user_approved_at IS NOT NULL",
+		"i.deleted_at IS NULL",
+	} {
+		if !state.Queried(fragment) {
+			t.Fatalf("expected pgvector search to filter incident state in SQL with %q", fragment)
+		}
+	}
 }
 
 func TestPostgresConnectFallsBackToJSONBWhenPGVectorUnavailable(t *testing.T) {

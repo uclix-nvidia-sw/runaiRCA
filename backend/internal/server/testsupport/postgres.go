@@ -148,6 +148,17 @@ func (s *PostgresState) RecordedPGVectorSearchLimit() int64 {
 	return s.pgvectorSearchLimit
 }
 
+func (s *PostgresState) Queried(fragment string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, query := range s.queries {
+		if strings.Contains(query, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 type fakePostgresDriver struct {
 	state *PostgresState
 }
@@ -254,8 +265,8 @@ func (c *fakePostgresConn) QueryContext(ctx context.Context, query string, args 
 		c.state.queriesNoDeadline++
 	}
 	c.state.queries = append(c.state.queries, query)
-	if strings.Contains(query, "<=>") && len(args) >= 2 {
-		switch value := args[1].Value.(type) {
+	if strings.Contains(query, "<=>") && len(args) > 0 {
+		switch value := args[len(args)-1].Value.(type) {
 		case int64:
 			c.state.pgvectorSearchLimit = value
 		case int:

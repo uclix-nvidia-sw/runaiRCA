@@ -32,6 +32,7 @@ from app.knowledge import (
     _keyword_negated,
     component_action_lines,
     component_check_lines,
+    component_for_text,
     dependency_path,
     family_label,
     is_matcher_only_family,
@@ -1835,7 +1836,13 @@ async def rank_stage(state: PipelineState) -> PipelineState:
     try:
         from app.services.kg_enrichment import external_case_cards
 
-        case_match_text = f"{state.observed}\n{comp_name}" if comp_name else state.observed
+        case_entry = (
+            component_for_text(load_architecture(settings.architecture_file), _alert_text(request))
+            if not comp_name
+            else None
+        )
+        case_component = comp_name or (case_entry["component"] if case_entry else "")
+        case_match_text = f"{state.observed}\n{case_component}" if case_component else state.observed
         ext_cards, ext_warnings = await external_case_cards(settings, case_match_text)
     except Exception:  # noqa: BLE001 - external prior is optional
         ext_cards, ext_warnings = [], []
@@ -2443,6 +2450,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                         language=getattr(settings, "language", "en"),
                         masker=state.masker,
                         component=getattr(plan, "component", "") if plan else "",
+                        component_source=getattr(plan, "component_source", "") if plan else "",
                         components=load_architecture(settings.architecture_file),
                         matched_alert=getattr(plan, "matched_alert", None) if plan else None,
                         families=_plan_families(plan),
@@ -4512,6 +4520,7 @@ def _detail_from(
                     language=language,
                     masker=masker,
                     component=getattr(plan, "component", "") if plan else "",
+                    component_source=getattr(plan, "component_source", "") if plan else "",
                     components=components,
                     matched_alert=getattr(plan, "matched_alert", None) if plan else None,
                     families=_plan_families(plan),
@@ -4588,6 +4597,7 @@ def _abstain_guidance_block(state: "PipelineState", language: str) -> str:
                 language=language,
                 masker=state.masker,
                 component=getattr(plan, "component", "") if plan else "",
+                component_source=getattr(plan, "component_source", "") if plan else "",
                 components=load_architecture(state.settings.architecture_file),
                 matched_alert=getattr(plan, "matched_alert", None) if plan else None,
                 families=_plan_families(plan),
