@@ -560,6 +560,9 @@ function App() {
   }, [loadRoute]);
 
   const viewCopy = VIEW_COPY[activeView];
+  // Analysis and Alerts don't wire the topbar query into their filtering —
+  // showing a search box that silently does nothing is worse than no box.
+  const searchlessView = activeView === 'analysis' || activeView === 'alerts';
 
   const goHome = () => navigateToHash(hashForView('incidents'));
 
@@ -767,19 +770,21 @@ function App() {
       </aside>
 
       <main className="main">
-        <header className="topbar">
+        <header className={`topbar ${searchlessView ? 'topbar-no-search' : ''}`}>
           <div>
             <p className="eyebrow">{viewCopy.eyebrow}</p>
             <h2>{viewCopy.title}</h2>
           </div>
-          <div className="search-box">
-            <Search size={17} />
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder={viewCopy.placeholder}
-            />
-          </div>
+          {!searchlessView && (
+            <div className="search-box">
+              <Search size={17} />
+              <input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder={viewCopy.placeholder}
+              />
+            </div>
+          )}
           <button
             className={`icon-button ${refreshing ? 'is-spinning' : ''}`}
             disabled={refreshing}

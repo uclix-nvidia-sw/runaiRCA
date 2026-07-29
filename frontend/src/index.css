@@ -229,6 +229,10 @@ h2 {
   margin-bottom: 1.25rem;
 }
 
+.topbar-no-search {
+  grid-template-columns: minmax(14rem, 1fr) auto;
+}
+
 .search-box {
   display: flex;
   align-items: center;
