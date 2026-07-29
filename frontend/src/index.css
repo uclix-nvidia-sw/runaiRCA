@@ -520,6 +520,12 @@ tbody tr:active td {
   padding: 0.95rem 1rem;
 }
 
+.candidate-list-panel .knowledge-panel-head {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.6rem;
+}
+
 .knowledge-panel-head .eyebrow {
   margin-bottom: 0.18rem;
 }
@@ -654,22 +660,58 @@ tbody tr:active td {
   white-space: pre-wrap;
 }
 
-.knowledge-provenance {
+.knowledge-causal-chain {
+  margin: 0 0 1rem;
+}
+
+.knowledge-causal-step {
+  position: relative;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.55rem;
-  margin: 0 0 1.1rem;
+  grid-template-columns: 1.75rem minmax(0, 1fr);
+  gap: 0.7rem;
+  padding-bottom: 1rem;
 }
 
-.knowledge-provenance > div {
-  min-width: 0;
+.knowledge-causal-step:last-child {
+  padding-bottom: 0;
+}
+
+.knowledge-causal-step::before {
+  content: "";
+  position: absolute;
+  left: 0.86rem;
+  top: 1.75rem;
+  bottom: 0.1rem;
+  width: 1px;
+  background: var(--line);
+}
+
+.knowledge-causal-step:last-child::before {
+  display: none;
+}
+
+.knowledge-causal-icon {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
   border: 1px solid var(--line);
-  border-radius: 0.45rem;
-  background: #fafcf8;
-  padding: 0.5rem 0.6rem;
 }
 
-.knowledge-provenance dt {
+.knowledge-causal-step-action .knowledge-causal-icon {
+  background: var(--nvidia);
+  border-color: var(--nvidia);
+  color: #ffffff;
+}
+
+.knowledge-causal-step dt {
+  margin-bottom: 0.14rem;
   color: var(--muted);
   font-size: 0.68rem;
   font-weight: 800;
@@ -677,15 +719,77 @@ tbody tr:active td {
   text-transform: uppercase;
 }
 
-.knowledge-provenance dd {
-  margin: 0.14rem 0 0;
+.knowledge-causal-step dd {
+  margin: 0;
   overflow-wrap: anywhere;
   color: #344054;
-  font-size: 0.8rem;
+  font-size: 0.85rem;
 }
 
-.knowledge-provenance code {
+.knowledge-causal-step code {
+  font-size: 0.78rem;
+}
+
+.knowledge-causal-substep {
+  display: block;
+  margin-top: 0.3rem;
+  color: var(--muted);
   font-size: 0.73rem;
+}
+
+.knowledge-causal-step-action {
+  border: 1px solid #d7e8ba;
+  border-radius: 0.5rem;
+  background: #fbfef6;
+  padding: 0.65rem 0.7rem 0.65rem 0.6rem;
+  margin-left: -0.6rem;
+}
+
+.knowledge-causal-step-action::before {
+  display: none;
+}
+
+.knowledge-meta-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 0.6rem;
+  margin: 0 0 1.1rem;
+  color: var(--muted);
+  font-size: 0.73rem;
+}
+
+.knowledge-meta-line span {
+  white-space: nowrap;
+}
+
+.knowledge-meta-line span:not(:last-child)::after {
+  content: "·";
+  margin-left: 0.6rem;
+  color: var(--line);
+}
+
+.knowledge-action-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-left: 0.4rem;
+  border: 0;
+  border-radius: 0.3rem;
+  background: transparent;
+  padding: 0.12rem 0.4rem;
+  color: var(--nvidia-dark);
+  font-size: 0.72rem;
+  font-weight: 800;
+  vertical-align: baseline;
+  transition: background var(--dur-1) var(--ease-out);
+}
+
+.knowledge-action-edit:hover {
+  background: var(--surface-soft);
+}
+
+.knowledge-action-edit svg {
+  flex: 0 0 auto;
 }
 
 .knowledge-evidence-head {
@@ -5298,10 +5402,6 @@ code .evidence-mark {
   .analysis-trend-row,
   .analysis-stat-grid,
   .analysis-insight-grid {
-    grid-template-columns: 1fr;
-  }
-
-  .knowledge-provenance {
     grid-template-columns: 1fr;
   }
 
