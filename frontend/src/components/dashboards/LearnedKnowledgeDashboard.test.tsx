@@ -92,7 +92,9 @@ describe('CandidateDetail', () => {
       probe_template_ids: ['k8s_troubleshooting:incident_scope:p01'],
       trace: { probe_executions: [{ template_id: 'k8s_troubleshooting:incident_scope:p01', tool: 'k8s_read', verdict: 'supports' }] },
     }));
-    expect(markup).toContain('Diagnostic steps');
+    // The causal-chain redesign folded the old "Diagnostic steps" section into
+    // a substep under the symptom it confirms; the tool+verdict still render.
+    expect(markup).toContain('Confirmed via');
     expect(markup).toContain('incident scope · k8s_read · supports');
   });
 
@@ -113,10 +115,11 @@ describe('CandidateDetail', () => {
     const markup = renderToStaticMarkup(
       <CandidateDetail candidate={curated} busy={false} onDecide={async () => {}} onEditActions={async () => {}} />,
     );
-    expect(markup).toContain('>Edit<');
+    // Matched past the button's icon: the label is no longer the first child.
+    expect(markup).toContain('Edit</button>');
     expect(markup).toContain('kubectl get secret nonexistent-secret -n default');
     // Without an edit handler the control stays hidden.
-    expect(render(curated)).not.toContain('>Edit<');
+    expect(render(curated)).not.toContain('Edit</button>');
   });
 });
 
