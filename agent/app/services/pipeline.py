@@ -4659,6 +4659,7 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
         return ""
     rendered_codes = ", ".join(str(code) for code in codes)
     roots = getattr(graph_fixes, "root_xids", None) or {}
+    root_status = getattr(graph_fixes, "root_xid_status", {}) or {}
     chain = "; ".join(
         dict.fromkeys(
             f"XID {root} → XID {observed}"
@@ -4666,19 +4667,52 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
             for root in root_list
         )
     )
+    statuses = set(root_status.values())
+    if "degraded" in statuses:
+        qualification = (
+            " Causal-chain lookup was degraded by a query failure; shown upstream XIDs "
+            "may not include the root."
+        )
+        qualification_ko = " 인과 사슬 조회가 쿼리 실패로 불완전합니다."
+    elif "truncated" in statuses:
+        qualification = (
+            " Causal-chain lookup was capped; shown upstream XIDs may not include the root."
+        )
+        qualification_ko = (
+            " 인과 사슬 조회가 제한되어 표시된 뿌리가 "
+            "불완전할 수 있습니다."
+        )
+    else:
+        qualification = ""
+        qualification_ko = ""
+    chain_label = "root → observed" if not qualification else "upstream → observed"
+    chain_label_ko = "뿌리→관측" if not qualification_ko else "상류→관측"
     if language == "ko":
         if chain:
             return (
-                f"- 관련 GPU 오류(XID): {rendered_codes} — 인과 사슬(뿌리→관측): {chain}. "
-                "뿌리 XID를 먼저 조치하세요."
+                f"- 관련 GPU 오류(XID): {rendered_codes} — "
+                f"인과 사슬({chain_label_ko}): {chain}. "
+                + (
+                    "뿌리 XID를 먼저 조치하세요."
+                    if not qualification_ko
+                    else qualification_ko.strip()
+                )
             )
-        return f"- 관련 GPU 오류(XID): {rendered_codes} — 세부 조치는 아래 권장 조치를 참고."
+        return (
+            f"- 관련 GPU 오류(XID): {rendered_codes} — "
+            "세부 조치는 아래 권장 조치를 참고."
+            + qualification_ko
+        )
     if chain:
         return (
-            f"- Related GPU errors (XID): {rendered_codes} — causal chain (root → observed): "
-            f"{chain}. Fix the root XID first."
+            f"- Related GPU errors (XID): {rendered_codes} — causal chain ({chain_label}): "
+            f"{chain}." + (" Fix the root XID first." if not qualification else qualification)
         )
-    return f"- Related GPU errors (XID): {rendered_codes} — see the recommended actions below."
+    return (
+        f"- Related GPU errors (XID): {rendered_codes} — "
+        "see the recommended actions below."
+        + qualification
+    )
 
 
 def _xid_diagnostic_guidance_lines(
@@ -5488,13 +5522,32 @@ def _numbered_actions(
         # to crowd the exact symptom actions out of the eight-item report cap.
         # Keep only signature-specific graph fixes (XIDs) in executable actions;
         # symptom remediation below is selected from the observed evidence.
-        root_codes = {r for roots in graph_fixes.root_xids.values() for r in roots}
+        root_codes = {
+            root
+            for observed, roots in graph_fixes.root_xids.items()
+            if graph_fixes.root_xid_status.get(observed, "complete") == "complete"
+            for root in roots
+        }
+        upstream_codes = {
+            root
+            for observed, roots in graph_fixes.root_xids.items()
+            if graph_fixes.root_xid_status.get(observed) != "complete"
+            for root in roots
+        }
         # Fix the ROOT of the causal chain before its downstream symptoms.
         for code in sorted(graph_fixes.xid_fixes, key=lambda c: (c not in root_codes, c)):
             if language == "ko":
-                label = "근본 XID" if code in root_codes else "XID"
+                label = (
+                    "근본 XID"
+                    if code in root_codes
+                    else "상류 XID" if code in upstream_codes else "XID"
+                )
             else:
-                label = "root XID" if code in root_codes else "XID"
+                label = (
+                    "root XID"
+                    if code in root_codes
+                    else "upstream XID" if code in upstream_codes else "XID"
+                )
             fixes = [
                 f"({label} {code}) {fix}"
                 for fix in graph_fixes.xid_fixes[code]
@@ -6487,9 +6540,18 @@ def _knowledge_base_lines(
         )
     history = kg_context.get("location_history") or []
     if history:
+        history_truncated = bool(kg_context.get("location_history_truncated"))
+        rendered_history = min(len(history), 4)
+        history_count = (
+            f"At least {len(history)} past resolved incident(s)"
+            if history_truncated
+            else f"{len(history)} past resolved incident(s)"
+        )
         body.append(
-            f"- {len(history)} past resolved incident(s) at this alert's location "
-            "(different alerts, same node/namespace):"
+            f"- {history_count} at this alert's location "
+            "(different alerts, same node/namespace"
+            + (f"; showing {rendered_history}" if history_truncated else "")
+            + "):"
         )
         for item in history[:4]:
             where = active_masker.mask_text(str(item.get("where") or "location"))
@@ -6517,6 +6579,9 @@ def _knowledge_base_lines(
                 f" — PVC shared with {len(shared)} other workload(s): "
                 + ", ".join(shared[:5])
             )
+        if topology.get("shared_storage_truncated"):
+            searched = ", ".join(topology.get("shared_storage_pvcs") or [])
+            line += f" — shared-storage checked only on PVC(s) {searched}"
         body.append(active_masker.mask_text(line))
     prior = kg_context.get("prior_incidents") or []
     if prior:

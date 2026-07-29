@@ -20,6 +20,7 @@ from app.services.kg_enrichment import (
     enrich,
 )
 from app.services.pipeline import (
+    _causal_chain_line,
     _graph_remediation_lines,
     _knowledge_base_lines,
     _playbook_lines,
@@ -61,8 +62,13 @@ def test_root_chain_walks_leads_to_transitively() -> None:
     out = _query_remediation(FakeClient(), "", [154], "")  # type: ignore[arg-type]
     # Transitive ancestors, nearest hop first.
     assert out.root_xids[154] == [48, 144]
+    assert out.root_xid_status[154] == "complete"
     # Fixes fetched for each discovered root too.
     assert 48 in out.xid_fixes and 144 in out.xid_fixes
+    assert _causal_chain_line(out, "en") == (
+        "- Related GPU errors (XID): 48, 144, 154 — causal chain (root → observed): "
+        "XID 48 → XID 154; XID 144 → XID 154. Fix the root XID first."
+    )
 
 
 def test_root_chain_is_cycle_safe() -> None:
@@ -105,6 +111,53 @@ def test_root_chain_hop_failure_is_isolated() -> None:
     out = _query_remediation(FakeClient(), "", [79], "")  # type: ignore[arg-type]
     assert out.xid_fixes[79] == ["reset the GPU"]
     assert 79 not in out.root_xids
+    assert out.root_xid_status[79] == "degraded"
+    assert "degraded by a query failure" in _causal_chain_line(out, "en")
+
+
+def test_root_chain_node_cap_is_reported_as_truncated() -> None:
+    import re
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                match = re.search(r"root_xids_for\((\d+)\)", query)
+                if match:
+                    return [{"x": root} for root in range(2, 19)] if match.group(1) == "1" else []
+                if "fixes_for_xid" in query:
+                    return [{"x": "reset the GPU"}]
+                return []
+
+            yield run
+
+    out = _query_remediation(FakeClient(), "", [1], "")  # type: ignore[arg-type]
+    assert len(out.root_xids[1]) == 16
+    assert out.root_xid_status[1] == "truncated"
+    assert "capped; shown upstream XIDs may not include the root" in _causal_chain_line(out, "en")
+
+
+def test_root_chain_depth_cap_is_reported_as_truncated() -> None:
+    import re
+
+    causes = {code: [code + 1] for code in range(1, 8)}
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                match = re.search(r"root_xids_for\((\d+)\)", query)
+                if match:
+                    return [{"x": root} for root in causes.get(int(match.group(1)), [])]
+                if "fixes_for_xid" in query:
+                    return [{"x": "reset the GPU"}]
+                return []
+
+            yield run
+
+    out = _query_remediation(FakeClient(), "", [1], "")  # type: ignore[arg-type]
+    assert out.root_xids[1] == [2, 3, 4, 5, 6, 7]
+    assert out.root_xid_status[1] == "truncated"
 
 
 def test_query_remediation_projects_xid_trigger_and_renders_guidance() -> None:
@@ -218,6 +271,10 @@ def test_query_kg_surfaces_location_history_and_renders_it() -> None:
         {"enabled": True, "available": True, "location_history": history}, [], "", ""
     )
     joined = "\n".join(lines)
+    assert (
+        "- 2 past resolved incident(s) at this alert's location "
+        "(different alerts, same node/namespace):"
+    ) in lines
     assert "2 past resolved incident(s)" in joined
     assert "INC-node-1 (node gpu-1): GPU fell off the bus." in joined
 
@@ -251,7 +308,57 @@ def test_query_kg_surfaces_workload_topology_and_storage_blast_radius() -> None:
     )
     joined = "\n".join(lines)
     assert "Workload topology" in joined
+    assert (
+        "- Workload topology (stable identity): Service(s) runai-backend-workloads; "
+        "PVC(s) data-0 — PVC shared with 1 other workload(s): other-workload"
+    ) in lines
     assert "PVC shared with 1 other workload(s): other-workload" in joined
+
+
+def test_query_kg_discloses_unsearched_fourth_pvc() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "has name $pn" in query:
+                    return [{"pn": f"data-{index}"} for index in range(1, 5)]
+                if 'has name "data-4"' in query:
+                    raise AssertionError("the fourth PVC must not be searched")
+                return []
+
+            yield run
+
+    data = _query_kg(
+        FakeClient(), replace(_target(), workload_name="workload"), []
+    )  # type: ignore[arg-type]
+
+    topology = data["workload_topology"]
+    assert topology["pvcs"] == ["data-1", "data-2", "data-3", "data-4"]
+    assert topology["shared_storage_pvcs"] == ["data-1", "data-2", "data-3"]
+    assert topology["shared_storage_truncated"] is True
+    assert "shared-storage checked only on PVC(s) data-1, data-2, data-3" in "\n".join(
+        _knowledge_base_lines({"enabled": True, "available": True, "workload_topology": topology})
+    )
+
+
+def test_location_history_cap_is_rendered_as_at_least() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "has node_name" in query:
+                    return [{"iid": f"INC-{index}", "sum": "prior RCA"} for index in range(1, 8)]
+                return []
+
+            yield run
+
+    data = _query_kg(FakeClient(), _target(), [])  # type: ignore[arg-type]
+
+    assert len(data["location_history"]) == 6
+    assert data["location_history_truncated"] is True
+    assert "At least 6 past resolved incident(s)" in "\n".join(
+        _knowledge_base_lines({"enabled": True, "available": True, **data})
+    )
 
 
 def test_query_kg_projects_typedb_symptom_metadata() -> None:

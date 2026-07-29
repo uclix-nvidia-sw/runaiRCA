@@ -230,6 +230,7 @@ class KGContext:
     prior_incidents: list[dict[str, str]] = field(default_factory=list)
     # Resolved incidents that fired at the same node/namespace, any alert name.
     location_history: list[dict[str, str]] = field(default_factory=list)
+    location_history_truncated: bool = False
     # Stable-identity Service/PVC attachments of the target workload.
     workload_topology: dict[str, Any] = field(default_factory=dict)
     case_cards: list[dict[str, Any]] = field(default_factory=list)
@@ -249,6 +250,7 @@ class KGContext:
             "blast_radius_workload_names": self.blast_radius_workload_names,
             "prior_incidents": self.prior_incidents,
             "location_history": self.location_history,
+            "location_history_truncated": self.location_history_truncated,
             "workload_topology": self.workload_topology,
             "case_cards": self.case_cards,
             "knowledge": self.knowledge,
@@ -312,6 +314,7 @@ async def enrich(
         blast_radius_workload_names=data["blast_radius_workload_names"],
         prior_incidents=data["prior_incidents"],
         location_history=data.get("location_history") or [],
+        location_history_truncated=bool(data.get("location_history_truncated")),
         workload_topology=data.get("workload_topology") or {},
         case_cards=data["case_cards"],
         knowledge=data["knowledge"],
@@ -335,6 +338,9 @@ class GraphRemediation:
     # along the leads_to chain (nearest hop first). E.g. observing 154 with chain
     # 144 -> 48 -> 154 yields [48, 144]: both the near cause and the true origin.
     root_xids: dict[int, list[int]] = field(default_factory=dict)
+    # observed XID -> complete, truncated by a traversal cap, or degraded by a
+    # failed one-hop query.
+    root_xid_status: dict[int, str] = field(default_factory=dict)
     verified_actions: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -355,6 +361,7 @@ class GraphRemediation:
             "xid_triggers": {str(k): v for k, v in self.xid_triggers.items()},
             "model_xids": {k: v for k, v in self.model_xids.items()},
             "root_xids": {str(k): v for k, v in self.root_xids.items()},
+            "root_xid_status": {str(k): v for k, v in self.root_xid_status.items()},
             "verified_actions": self.verified_actions,
             "warnings": self.warnings,
         }
@@ -429,7 +436,8 @@ def _query_remediation(
             # read from an attribute. Keep the traversal in Python instead:
             # it is bounded, cycle-safe, and composes the validated one-hop
             # root_xids_for function without a failed query per XID.
-            roots = _root_chain_for(run, code)
+            roots, root_status = _root_chain_for(run, code)
+            out.root_xid_status[code] = root_status
             if roots:
                 out.root_xids[code] = roots
                 for root in roots:
@@ -455,18 +463,21 @@ _MAX_CHAIN_NODES = 16
 _MAX_CHAIN_DEPTH = 6
 
 
-def _root_chain_for(run: Any, code: int) -> list[int]:
+def _root_chain_for(run: Any, code: int) -> tuple[list[int], str]:
     """Transitive ancestors of `code` along leads_to, nearest hop first.
 
     Repeatedly applies the validated one-hop `root_xids_for` backward from the
     observed code, accumulating every fault that (directly or indirectly)
     escalates into it. Cycle-safe (visited set) and bounded (`_MAX_CHAIN_*`).
-    Best-effort: a failed hop is skipped, never fatal.
+    Best-effort: a failed hop is skipped, never fatal. The accompanying status
+    distinguishes a cap from a failed hop so callers do not present either as
+    a complete root chain.
     """
     ordered: list[int] = []
     seen: set[int] = {code}
     frontier: list[int] = [code]
     depth = 0
+    status = "complete"
     while frontier and depth < _MAX_CHAIN_DEPTH and len(ordered) < _MAX_CHAIN_NODES:
         depth += 1
         nxt: list[int] = []
@@ -474,6 +485,7 @@ def _root_chain_for(run: Any, code: int) -> list[int]:
             try:
                 rows = run(_FN_ROOT_XIDS_FOR.format(code=cur))
             except Exception:  # noqa: BLE001 - best-effort drill-down, never fatal
+                status = "degraded"
                 continue
             for value in _values(rows):
                 if not _is_int(value):
@@ -485,11 +497,15 @@ def _root_chain_for(run: Any, code: int) -> list[int]:
                 ordered.append(root)
                 nxt.append(root)
                 if len(ordered) >= _MAX_CHAIN_NODES:
+                    if status == "complete":
+                        status = "truncated"
                     break
             if len(ordered) >= _MAX_CHAIN_NODES:
                 break
         frontier = nxt
-    return ordered
+    if frontier and depth >= _MAX_CHAIN_DEPTH and status == "complete":
+        status = "truncated"
+    return ordered, status
 
 
 def _statements(rows: list[dict[str, Any]]) -> list[str]:
@@ -770,6 +786,7 @@ def _query_kg(
         # Past resolved incidents at the same location (any alert name) — the
         # infra layer's "have we seen trouble HERE before" signal.
         location_history: list[dict[str, str]] = []
+        location_history_truncated = False
         seen_locations: set[str] = set()
         for where, query in (
             ("node " + target.node, _NODE_HISTORY_QUERY.format(node=escape_typeql(target.node)))
@@ -797,6 +814,7 @@ def _query_kg(
                     }
                 )
                 if len(location_history) >= 6:
+                    location_history_truncated = True
                     break
             if len(location_history) >= 6:
                 break
@@ -821,7 +839,8 @@ def _query_kg(
                 }
             )
             shared: list[str] = []
-            for pvc in pvcs[:3]:
+            shared_storage_pvcs = pvcs[:3]
+            for pvc in shared_storage_pvcs:
                 for r in run(_SHARED_PVC_QUERY.format(pvc=escape_typeql(pvc))):
                     other = str(r.get("on") or "")
                     if other and other != target.workload_name and other not in shared:
@@ -831,6 +850,8 @@ def _query_kg(
                     "services": services[:10],
                     "pvcs": pvcs[:10],
                     "shared_storage_workloads": shared[:10],
+                    "shared_storage_pvcs": shared_storage_pvcs,
+                    "shared_storage_truncated": len(pvcs) > len(shared_storage_pvcs),
                 }
 
         prior: list[dict[str, Any]] = []
@@ -982,6 +1003,7 @@ def _query_kg(
         "blast_radius_workload_names": workloads[:20],
         "prior_incidents": prior[:5],
         "location_history": location_history,
+        "location_history_truncated": location_history_truncated,
         "workload_topology": workload_topology,
         "case_cards": case_cards,
         "knowledge": knowledge,
