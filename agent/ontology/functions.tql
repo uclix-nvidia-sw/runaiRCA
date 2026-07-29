@@ -117,34 +117,9 @@ fun entry_steps_for_runbook($runbook: string) -> { diagnostic_id }:
     $s has diagnostic_id $id;
   return { $id };
 
-# Root-cause outcome attached to a terminal diagnostic step.
-fun diagnostic_outcomes_for($step: string) -> { subtype, summary, confidence }:
-  match
-    $s isa diagnostic_step, has diagnostic_id $sid; $sid == $step;
-    $o isa diagnostic_outcome(step: $s, cause: $c),
-      has summary $sum,
-      has confidence $conf;
-    $c has subtype $family;
-  return { $family, $sum, $conf };
-
-# Ordered remediation statements for a terminal diagnostic step.
-fun diagnostic_actions_for($step: string) -> { statement, sequence_index }:
-  match
-    $s isa diagnostic_step, has diagnostic_id $sid; $sid == $step;
-    (step: $s, remedy: $a) isa diagnostic_recommendation,
-      has sequence_index $seq;
-    $a has statement $st;
-  return { $st, $seq };
-
-# Evidence that should refute or weaken a terminal outcome.
-fun diagnostic_disconfirmations_for($step: string) -> { disconfirm }:
-  match
-    $s isa diagnostic_step, has diagnostic_id $sid; $sid == $step;
-    (step: $s, cause: $c) isa diagnostic_outcome, has disconfirm $d;
-  return { $d };
-
-# Bulk graph projections used by the runtime. They avoid issuing one query per
-# step while preserving the same typed relations as the per-step functions.
+# Bulk graph projections used by the runtime: one query per runbook rather than
+# one per step. Each returns the step's diagnostic_id alongside the payload, so
+# the caller reassembles per-step results in Python.
 fun diagnostic_transitions_for_runbook($runbook: string) -> {
   diagnostic_id, diagnostic_id, match_expression, transition_priority
 }:
