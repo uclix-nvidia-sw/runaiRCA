@@ -587,7 +587,12 @@ def _workload_kind_identity(labels: dict[str, str], annotations: dict[str, str])
     for key in _WORKLOAD_KIND_LABELS:
         value = value_from(labels, annotations, key)
         if value:
-            return value, _WORKLOAD_KIND_TYPES[key]
+            # Controller-kind labels are stable identities and stay verbatim.
+            # `job_name` alone is normalized because CronJob children embed a
+            # per-run timestamp. Go normalizes every label because its dedup
+            # consumer tolerates over-merge; this agent intentionally does not.
+            name = normalize_pod_name(value) if key == "job_name" else value
+            return name, _WORKLOAD_KIND_TYPES[key]
     return "", ""
 
 
@@ -661,9 +666,11 @@ def resolve_target(
         queue=value_from(labels, annotations, "queue", "runai_queue", "runai.io/queue"),
         namespace=namespace,
         workload_name=(
-            # Explicit workload/controller labels are already stable identities
-            # and stay verbatim; only the raw-pod-name FALLBACK is normalized
-            # (a Run:ai workload named "train-3" must not lose its "-3").
+            # Explicit workload/controller labels are stable identities and
+            # stay verbatim; `job_name` alone is normalized because CronJob
+            # children embed per-run timestamps. Go normalizes all labels for
+            # dedup, whose consumer tolerates over-merge; the raw-pod fallback
+            # is separately normalized for this agent's graph identities.
             explicit_workload_name
             or workload_kind_name
             or normalize_pod_name(value_from(labels, annotations, "pod"))

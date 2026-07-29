@@ -344,6 +344,39 @@ def test_pod_fallback_workload_identity_is_stemmed() -> None:
         assert target.pod == pod
 
 
+def test_job_name_controller_identity_collapses_cronjob_runs() -> None:
+    targets = [
+        resolve_target({"job_name": name}, {})
+        for name in ("runai-rca-typedb-ingest-29726117", "runai-rca-typedb-ingest-29726118")
+    ]
+
+    assert [target.workload_name for target in targets] == [
+        "runai-rca-typedb-ingest",
+        "runai-rca-typedb-ingest",
+    ]
+    assert [target.workload_type for target in targets] == ["Job", "Job"]
+
+
+def test_statefulset_controller_identity_stays_verbatim() -> None:
+    target = resolve_target({"statefulset": "web-2"}, {})
+
+    assert (target.workload_name, target.workload_type) == ("web-2", "StatefulSet")
+
+
+def test_job_name_non_timestamp_suffix_stays_verbatim() -> None:
+    target = resolve_target({"job_name": "train-v2"}, {})
+
+    assert (target.workload_name, target.workload_type) == ("train-v2", "Job")
+
+
+def test_job_name_rerun_suffix_collapses_as_accepted_job_only_cost() -> None:
+    # A rerun suffix plausibly denotes the same Job workload; this cost is
+    # intentionally confined to job_name, never controller-kind labels.
+    target = resolve_target({"job_name": "backup-2"}, {})
+
+    assert (target.workload_name, target.workload_type) == ("backup", "Job")
+
+
 def test_workload_topology_extracts_pvcs_and_selector_matched_services() -> None:
     pod = {
         "metadata": {"labels": {"app": "workloads", "tier": "backend"}},
