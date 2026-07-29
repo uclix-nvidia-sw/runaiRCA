@@ -91,6 +91,7 @@
     - "kubectl get runaiconfig -n runai -o yaml | tail -40   # status/conditions"
 
 - component: runai-scheduler-default
+  aliases: ["runai scheduler", "run:ai scheduler"]
   layer: cluster
   namespace: runai
   kind: Deployment
@@ -318,6 +319,7 @@
     - "kubectl logs -n runai deploy/workload-exporter --tail=100"
 
 - component: prometheus-runai
+  aliases: ["runai prometheus"]
   layer: cluster
   namespace: runai
   kind: StatefulSet
@@ -623,6 +625,7 @@
     - "kubectl logs -n runai-backend deploy/runai-backend-metrics-service --tail=200"
 
 - component: runai-backend-thanos-receive
+  aliases: ["thanos receive", "thanos-receive"]
   layer: control_plane
   namespace: runai-backend
   kind: StatefulSet
@@ -635,6 +638,7 @@
     - "kubectl get pvc -n runai-backend | grep thanos"
 
 - component: runai-backend-thanos-query
+  aliases: ["thanos query"]
   layer: control_plane
   namespace: runai-backend
   kind: Deployment

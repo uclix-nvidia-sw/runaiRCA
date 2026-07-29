@@ -46,6 +46,7 @@ class InvestigationPlan:
     # The platform component the alert target ITSELF is (runai_architecture.yaml
     # name, e.g. "runai-container-toolkit"), resolved from the pod/workload name.
     component: str = ""
+    component_source: str = ""
     # Neutral ontology guidance shared with every collector/investigator. It
     # contains questions/checks/disconfirmation, never a command to prove a
     # predetermined cause.
@@ -90,6 +91,7 @@ class InvestigationPlan:
             "narrative": self.narrative,
             "matched_alert": self.matched_alert,
             "component": self.component,
+            "component_source": self.component_source,
             "diagnostic_directive": self.diagnostic_directive,
             "case_cards": self.case_cards,
             "warnings": self.warnings,

@@ -1603,6 +1603,27 @@ func TestChatAnalysisRequestWithoutTargetUsesLatestAlert(t *testing.T) {
 	}
 }
 
+func TestSimilarIncidentsFallBackToSparseWithoutDatabase(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "GPU quota blocked scheduling"},
+	}
+	seedApprovedMemoryIncidentForTest(store, "INC-prior", time.Now().UTC())
+	store.memories["INC-prior"] = &IncidentMemory{
+		IncidentID: "INC-prior",
+		Title:      "GPU quota blocked scheduling",
+		Labels:     cloneMap(alert.Labels),
+		Vector:     textVector(alertSearchText(alert)),
+	}
+
+	similar := store.SimilarIncidentsForAlert(alert, "INC-current", 1)
+	if len(similar) != 1 || similar[0].IncidentID != "INC-prior" {
+		t.Fatalf("expected sparse fallback without database, got %+v", similar)
+	}
+}
+
 func TestFeedbackAndSimilarIncidentMemory(t *testing.T) {
 	store := NewStore()
 	priorAlert := Alert{

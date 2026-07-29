@@ -11,6 +11,7 @@ from typing import Any
 
 from app.knowledge import (
     component_action_lines,
+    component_for_text,
     family_label,
     localized_failure_mode_actions,
     match_failure_mode_symptoms,
@@ -45,6 +46,7 @@ def general_guidance_lines(
     language: str = "en",
     masker: Masker | None = None,
     component: str = "",
+    component_source: str = "",
     components: dict[str, dict[str, Any]] | None = None,
     matched_alert: dict[str, Any] | None = None,
     families: list[str] | None = None,
@@ -82,6 +84,9 @@ def general_guidance_lines(
     active_masker = masker or build_masker(())
     lines = list(_BASE_LINES.get(language, _BASE_LINES["en"]))
     text = active_masker.mask_text(query or "")
+    if not component:
+        entry = component_for_text(components or {}, query)
+        component = entry["component"] if entry else ""
 
     # Precision order mirrors the playbook: identity beats any keyword match.
     # The component is a fact about the target, so its checks are stated plainly
@@ -91,11 +96,21 @@ def general_guidance_lines(
         if checks:
             name = _safe(component, active_masker, 120)
             lines.append(
-                f"- 알림 대상이 **{name}** 컴포넌트입니다. "
-                "원인 확정 전이라도 다음을 확인할 수 있습니다:"
-                if language == "ko"
-                else f"- The alert target is the **{name}** component. Even before a cause "
-                "is confirmed, these can be checked:"
+                (
+                    f"- 이 요청은 **{name}** 컴포넌트에 대한 것으로 해석되었습니다. "
+                    "확인된 대상이 아니라 해석이며, 원인 확정 전 다음을 확인할 수 있습니다:"
+                    if language == "ko"
+                    else f"- This request was interpreted as being about the **{name}** component — "
+                    "an interpretation, not a confirmed target. These can be checked:"
+                )
+                if component_source == "llm"
+                else (
+                    f"- 알림 대상이 **{name}** 컴포넌트입니다. "
+                    "원인 확정 전이라도 다음을 확인할 수 있습니다:"
+                    if language == "ko"
+                    else f"- The alert target is the **{name}** component. Even before a cause "
+                    "is confirmed, these can be checked:"
+                )
             )
             lines.extend(f"  - {_safe(check, active_masker, 360)}" for check in checks[:4])
 

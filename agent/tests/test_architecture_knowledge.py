@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from app.knowledge import (
     component_check_lines,
+    component_for_text,
     dependency_path,
     load_architecture,
     load_failure_modes,
@@ -31,6 +32,34 @@ def test_architecture_loads_and_is_internally_consistent() -> None:
         if entry["layer"] != "external":
             assert entry["checks"], f"{name}: no checks"
             assert all("kubectl" in c for c in entry["checks"]), name
+
+
+def test_component_aliases_are_unique_and_do_not_collide_with_canonical_names() -> None:
+    components = load_architecture(ARCHITECTURE)
+
+    def normalize(value: object) -> str:
+        return " ".join(
+            str(value).casefold().replace("_", " ").replace("-", " ").split()
+        )
+
+    canonical = {normalize(name): name for name in components}
+    aliases: dict[str, str] = {}
+    for name, entry in components.items():
+        for alias in entry["aliases"]:
+            normalized = normalize(alias)
+            assert aliases.setdefault(normalized, name) == name
+            assert canonical.get(normalized, name) == name
+
+
+def test_component_for_text_matches_curated_aliases_without_fuzzy_matching() -> None:
+    components = load_architecture(ARCHITECTURE)
+    entry = component_for_text(
+        components, "Thanos Receive 가 OOMKilled 반복되어서 메모리를 올렸는데도 자꾸 죽는데"
+    )
+    assert entry is not None and entry["component"] == "runai-backend-thanos-receive"
+    assert component_for_text(components, "unrelated text") is None
+    entry = component_for_text(components, "thanos-receive keeps dying")
+    assert entry is not None and entry["component"] == "runai-backend-thanos-receive"
 
 
 def test_live_roster_additions_and_confirmed_service_names_are_present() -> None:

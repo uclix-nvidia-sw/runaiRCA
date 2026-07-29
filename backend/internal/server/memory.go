@@ -167,9 +167,13 @@ type IncidentMemory struct {
 }
 
 func (s *Store) SimilarIncidentsForAlert(alert Alert, incidentID string, limit int) []SimilarIncident {
+	limit = capSimilarIncidentLimit(limit)
+	if results, ok := s.dbSearchSimilarIncidents(alertSearchText(alert), incidentID, limit); ok && len(results) > 0 {
+		return results
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.similarIncidentsLocked(alert, incidentID, capSimilarIncidentLimit(limit))
+	return s.similarIncidentsLocked(alert, incidentID, limit)
 }
 
 func (s *Store) FeedbackHintsForAlert(alert Alert, incidentID string, limit int) []FeedbackHint {
