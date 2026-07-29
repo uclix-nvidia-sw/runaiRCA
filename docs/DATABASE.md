@@ -150,10 +150,9 @@ the latest validation error for an ineligible candidate and can return it to
 Schema: `agent/ontology/schema.tql` (TypeQL 3.x). Three layers.
 
 ### Infra layer — *populated by ingestion*
-`cluster`, `node`, `namespace`, `project`, `queue`, `workload`, `pod`,
-`control_plane_component`.
-GPU is modeled as attributes (`gpu_allocated`, `gpu_requested`) on
-`node`/`queue`/`project`, not a separate entity.
+`node`, `workload`, `service`, `pvc`, `control_plane_component`.
+GPU is modeled as attributes: `gpu_allocated` is owned only by `node`, while
+`gpu_requested` is declared but has no owning entity.
 
 ### Incident / RCA layer — *populated by ingestion*
 `alert`, `incident` (owns `analysis_summary` so prior RCA is queryable),
@@ -178,13 +177,22 @@ the [Knowledge Base](KNOWLEDGE-BASE.md) doc.
 `agent/app/services/root_cause_ranking.py`; guardrail tests enforce it.
 
 ### Relations
-- **Topology**: `scopes` (cluster→node/project), `runs_on` (node→pod),
-  `belongs_to` (workload→pod), `in_project`, `submitted_to` (workload→queue),
-  `contains` (namespace→pod/workload/component), `depends_on` (component→component)
-- **Incident**: `grouped_into` (incident←alert), `analyzed_by`, `similar_to`
-- **Knowledge**: `has_symptom`, `indicates` (symptom→cause), `has_cause`,
-  `fixed_by` (cause→action), `resolved_by` (symptom→action), `supported_by`
-  (←evidence), `emits`, `applies_to` (xid→gpu_model), `leads_to` (xid→xid)
+- **Topology**: `runs_on` (host→guest), `exposes` (endpoint→backend),
+  `uses_storage` (consumer→storage), `depends_on` (dependent→dependency)
+- **Incident**: `grouped_into` (incident←member), `has_symptom` (incident→symptom),
+  `analyzed_by` (incident→run), `diagnosis` (run+incident→cause),
+  `case_projection` (case→finding), `resolution` (finding→remedy),
+  `supported_by` (claim←proof), `contradicted_by` (claim←proof)
+- **Knowledge**: `indicates` (symptom→cause), `resolved_by` (symptom→remedy),
+  `runbook_contains` (runbook→step), `runbook_entry` (runbook→step),
+  `diagnostic_transition` (prior→next), `diagnostic_outcome` (step→cause),
+  `diagnostic_recommendation` (step→remedy), `probe_template_for` (step→template),
+  `package_has_template` (package→template+binding), `applies_to` (fault→model),
+  `leads_to` (cause_fault→effect_fault)
+- **Trace projection**: `hypothesis_for` (run+incident→hypothesis),
+  `probe_execution_for` (execution→template), `probe_execution_tests`
+  (execution→hypothesis), `probe_execution_evidence` (execution→proof),
+  `rejected_evidence_link` (hypothesis→proof)
 
 ### Populated vs modeled
 | Status | Entities / relations |
@@ -192,7 +200,7 @@ the [Knowledge Base](KNOWLEDGE-BASE.md) doc.
 | ✅ Populated (`ontology/ingest.py`) | infra + incident layer + topology/`grouped_into` |
 | ✅ Knowledge (`load_knowledge` / `load_troubleshooting` / other `load_*`) | symptom/cause/action plus executable runbook steps, transitions, outcomes, recommendations, XIDs, and component dependencies |
 | 🟦 Promoted (`ingest.py --promote-knowledge`) | `confirmed:<alert>` symptom → family → action, from operator-confirmed RCAs |
-| ⬜ Modeled, not yet fed | `evidence`, `analysis_run`, `similar_to`, `supported_by`, GPU attrs |
+| ⬜ Modeled, not yet fed | GPU attrs |
 
 ---
 

@@ -162,10 +162,11 @@ label overlap cannot express. It is a knowledge resource the orchestrator
 consults around synthesis time — not a parallel evidence collector, and not a
 separate agent. Full detail: [Knowledge Base](KNOWLEDGE-BASE.md).
 
-- **Schema** (`agent/ontology/schema.tql`): typed entities (cluster, node, pod,
-  workload, project, queue, namespace, alert, incident, symptom, root cause,
+- **Schema** (`agent/ontology/schema.tql`): typed entities (`node`, `workload`,
+  `service`, `alert`, `incident`, `symptom`, `root_cause`, `action`,
   `control_plane_component`, `xid_error`, ...) and relations (`runs_on`,
-  `submitted_to`, `grouped_into`, `indicates`, `depends_on`, `leads_to`, ...),
+  `exposes`, `grouped_into`, `has_symptom`, `indicates`, `resolved_by`,
+  `depends_on`, `leads_to`, ...),
   with 16 root-cause families modeled as `sub` types.
 - **Ingestion** (`agent/ontology/ingest.py`, CronJob): a deterministic projection
   of Dashboard-approved, resolved `incidents`/`alerts` into the graph after a grace

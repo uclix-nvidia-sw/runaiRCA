@@ -154,10 +154,11 @@ pgvector 유사도와 레이블 중첩으로는 표현할 수 없는 관계형 �
 이는 오케스트레이터가 종합 시점 즈음에 참조하는 지식 자원이며, 병렬 증거 수집기도 아니고 별도의
 에이전트도 아닙니다. 전체 상세: [Knowledge Base](KNOWLEDGE-BASE.md).
 
-- **스키마**(`agent/ontology/schema.tql`): 타입이 지정된 엔티티(cluster, node, pod, workload,
-  project, queue, namespace, alert, incident, symptom, root cause,
-  `control_plane_component`, `xid_error`, ...)와 관계(`runs_on`, `submitted_to`,
-  `grouped_into`, `indicates`, `depends_on`, `leads_to`, ...), 그리고 `sub` 타입으로 모델링된
+- **스키마**(`agent/ontology/schema.tql`): 타입이 지정된 엔티티(`node`, `workload`,
+  `service`, `alert`, `incident`, `symptom`, `root_cause`, `action`,
+  `control_plane_component`, `xid_error`, ...)와 관계(`runs_on`, `exposes`,
+  `grouped_into`, `has_symptom`, `indicates`, `resolved_by`, `depends_on`,
+  `leads_to`, ...), 그리고 `sub` 타입으로 모델링된
   16개의 근본 원인(root cause) 패밀리.
 - **수집(Ingestion)**(`agent/ontology/ingest.py`, CronJob): Dashboard 승인을 받고 유예 기간 이후
   해결된 `incidents`/`alerts`를 그래프로 결정론적으로 투영합니다(`requireApproval=true`가 기본값).
