@@ -724,6 +724,29 @@ def test_external_signature_match_projects_labeled_card() -> None:
     assert card["successful_actions"][0]["outcome"] == "resolved"
 
 
+def test_component_identity_is_an_external_case_entry_point() -> None:
+    # The live thanos gap: the operator's question spells "Thanos Receive", but
+    # the case's only reachable keyword is the canonical hyphenated component
+    # token. The resolved plan component must therefore join the match text —
+    # the question alone can never hit it, in any language.
+    from app.services.kg_enrichment import _matched_external_cases
+
+    def run(query: str) -> list[dict]:
+        if "isa has_symptom" in query:
+            return [
+                {"iid": "ext:sc-e38f69ff583a", "sum": "Thanos Receive OOMKilled",
+                 "sn": "ext:sc-e38f69ff583a", "case_id": "enterprise_support:e38f69ff583a",
+                 "family": "observability_accuracy",
+                 "kw": "runai-backend-thanos-receive"},
+            ]
+        return []
+
+    question = "Thanos Receive 가 OOMKilled 반복되어서 메모리를 올렸는데도 자꾸 죽는데 어떻게 해야할까?"
+    assert _matched_external_cases(run, question) == []
+    matched = _matched_external_cases(run, f"{question}\nrunai-backend-thanos-receive")
+    assert [case_id for case_id, _info, _hits in matched] == ["enterprise_support:e38f69ff583a"]
+
+
 def test_external_no_signature_match_returns_empty_and_skips_projection() -> None:
     recorded: list[str] = []
     client = _external_fake(recorded)

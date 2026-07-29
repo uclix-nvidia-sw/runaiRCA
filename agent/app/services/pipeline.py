@@ -1826,12 +1826,17 @@ async def rank_stage(state: PipelineState) -> PipelineState:
             state.kg_context.reasoning["candidate_families"] = graph_counts
     # External support-case priors: exact error-signature match against the run's
     # observed evidence (available only post-collection, so this cannot run at plan
-    # time). Labelled historical context for synthesis only — never a ranking input
-    # and never presented as a verified resolution (see synthesis prompt rule).
+    # time). Labelled historical context — never a ranking input and never presented
+    # as a verified resolution (see synthesis prompt rule + general-guidance labels).
+    # The resolved component identity joins the match text: case keywords carry the
+    # canonical hyphenated component token (runai-backend-thanos-receive), which an
+    # operator's question ("Thanos Receive 가 OOMKilled...") never spells out, so an
+    # evidence-free run would otherwise miss the one case that answers it.
     try:
         from app.services.kg_enrichment import external_case_cards
 
-        ext_cards, ext_warnings = await external_case_cards(settings, state.observed)
+        case_match_text = f"{state.observed}\n{comp_name}" if comp_name else state.observed
+        ext_cards, ext_warnings = await external_case_cards(settings, case_match_text)
     except Exception:  # noqa: BLE001 - external prior is optional
         ext_cards, ext_warnings = [], []
     state.extra_warnings.extend(ext_warnings)
@@ -2441,6 +2446,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                         components=load_architecture(settings.architecture_file),
                         matched_alert=getattr(plan, "matched_alert", None) if plan else None,
                         families=_plan_families(plan),
+                        case_cards=state.kg_context.case_cards,
                     ),
                 ]
             )
@@ -4509,6 +4515,7 @@ def _detail_from(
                     components=components,
                     matched_alert=getattr(plan, "matched_alert", None) if plan else None,
                     families=_plan_families(plan),
+                    case_cards=list((kg_context or {}).get("case_cards") or []),
                 ),
             ]
         )
@@ -4584,6 +4591,9 @@ def _abstain_guidance_block(state: "PipelineState", language: str) -> str:
                 components=load_architecture(state.settings.architecture_file),
                 matched_alert=getattr(plan, "matched_alert", None) if plan else None,
                 families=_plan_families(plan),
+                case_cards=list(
+                    getattr(getattr(state, "kg_context", None), "case_cards", None) or []
+                ),
             ),
         ]
     )

@@ -31,17 +31,40 @@ class _Result:
         return _Rows(self._rows)
 
 
+class _FamilyConcept:
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def get_value(self) -> str:
+        return self._value
+
+
+class _FamilyRow:
+    def __init__(self, value: str) -> None:
+        self._value = value
+
+    def get(self, name: str) -> _FamilyConcept:
+        assert name == "f"
+        return _FamilyConcept(self._value)
+
+
 class FakeTx:
     """Records every query; existence reads answer `exists`, inserts return empty."""
 
-    def __init__(self, exists: bool) -> None:
+    def __init__(self, exists: bool, family: str = "node_kubelet_pressure") -> None:
         self.exists = exists
+        self.family = family
         self.queries: list[str] = []
 
     def query(self, q: str) -> _Result:
         self.queries.append(q)
         is_insert = q.lstrip().startswith("insert") or " insert " in q
-        return _Result([] if is_insert or not self.exists else [object()])
+        if is_insert or not self.exists:
+            return _Result([])
+        # _relate_indicates reads the symptom's current family edges.
+        if "select $f;" in q:
+            return _Result([_FamilyRow(self.family)])
+        return _Result([object()])
 
     def inserts(self) -> list[str]:
         return [q for q in self.queries if q.lstrip().startswith("insert") or " insert " in q]
