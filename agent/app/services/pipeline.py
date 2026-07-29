@@ -5084,6 +5084,7 @@ def _promote_signature_cause(
                         "kind": "known_issue",
                         "label": rationale,
                         "score_floor": 8.0,
+                        "evidence_ids": list(dict.fromkeys(support_ids)),
                     }
                 ],
             )
@@ -5152,6 +5153,7 @@ def _promote_signature_cause(
                         "kind": "curated_symptom",
                         "label": rationale,
                         "score_floor": 7.0,
+                        "evidence_ids": list(dict.fromkeys(support_ids)),
                         "matched_keywords": matched_keywords,
                     }
                 ],
@@ -5332,6 +5334,7 @@ def _promote_typed_state_cause(
                     "kind": "typed_container_state",
                     "label": rationale,
                     "score_floor": 9.0,
+                    "evidence_ids": list(dict.fromkeys(support_ids)),
                     "force_high": True,
                 },
             ],
@@ -5359,6 +5362,7 @@ def _promote_typed_state_cause(
                     "kind": "typed_container_state",
                     "label": rationale,
                     "score_floor": 9.0,
+                    "evidence_ids": list(dict.fromkeys(support_ids)),
                     "force_high": True,
                 }
             ],
@@ -5446,6 +5450,7 @@ def _with_signature_support(
                 "label": rationale,
                 "score_floor": score_floor,
                 "delta": score - candidate.score,
+                "evidence_ids": list(dict.fromkeys(support_evidence_ids or [])),
                 **({"matched_keywords": signature_keywords} if signature_keywords else {}),
             },
         ],
@@ -5482,6 +5487,7 @@ def _promote_xid_cause(candidates: list[RankedCause], xid_codes: list[int]) -> l
                     "label": rationale,
                     "score_floor": 10.0,
                     "delta": 10.0 - existing.score,
+                    "evidence_ids": list(existing.support_evidence_ids),
                     "force_high": True,
                 },
             ],
@@ -5507,6 +5513,7 @@ def _promote_xid_cause(candidates: list[RankedCause], xid_codes: list[int]) -> l
                     "kind": "nvidia_xid",
                     "label": rationale,
                     "score_floor": 10.0,
+                    "evidence_ids": [],
                     "force_high": True,
                 }
             ],
