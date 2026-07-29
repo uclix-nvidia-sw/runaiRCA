@@ -1,14 +1,17 @@
 :root {
   color: #111827;
   background: #f2f4ef;
-  font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-heading: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+  --font-body: "Public Sans", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+  font-family: var(--font-body);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   --nvidia: #76b900;
-  --nvidia-dark: #4b7f00;
+  --nvidia-dark: #457300;
   --ink: #111827;
-  --muted: #667085;
+  --muted: #5f6980;
   --line: #dde3ea;
   --surface: #ffffff;
   --surface-soft: #f5f8f1;
@@ -46,6 +49,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -96,9 +100,7 @@ button:not(:disabled):active,
   display: grid;
   grid-template-columns: 13rem 1fr;
   min-height: 100vh;
-  background:
-    linear-gradient(180deg, rgba(118, 185, 0, 0.07), transparent 16rem),
-    var(--canvas);
+  background: var(--canvas);
 }
 
 .sidebar {
@@ -138,6 +140,7 @@ button:not(:disabled):active,
 .eyebrow {
   margin: 0 0 0.35rem;
   color: var(--nvidia-dark);
+  font-family: var(--font-heading);
   font-size: 0.72rem;
   font-weight: 750;
   letter-spacing: 0.06em;
@@ -149,6 +152,12 @@ h2,
 h3,
 p {
   margin-top: 0;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--font-heading);
 }
 
 h1 {
@@ -314,7 +323,9 @@ h2 {
   display: block;
   color: var(--muted);
   font-size: 0.72rem;
-  font-weight: 700;
+  font-weight: 750;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
   line-height: 1.1;
   white-space: nowrap;
   overflow: hidden;
@@ -427,7 +438,7 @@ tbody tr:active td {
   vertical-align: middle;
   border-bottom: 0;
   background: transparent;
-  color: #55556d;
+  color: var(--muted);
   font-size: 0.78rem;
   font-weight: 800;
   letter-spacing: 0;
@@ -475,7 +486,7 @@ tbody tr:active td {
 .selection-column input {
   width: 1rem;
   height: 1rem;
-  accent-color: var(--nvidia-dark);
+  accent-color: var(--nvidia);
 }
 
 .operations-table tbody tr:active td {
@@ -722,8 +733,9 @@ tbody tr:active td {
 }
 
 .knowledge-evidence {
-  border-left: 3px solid #b8d986;
+  border: 1px solid #d7e8ba;
   background: #f8faf6;
+  border-radius: 0.35rem;
   padding: 0.6rem 0.7rem;
 }
 
@@ -818,8 +830,9 @@ tbody tr:active td {
 }
 
 .knowledge-validation-error {
-  border-left: 3px solid #fda29b;
+  border: 1px solid #fda29b;
   background: #fff5f4;
+  border-radius: 0.35rem;
   padding: 0.55rem 0.65rem;
   color: #991b1b;
   font-size: 0.8rem;
@@ -933,7 +946,7 @@ tbody tr:active td {
 
 .column-filter svg {
   flex: 0 0 auto;
-  color: #55556d;
+  color: var(--muted);
   pointer-events: none;
 }
 
@@ -1232,8 +1245,6 @@ td span.occurrence-pill {
 }
 
 .loading-strip {
-  position: relative;
-  overflow: hidden;
   display: flex;
   align-items: center;
   gap: 0.55rem;
@@ -1248,16 +1259,6 @@ td span.occurrence-pill {
   font-weight: 800;
 }
 
-.loading-strip::before,
-.workspace-progress::before {
-  content: "";
-  position: absolute;
-  inset: auto 0 0;
-  height: 0.2rem;
-  background: linear-gradient(90deg, transparent, var(--nvidia), transparent);
-  animation: loading-sweep 1.15s linear infinite;
-}
-
 .loading-strip span,
 .workspace-progress span {
   flex: 0 0 auto;
@@ -1266,16 +1267,6 @@ td span.occurrence-pill {
   border: 2px solid #d9e6c5;
   border-top-color: var(--nvidia-dark);
   border-radius: 999px;
-}
-
-@keyframes loading-sweep {
-  0% {
-    transform: translateX(-100%);
-  }
-
-  100% {
-    transform: translateX(100%);
-  }
 }
 
 @keyframes spin {
@@ -1626,7 +1617,7 @@ td span.occurrence-pill {
 .pipeline-step.synthesis-step {
   border-color: #d9e6c5;
   background: #fbfdf6;
-  box-shadow: 0 8px 20px rgba(75, 141, 13, 0.08);
+  box-shadow: var(--shadow);
   --pipeline-icon-bg: #eef8e9;
   --pipeline-icon-color: var(--nvidia-dark);
 }
@@ -1713,7 +1704,7 @@ td span.occurrence-pill {
 }
 
 .analysis-stat-card span {
-  color: #55556d;
+  color: var(--muted);
   font-size: 0.82rem;
   font-weight: 750;
 }
@@ -2057,7 +2048,7 @@ td span.occurrence-pill {
 }
 
 .trend-chart .recharts-cartesian-axis-tick-value {
-  fill: #667085;
+  fill: var(--muted);
   font-size: 0.75rem;
   font-weight: 700;
 }
@@ -2508,7 +2499,7 @@ td span.occurrence-pill {
 }
 
 .rca-summary {
-  border-left: 4px solid var(--nvidia);
+  border: 1px solid #d7e8ba;
   background: var(--surface-soft);
   padding: 0.85rem 0.95rem;
   border-radius: 0.45rem;
@@ -2609,7 +2600,6 @@ td span.occurrence-pill {
 .confidence-final-note {
   margin: 0;
   border: 1px solid #d9e6c5;
-  border-left: 3px solid var(--nvidia);
   border-radius: 0.5rem;
   background: #fbfdf7;
   padding: 0.68rem 0.8rem;
@@ -2629,8 +2619,7 @@ td span.occurrence-pill {
 
 .confidence-legacy-note {
   margin-bottom: 0.8rem;
-  border-color: #ead9b8;
-  border-left-color: var(--warning);
+  border-color: var(--warning);
   background: #fdfaf1;
 }
 
@@ -2884,7 +2873,6 @@ td span.occurrence-pill {
   gap: 0.2rem;
   margin: 0 0 1rem;
   border: 1px solid var(--line);
-  border-left-width: 3px;
   border-radius: 0.5rem;
   padding: 0.6rem 0.8rem;
   background: #fafbf8;
@@ -2901,18 +2889,18 @@ td span.occurrence-pill {
 }
 
 .knowledge-preview-ready {
-  border-left-color: #15803d;
+  border-color: #15803d;
   background: #f2fbf5;
 }
 
 .knowledge-preview-validation_failed {
-  border-left-color: var(--warning);
+  border-color: var(--warning);
   background: #fdfaf1;
 }
 
 .knowledge-preview-blocked,
 .knowledge-preview-not_approved {
-  border-left-color: var(--muted);
+  border-color: var(--muted);
 }
 
 .evaluation-confirm {
@@ -3144,7 +3132,7 @@ td span.occurrence-pill {
 }
 
 .progress-timeline-meta {
-  color: #667085;
+  color: var(--muted);
   font-size: 0.76rem;
   text-transform: uppercase;
   letter-spacing: 0;
@@ -3176,7 +3164,7 @@ td span.occurrence-pill {
 }
 
 .hypothesis-chip em {
-  color: #667085;
+  color: var(--muted);
   font-style: normal;
 }
 
@@ -3208,7 +3196,7 @@ td span.occurrence-pill {
   justify-content: space-between;
   gap: 0.75rem;
   margin-bottom: 0.55rem;
-  color: #667085;
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 750;
 }
@@ -3248,7 +3236,7 @@ td span.occurrence-pill {
 }
 
 .progress-event-head time {
-  color: #667085;
+  color: var(--muted);
   font-size: 0.74rem;
   white-space: nowrap;
 }
@@ -3317,7 +3305,7 @@ td span.occurrence-pill {
 }
 
 .progress-detail-field > span {
-  color: #667085;
+  color: var(--muted);
   font-size: 0.7rem;
   font-weight: 800;
 }
@@ -3405,8 +3393,8 @@ td span.occurrence-pill {
 .rca-report-body blockquote {
   margin: 0.6rem 0;
   padding: 0.15rem 0.8rem;
-  border-left: 3px solid var(--nvidia);
   color: var(--muted);
+  font-style: italic;
 }
 
 .rca-report-body table {
@@ -3651,7 +3639,6 @@ td span.occurrence-pill {
 .evidence-interpretation {
   margin-top: 0.65rem;
   border: 1px solid #d9e5cd;
-  border-left: 3px solid var(--nvidia);
   border-radius: 0.35rem;
   background: #fbfdf8;
   padding: 0.55rem 0.65rem;
@@ -3706,7 +3693,7 @@ td span.occurrence-pill {
 }
 
 .evidence-interpretation dt {
-  color: #667085;
+  color: var(--muted);
   font-size: 0.68rem;
   font-weight: 750;
 }
@@ -3989,7 +3976,7 @@ code .evidence-mark {
   padding: 0 0.45rem;
   border-radius: 999px;
   background: #eef2e8;
-  color: #4b7f00;
+  color: var(--nvidia-dark);
   border: 1px solid #d9e6c5;
   font-size: 0.7rem;
   font-weight: 850;
@@ -4140,7 +4127,6 @@ code .evidence-mark {
 .similar-item {
   display: block;
   border: 1px solid var(--line);
-  border-left: 4px solid #3b82f6;
   border-radius: 0.5rem;
   padding: 0.65rem;
   background: #f8fafc;
@@ -4154,12 +4140,12 @@ code .evidence-mark {
 }
 
 .similar-item:hover {
-  border-color: #93c5fd;
+  border-color: var(--nvidia-dark);
   box-shadow: 0 5px 14px rgb(15 23 42 / 9%);
 }
 
 .similar-item:focus-visible {
-  outline: 3px solid rgb(37 99 235 / 25%);
+  outline: 3px solid var(--ring);
   outline-offset: 2px;
 }
 
@@ -4171,7 +4157,7 @@ code .evidence-mark {
 }
 
 .similar-head span {
-  color: #1d4ed8;
+  color: var(--nvidia-dark);
   font-weight: 850;
   white-space: nowrap;
 }
@@ -4213,8 +4199,7 @@ code .evidence-mark {
   align-items: flex-start;
   justify-content: space-between;
   gap: 1rem;
-  border: 1px solid var(--line);
-  border-left: 4px solid var(--nvidia);
+  border: 1px solid #d7e8ba;
   border-radius: 0.5rem;
   background: #fafbf8;
   padding: 0.85rem;
@@ -4480,7 +4465,7 @@ code .evidence-mark {
   border: 0;
   border-radius: 0.35rem;
   background: transparent;
-  color: #667085;
+  color: var(--muted);
 }
 
 .comment-menu-button:hover {
@@ -4821,7 +4806,7 @@ code .evidence-mark {
   border: 0;
   background: var(--nvidia);
   color: #ffffff;
-  box-shadow: 0 18px 35px rgba(76, 127, 0, 0.25);
+  box-shadow: 0 18px 35px rgba(16, 24, 40, 0.16);
   display: grid;
   place-items: center;
   z-index: 45;
@@ -5440,7 +5425,7 @@ h2,
 
   .chat-fab:hover {
     transform: translateY(-2px) scale(1.03);
-    box-shadow: 0 22px 42px rgba(76, 127, 0, 0.32);
+    box-shadow: 0 22px 42px rgba(16, 24, 40, 0.2);
   }
 }
 
@@ -5492,13 +5477,11 @@ tbody tr:focus-visible {
 }
 
 /* ---- Translucent chrome: floating layers read as real material over the
-   content/gradient behind them (Apple §12). ---- */
-.sidebar {
-  background: var(--glass);
-  backdrop-filter: blur(16px) saturate(180%);
-  -webkit-backdrop-filter: blur(16px) saturate(180%);
-}
-
+   content/gradient behind them (Apple §12). The sidebar itself stays opaque
+   (see the base .sidebar rule) — it carries brand/nav text at rest, and
+   backdrop-filter there measurably undermined text contrast without a
+   verifiable win in return. Popover/menu chrome still gets the material
+   treatment since they float transiently over content, not text at rest. ---- */
 .row-action-popover,
 .editor-menu,
 .comment-menu {
@@ -5669,10 +5652,6 @@ tbody tr:focus-visible {
     animation: spin 900ms linear infinite !important;
   }
 
-  .loading-strip::before,
-  .workspace-progress::before {
-    animation: loading-sweep 1.15s linear infinite !important;
-  }
 }
 
 /* ---- Reduced transparency: frost the material into a solid surface. ---- */
