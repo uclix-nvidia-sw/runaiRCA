@@ -115,6 +115,34 @@ disconfirmations, and declarative probe templates. Placeholders are filled only
 from alert scope. It is guidance, not a shell command: each agent's read-only
 tool registry remains the enforcement boundary.
 
+A component's curated `checks` reach **both** the report's Troubleshooting
+Playbook and the drill-down agent's platform-architecture context, so an agent
+still investigating knows how to interrogate the component it is suspecting —
+not only which one. That matters when a check is the sole record that the
+evidence sits somewhere non-obvious: a fractional-GPU workload's slice is held
+by a `gpu-reservation-<hash>` Pod in a separate namespace, so an agent looking
+only at the workload's own namespace cannot see the blocker.
+
+### Placeholder tokens in curated actions
+
+Curated actions are family-level knowledge, so they are written with
+placeholders. The report substitutes the values the run actually observed, which
+is why a rendered action names this incident's Pod rather than `<pod>`:
+
+| Token | Filled with |
+| --- | --- |
+| `<ns>`, `<namespace>`, `<workload-ns>`, `<project-ns>` | the observed namespace |
+| `<pod>` | the live Pod the collector read (beats a stale alert label) |
+| `<node>` | the alert's node |
+| `<image:tag>`, `<image>` | the container image reference observed on the Pod |
+| `<repo>` | that reference without its tag or digest |
+| `<workload>` | the workload name |
+
+Any other token stays a placeholder **on purpose**. `<name>` means the PVC in
+one curated line and a NetworkPolicy in the next, so substituting it would
+produce a confidently wrong command — worse than a visible blank. Write new
+actions with the tokens above when you want substitution.
+
 **Runtime activation ladder.** How aggressively approved knowledge packages
 feed the live analysis is controlled by `DYNAMIC_KNOWLEDGE_MODE` (default
 `assist`):

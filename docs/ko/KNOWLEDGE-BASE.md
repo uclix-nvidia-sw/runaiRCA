@@ -106,6 +106,31 @@ known issue를 *모든* family에서 찾습니다. exact 매치가 우선이고 
 반증, 선언형 probe template이 담깁니다. placeholder는 alert scope에서만 채워집니다. 이것은
 shell 명령이 아니며, 각 Agent의 읽기 전용 tool registry가 실제 권한 경계입니다.
 
+컴포넌트의 큐레이션된 `checks`는 리포트의 Troubleshooting Playbook **과** 드릴다운 Agent의
+platform-architecture 컨텍스트 **양쪽**에 전달됩니다. 그래서 조사 중인 Agent가 "어느 컴포넌트를
+의심할지"뿐 아니라 "그것을 어떻게 조사할지"까지 알 수 있습니다. 이는 증거가 눈에 띄지 않는 곳에
+있다는 사실을 그 check만이 기록하고 있을 때 특히 중요합니다. fractional GPU 워크로드의 GPU 조각은
+별도 namespace의 `gpu-reservation-<hash>` Pod이 점유하므로, 워크로드 자신의 namespace만 보는
+Agent는 원인을 볼 수 없습니다.
+
+### 큐레이션 조치의 placeholder 토큰
+
+큐레이션 조치는 family 수준의 지식이므로 placeholder로 작성합니다. 리포트는 해당 런이 실제로
+관측한 값을 치환하며, 그래서 렌더된 조치가 `<pod>` 대신 이 인시던트의 Pod 이름을 지목합니다.
+
+| 토큰 | 치환되는 값 |
+| --- | --- |
+| `<ns>`, `<namespace>`, `<workload-ns>`, `<project-ns>` | 관측된 namespace |
+| `<pod>` | 컬렉터가 실제로 읽은 live Pod (오래된 alert 라벨보다 우선) |
+| `<node>` | 알림의 노드 |
+| `<image:tag>`, `<image>` | Pod에서 관측된 컨테이너 이미지 reference |
+| `<repo>` | 그 reference에서 tag/digest를 제거한 값 |
+| `<workload>` | 워크로드 이름 |
+
+그 외 토큰은 **의도적으로** placeholder로 남습니다. `<name>`은 어떤 줄에서는 PVC, 다음 줄에서는
+NetworkPolicy를 뜻하므로 치환하면 그럴듯하지만 틀린 명령이 만들어집니다. 이는 눈에 보이는 빈칸보다
+위험합니다. 치환이 필요한 새 조치는 위 토큰으로 작성하세요.
+
 **런타임 활성화 사다리.** 승인된 지식 패키지를 실시간 분석에 얼마나 적극적으로 반영할지는
 `DYNAMIC_KNOWLEDGE_MODE`(기본값 `assist`)로 제어합니다.
 

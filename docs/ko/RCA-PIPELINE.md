@@ -259,6 +259,34 @@ TypeDB가 꺼져 있거나 도달 불가능할 때는 빈 값으로 저하되며
 Recommended Actions → Appendix** — 운영자(또는 Word 내보내기)가 읽는 약 1페이지 분량의
 문서입니다. 이 리포트의 모든 결론은 코드가 만들며, LLM이 리포트를 저작하지 않습니다.
 
+**관측된 설정.** 모든 메커니즘 문장은 *무엇이* 실패했는지를 답합니다. 운영자의 다음 질문은 항상
+"그것이 어떤 설정이었는지"입니다. 그래서 각 typed artifact가 자기가 타이핑한 대상의 설정을 함께
+싣고, Root Cause는 *eligible*한 artifact에서 대상별로 한 줄씩 렌더합니다. family별 분기 테이블이
+필요 없고, 관측 없이 서술되는 값도 없습니다.
+
+| 줄 | 출처 artifact | 담는 값 |
+| --- | --- | --- |
+| `현재 설정 (main)` | `kubernetes_container_lifecycle` | memory/cpu/GPU limit·request, image |
+| `프로브 설정 (main)` | `kubernetes_warning_events` + Pod spec | handler와 임계값. eligible한 `Unhealthy` 이벤트가 있을 때만 |
+| `요청 리소스` | `kubernetes_pod_scheduling` | 컨테이너별 요청량, `nodeSelector`, `schedulerName`, Run:ai 자체 GPU 집계 |
+| `프로젝트 quota` | `runai_queue_quota` | 요청 대비 quota, 상한, over-quota 가중치 |
+| `스토리지 클레임` | `kubernetes_storage_claim` | 요청 용량, storageClass, access mode, phase |
+| `노드 GPU` | `kubernetes_node_gpu_resources` | 여유/allocatable과 기존 Pod 점유량 |
+| `노드 용량` | `kubernetes_node_condition` | 노드의 allocatable 용량 |
+
+두 가지 실패는 책임 있는 *설정*이 증거와 다른 artifact에 있습니다. 그래서 eligible 순회 뒤에
+해석하며 절대 그 결과를 덮어쓰지 않습니다. not-Ready 컨테이너는 인과적 컨테이너 state가 없고
+(kubelet이 `Unhealthy` 이벤트로 보고), Bound 클레임은 그것이 가리키는 볼륨의 attach가 실패했을 때
+클레임 자체가 막힌 것이 아닙니다. 두 경우 모두 이벤트가 eligible 증거여야 하며, 설정은 정체성이
+검증된 spec에서 읽습니다.
+
+**조치에는 placeholder가 아니라 값이 담깁니다.** 큐레이션 조치는 placeholder로 작성된 family 수준
+지식이며, 번호 목록이 해당 런의 관측값을 치환합니다([KNOWLEDGE-BASE.md](KNOWLEDGE-BASE.md) 참고).
+카탈로그가 숫자를 담을 수 없는 부분은 리포트가 도출합니다. 알려진 limit에서 OOMKilled된 컨테이너는
+옛 limit을 새 request로(실제 사용량 근거), 옛 limit의 2배를 새 상한으로 제시하고 실행 가능한 명령을
+함께 냅니다 — kubectl이 패치할 수 있는 kind에만 `kubectl set resources`를, Run:ai나 Grove 워크로드처럼
+CRD가 소유한 Pod에는 소유자에 대한 `kubectl edit`을 사용합니다.
+
 `language=ko`이고 LLM이 구성된 경우 `_translate_report_lines_ko`가 **가장 마지막에** 실행됩니다 —
 Self-Check, 추가 확인 요청, 일반 가이드 블록까지 덧붙인 뒤 — 리포트를 *줄 단위로* 한국어화합니다.
 한글이 없고 실제 산문인 줄만 전송되며, 헤딩·펜스 블록(Alert Labels JSON 포함)·명령어·식별자만 있는
