@@ -7,11 +7,13 @@ from dataclasses import replace
 
 from app.collectors.base import AnalysisTarget
 from app.config import load_settings
+from app.knowledge import match_failure_mode_symptoms
 from app.services.kg_enrichment import (
     _EXTERNAL_CASE_QUERY,
     KGContext,
     _case_card_projection,
     _prior_is_context_compatible,
+    _query_candidate_families,
     _query_external_cases,
     _query_kg,
     _query_remediation,
@@ -513,6 +515,8 @@ def test_query_kg_projects_typedb_symptom_metadata() -> None:
         @contextmanager
         def open_reader(self):
             def run(query: str) -> list[dict]:
+                if "not {" in query:
+                    return []
                 if "has keyword $kw" in query:
                     return [
                         {
@@ -560,6 +564,93 @@ def test_query_kg_projects_typedb_symptom_metadata() -> None:
     }
 
 
+def test_actionless_confirmed_symptom_reaches_matcher_and_candidate_family() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "not {" in query:
+                    return [{
+                        "fam": "node_kubelet_pressure",
+                        "sn": "confirmed:KubeNodeDiskPressure",
+                        "kw": "kubenodediskpressure",
+                    }]
+                return []
+
+            yield run
+
+    knowledge = _query_kg(FakeClient(), _target())["knowledge"]  # type: ignore[arg-type]
+    symptom = knowledge["node_kubelet_pressure"][0]
+
+    assert symptom["actions"] == []
+    matches = match_failure_mode_symptoms(knowledge, "KubeNodeDiskPressure")
+    assert [(family, item["symptom"], item["actions"]) for family, item in matches] == [
+        ("node_kubelet_pressure", "confirmed:KubeNodeDiskPressure", [])
+    ]
+
+    class CandidateClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                assert 'causes_for_symptom("confirmed:KubeNodeDiskPressure")' in query
+                return [{"x": "node_kubelet_pressure"}]
+
+            yield run
+
+    counts, warnings = _query_candidate_families(
+        CandidateClient(), [item["symptom"] for _family, item in matches]  # type: ignore[arg-type]
+    )
+    assert counts == {"node_kubelet_pressure": 1}
+    assert warnings == []
+
+
+def test_actionless_knowledge_renders_family_prior_without_action_stub() -> None:
+    kg = KGContext(
+        enabled=True,
+        available=True,
+        knowledge={
+            "node_kubelet_pressure": [
+                {
+                    "symptom": "confirmed:KubeNodeDiskPressure",
+                    "keywords": ["kubenodediskpressure"],
+                    "actions": [],
+                }
+            ]
+        },
+    ).as_dict()
+
+    text = "\n".join(
+        _knowledge_base_lines(kg, None, "KubeNodeDiskPressure")
+    )
+
+    assert "Matched symptom **confirmed:KubeNodeDiskPressure**" in text
+    assert "no verified action recorded" in text
+    assert "known fixes from the knowledge base" not in text
+    assert "\n  - " not in text
+
+
+def test_demoted_external_case_without_indicates_still_matches_nothing() -> None:
+    queries: list[str] = []
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                queries.append(query)
+                # load_external_cases._delete_chain_edges removed this case's
+                # indicates edge, so the actionless read returns no row.
+                return []
+
+            yield run
+
+    knowledge = _query_kg(FakeClient(), _target())["knowledge"]  # type: ignore[arg-type]
+
+    assert knowledge == {}
+    assert match_failure_mode_symptoms(knowledge, "KubeNodeDiskPressure") == []
+    actionless_query = next(query for query in queries if "not {" in query)
+    assert "isa indicates" in actionless_query
+
+
 def test_typedb_failure_mode_symptom_delivery_chain_contract() -> None:
     # When a consumer starts reading a new failure_modes symptom field, add it to the
     # TypeDB loader (load_knowledge.py), the read-back (kg_enrichment.py), and this list.
@@ -579,6 +670,8 @@ def test_typedb_failure_mode_symptom_delivery_chain_contract() -> None:
         @contextmanager
         def open_reader(self):
             def run(query: str) -> list[dict]:
+                if "not {" in query:
+                    return []
                 if "has keyword $kw" in query:
                     return [
                         {

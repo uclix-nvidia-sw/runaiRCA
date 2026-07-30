@@ -6669,6 +6669,11 @@ def _kb_remediation_lines(
                 header,
                 *[f"  - {_safe_line(a, limit=360, masker=active_masker)}" for a in actions[:5]],
             ]
+        symptom_name = _safe_line(symptom.get("symptom"), limit=160, masker=active_masker)
+        return [
+            f"Matched symptom **{symptom_name}** ({_family_label(family)}); "
+            "family prior from the knowledge base (no verified action recorded)."
+        ]
     # No symptom keyword matched the observed evidence: don't dump a generic family
     # checklist as if it were a match — say so plainly.
     return ["- No closely-matching prior knowledge for this evidence yet."]

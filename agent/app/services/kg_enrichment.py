@@ -187,6 +187,18 @@ match
 select $fam, $sn, $kw, $st;
 """
 
+# Operator-confirmed promotions may establish a family before an action has
+# been verified.  They are still keyword-matchable family priors, just with no
+# remediation to render.
+_KNOWLEDGE_ACTIONLESS_QUERY = """
+match
+  $rc isa root_cause, has subtype $fam;
+  (symptom: $sy, cause: $rc) isa indicates;
+  $sy isa symptom, has name $sn, has keyword $kw;
+  not { (symptom: $sy, remedy: $ac) isa resolved_by; };
+select $fam, $sn, $kw;
+"""
+
 _KNOWLEDGE_REASON_QUERY = """
 match
   $sy isa symptom, has name $sn, has reason $reason;
@@ -908,7 +920,7 @@ def _query_kg(
                 }
             )
 
-        knowledge_rows = run(_KNOWLEDGE_QUERY)
+        knowledge_rows = [*run(_KNOWLEDGE_QUERY), *run(_KNOWLEDGE_ACTIONLESS_QUERY)]
         knowledge_reason_rows = run(_KNOWLEDGE_REASON_QUERY)
         knowledge_exclusive_action_rows = run(_KNOWLEDGE_EXCLUSIVE_ACTIONS_QUERY)
         knowledge_reason_ko_rows = run(_KNOWLEDGE_REASON_KO_QUERY)
