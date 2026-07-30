@@ -80,6 +80,45 @@ kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --incide
 kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --count
 ```
 
+### 예상 밖 그래프 응답 조사
+
+`--count`는 프로젝션된 인시던트, 알림, 노드만 다룹니다. 아래 읽기 전용 쿼리는 이
+데이터베이스에 현재 들어 있는 큐레이션 지식과 실행형 runbook을 점검하며, `reduce`는 단일
+`count` 행을 반환합니다.
+
+```bash
+# 큐레이션 지식 symptom(원인과 action 엣지를 모두 가져야 함).
+kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --raw 'match $s isa symptom; (symptom: $s, cause: $c) isa indicates; (symptom: $s, remedy: $a) isa resolved_by; reduce $count = count($s);'
+# 나쁜 결과: `{'count': 0}`이면 큐레이션 symptom/action 지식이 로드되지 않았습니다.
+
+# 해당 knowledge symptom에서 도달 가능한 큐레이션 action.
+kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --raw 'match $s isa symptom; (symptom: $s, cause: $c) isa indicates; (symptom: $s, remedy: $a) isa resolved_by; reduce $count = count($a);'
+# 나쁜 결과: `{'count': 0}`이면 큐레이션 remediation action이 없습니다.
+
+# 런타임이 사용하는 이름 있는 diagnostic runbook의 step.
+kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --raw 'match $r isa runbook, has name "k8s-senior-troubleshooting"; (runbook: $r, step: $s) isa runbook_contains; reduce $count = count($s);'
+# 나쁜 결과: `{'count': 0}`이면 실행형 runbook이 로드되지 않았습니다.
+
+# 추론 함수 canary: 이 catalog symptom은 해당 family로 해석되어야 합니다.
+kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --raw 'match let $x in causes_for_symptom("NVML Driver/Library Version Mismatch"); select $x;'
+# 나쁜 결과: `gpu_hardware_error` 행이 없거나 `query failed`이면 catalog 또는 함수 정의가 없거나 오래되었습니다.
+```
+
+그래프에는 ingest watermark가 없습니다. 마지막으로 성공한 `typedb-ingest` Job의 완료 시각이
+freshness 신호이지만, 그래프 freshness의 **PROXY**일 뿐입니다. 즉 Job이 완료된 시점만 알려 주고
+어떤 레코드를 프로젝션했는지는 알려 주지 않으며 Kubernetes Job history retention이 적용됩니다.
+
+```bash
+kubectl get jobs -n <ns> -l app.kubernetes.io/component=typedb-ingest -o json | jq -r '[.items[] | select(.status.succeeded == 1) | .status.completionTime] | max // "no successful retained Job"'
+```
+
+`runs_on` 엣지가 없는 workload(고립된 topology)를 찾으려면 다음을 실행하십시오:
+
+```bash
+kubectl exec -n <ns> deploy/<release>-agent -- python -m ontology.query --raw 'match $w isa workload, has workload_uid $uid, has name $name; not { (host: $n, guest: $w) isa runs_on; }; select $uid, $name;'
+# 나쁜 결과: 반환된 workload가 하나라도 있으면 node topology에서 고립되어 있습니다.
+```
+
 - **그래프가 비어 보이나요?** 인제스트는 **해결된 지 `resolvedGraceHours`(6h) 이상 지난**
   인시던트만 프로젝션합니다. 새로 만든 클러스터에는 아직 적격한 대상이 없을 뿐입니다.
   `--recent`가 행을 반환하는데 인시던트 하나가 누락되었다면, 그 인시던트의 `resolved_at`이
