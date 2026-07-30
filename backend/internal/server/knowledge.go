@@ -1393,6 +1393,20 @@ func verdictSupports(verdict string) bool {
 	}
 }
 
+// knowledgeCandidateAwaitsValidatorRetry reports whether the only thing standing
+// between this candidate and a decision is the agent validator's own verdict.
+// Approve/Shadow re-ask the validator before they touch state, so letting the
+// operator retry such a row re-runs exactly the check that failed instead of
+// clearing it. Every other Go-side gate is still re-derived from the snapshot
+// below, and a still-rejecting validator simply records the failure again. The
+// alternative was a dead end: candidate IDs are content-derived, so a fixed
+// validator produced the same ID as the failed row and nothing could revive it.
+func knowledgeCandidateAwaitsValidatorRetry(candidate *KnowledgeCandidate) bool {
+	return candidate != nil &&
+		candidate.Status == knowledgeCandidateValidationFailed &&
+		strings.HasPrefix(candidate.ValidationError, errKnowledgeValidatorRejected.Error())
+}
+
 func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1400,7 +1414,7 @@ func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRe
 	if candidate == nil {
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate not found")
 	}
-	if candidate.Status != knowledgeCandidateReady {
+	if candidate.Status != knowledgeCandidateReady && !knowledgeCandidateAwaitsValidatorRetry(candidate) {
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate is not ready for review")
 	}
 	snapshot := s.caseSnapshots[candidate.CaseID]
@@ -1432,6 +1446,9 @@ func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRe
 	updated.Payload, updated.ContentHash = payload, validated.ContentHash
 	updated.Payload["runtime_status"] = knowledgePackageActive
 	updated.Status, updated.PackageID, updated.DecidedAt, updated.DecidedBy, updated.DecisionNote, updated.UpdatedAt = knowledgeCandidateActive, pkg.PackageID, &now, actor, note, now
+	// A retried candidate carries the validator error that blocked it; the
+	// validator has just accepted it, so the row must not stay red.
+	updated.ValidationError = ""
 	hydrateKnowledgeCandidate(&updated)
 	if !s.persistKnowledgeApprovalLocked(&updated, pkg, prior, event) {
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("could not persist knowledge candidate approval")
@@ -1459,7 +1476,7 @@ func (s *Store) ShadowKnowledgeCandidate(id string, request KnowledgeDecisionReq
 	if candidate == nil {
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate not found")
 	}
-	if candidate.Status != knowledgeCandidateReady {
+	if candidate.Status != knowledgeCandidateReady && !knowledgeCandidateAwaitsValidatorRetry(candidate) {
 		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate is not ready for review")
 	}
 	validated := s.knowledgeCandidateForSnapshotLocked(s.caseSnapshots[candidate.CaseID])
@@ -1477,6 +1494,9 @@ func (s *Store) ShadowKnowledgeCandidate(id string, request KnowledgeDecisionReq
 	updated.Payload, updated.ContentHash = payload, validated.ContentHash
 	updated.Payload["runtime_status"] = knowledgePackageShadow
 	updated.Status, updated.PackageID, updated.DecidedAt, updated.DecidedBy, updated.DecisionNote, updated.UpdatedAt = knowledgeCandidateShadow, pkg.PackageID, &now, actor, note, now
+	// A retried candidate carries the validator error that blocked it; the
+	// validator has just accepted it, so the row must not stay red.
+	updated.ValidationError = ""
 	hydrateKnowledgeCandidate(&updated)
 	event := s.newKnowledgeEventLocked(candidate.CandidateID, pkg.PackageID, "candidate_shadowed", actor, note, now)
 	if !s.persistKnowledgeApprovalLocked(&updated, pkg, nil, event) {

@@ -1409,3 +1409,57 @@ func TestOperatorConfirmedAllowsSingleSourceGroupSupport(t *testing.T) {
 		t.Fatalf("canonical window check must veto even when confirmed, got %+v", candidate)
 	}
 }
+
+// The agent validator rejects at Activate time, downgrading a ready candidate to
+// validation_failed. Candidate IDs are content-derived, so a fixed validator
+// recomputes the SAME id and the failed row can never be replaced — without a
+// retry the case is gone for good. Approve/Shadow re-ask the validator before
+// touching state, so the retry is allowed from that one failure class only.
+func TestValidatorRejectedCandidateCanBeRetriedButOthersCannot(t *testing.T) {
+	s := NewStore()
+	s.SeedDevFixtures()
+	scores := map[string]int{}
+	for _, d := range evaluationDimensions {
+		scores[d] = 5
+	}
+	review := EvaluationReviewRequest{
+		Author: "op", AnalysisHash: "devhash01", CaseType: "known",
+		ExpectedFamily: "workload_startup_error", Scores: scores, ResolutionOutcome: "resolved",
+		OperatorConfirmed: true, Notes: "reproduced offline",
+	}
+	if _, _, err := s.UpsertEvaluationReview("ANL-DEV-000001", review, []string{"workload_startup_error"}); err != nil {
+		t.Fatal(err)
+	}
+	var readyID string
+	for _, c := range s.ListKnowledgeCandidates("") {
+		if c.Status == knowledgeCandidateReady {
+			readyID = c.CandidateID
+		}
+	}
+	if readyID == "" {
+		t.Fatal("expected a ready candidate to activate")
+	}
+
+	// A failure that is NOT the validator's verdict stays a dead end here: the
+	// recompute, not a retry, is what has to change.
+	if _, err := s.FailKnowledgeCandidateValidation(readyID, "probe binding no longer resolves"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.ApproveKnowledgeCandidate(readyID, KnowledgeDecisionRequest{Actor: "op"}); err == nil {
+		t.Fatal("only an agent-validator rejection may be retried from validation_failed")
+	}
+
+	// The validator's own rejection is retryable — the handler re-asks the agent
+	// before this call, so nothing is being papered over.
+	s.knowledgeCandidates[readyID].ValidationError = errKnowledgeValidatorRejected.Error() + ": references unknown bundled probe template IDs"
+	candidate, pkg, err := s.ApproveKnowledgeCandidate(readyID, KnowledgeDecisionRequest{Actor: "op"})
+	if err != nil {
+		t.Fatalf("validator-rejected candidate must be retryable after a validator fix: %v", err)
+	}
+	if candidate.Status != knowledgeCandidateActive || pkg.Status != knowledgePackageActive {
+		t.Fatalf("retry should activate the candidate, got candidate=%s package=%s", candidate.Status, pkg.Status)
+	}
+	if candidate.ValidationError != "" {
+		t.Fatalf("activation must clear the stale validator error, got %q", candidate.ValidationError)
+	}
+}

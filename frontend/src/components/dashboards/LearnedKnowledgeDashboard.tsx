@@ -327,6 +327,13 @@ export function CandidateDetail({
   const evidence = candidate.evidence_summaries ?? [];
   const canReview = candidate.status === 'ready_for_review';
   const canActivate = candidate.status === 'shadow';
+  // The agent validator's verdict is the one failure an operator can retry:
+  // Activate re-asks the validator, so once the rejection reason is fixed this
+  // is the only way back — a candidate id is content-derived, so re-saving the
+  // evaluation recomputes the same row and cannot revive it.
+  const canRetryValidation =
+    candidate.status === 'validation_failed' &&
+    (candidate.validation_error ?? '').startsWith('knowledge validator rejected candidate');
   const [editingActions, setEditingActions] = useState(false);
   const [draftActions, setDraftActions] = useState('');
   // Reviewers judge the knowledge CHAIN (symptoms → cause → family, plus the
@@ -476,6 +483,13 @@ export function CandidateDetail({
           {evidence.length === 0 && <EmptyState text="No evidence summary was reported for this candidate." />}
         </div>
       </div>
+      {canRetryValidation && (
+        <div className="knowledge-review-actions">
+          <button className="primary-button" disabled={busy} onClick={() => void onDecide(candidate, 'approve')} type="button">
+            <CheckCircle2 size={16} /> {busy ? 'Saving…' : 'Retry validation'}
+          </button>
+        </div>
+      )}
       {canReview && (
         <div className="knowledge-review-actions">
           <button className="primary-button" disabled={busy} onClick={() => void onDecide(candidate, 'approve')} type="button">
