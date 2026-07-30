@@ -313,12 +313,6 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 		if candidate == nil {
 			continue
 		}
-		// A candidate's ID is content-derived, so a failed→ready transition (e.g. an
-		// operator confirmation makes a previously unpromotable analysis eligible)
-		// mints a NEW id and would otherwise leave the stale failed candidate behind
-		// as a confusing duplicate. Supersede any other non-decided candidate for the
-		// same case before recording the fresh one.
-		s.supersedeStaleCaseCandidatesLocked(snapshot.CaseID, candidate.CandidateID, time.Now().UTC())
 		existing := s.knowledgeCandidates[candidate.CandidateID]
 		if existing != nil && existing.Status == knowledgeCandidateValidationFailed && candidate.Status == knowledgeCandidateValidationFailed {
 			now := time.Now().UTC()
@@ -386,6 +380,14 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 		if !s.persistNewKnowledgeCandidateLocked(link, event) {
 			continue
 		}
+		// A candidate's ID is content-derived, so a failed→ready transition (e.g. an
+		// operator confirmation makes a previously unpromotable analysis eligible)
+		// mints a NEW id and would otherwise leave the stale failed candidate behind
+		// as a confusing duplicate. Supersede the stale ones only now that the fresh
+		// candidate is durably recorded — superseding first meant a failed persist
+		// (separate transaction) withdrew the old candidate without a replacement,
+		// leaving the case with nothing to review.
+		s.supersedeStaleCaseCandidatesLocked(snapshot.CaseID, candidate.CandidateID, time.Now().UTC())
 		if existing != nil {
 			if !containsString(existing.SupportingCaseIDs, snapshot.CaseID) {
 				existing.SupportingCaseIDs = append(existing.SupportingCaseIDs, snapshot.CaseID)
