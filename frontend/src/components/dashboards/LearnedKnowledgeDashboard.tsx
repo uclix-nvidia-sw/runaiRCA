@@ -333,7 +333,8 @@ export function CandidateDetail({
   // evaluation recomputes the same row and cannot revive it.
   const canRetryValidation =
     candidate.status === 'validation_failed' &&
-    (candidate.validation_error ?? '').startsWith('knowledge validator rejected candidate');
+    ((candidate.validation_error ?? '').startsWith('knowledge validator rejected candidate') ||
+      candidate.validation_error === 'agent semantic validation rejected compiled package');
   const [editingActions, setEditingActions] = useState(false);
   const [draftActions, setDraftActions] = useState('');
   // Reviewers judge the knowledge CHAIN (symptoms → cause → family, plus the
@@ -486,7 +487,7 @@ export function CandidateDetail({
       {canRetryValidation && (
         <div className="knowledge-review-actions">
           <button className="primary-button" disabled={busy} onClick={() => void onDecide(candidate, 'approve')} type="button">
-            <CheckCircle2 size={16} /> {busy ? 'Saving…' : 'Retry validation'}
+            <CheckCircle2 size={16} /> {busy ? 'Saving…' : 'Revalidate and activate'}
           </button>
         </div>
       )}

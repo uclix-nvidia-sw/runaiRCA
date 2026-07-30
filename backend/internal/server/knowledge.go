@@ -23,6 +23,7 @@ const (
 	knowledgePackageShadow             = "shadow"
 	knowledgePackageRetired            = "retired"
 	knowledgeReviewInvalidationError   = "operator evaluation no longer qualifies this analysis for runtime knowledge"
+	knowledgeAgentRejectionFallback    = "agent semantic validation rejected compiled package"
 )
 
 // KnowledgeCandidate is a reviewable, incident-derived proposal. It can only
@@ -1402,9 +1403,13 @@ func verdictSupports(verdict string) bool {
 // alternative was a dead end: candidate IDs are content-derived, so a fixed
 // validator produced the same ID as the failed row and nothing could revive it.
 func knowledgeCandidateAwaitsValidatorRetry(candidate *KnowledgeCandidate) bool {
-	return candidate != nil &&
-		candidate.Status == knowledgeCandidateValidationFailed &&
-		strings.HasPrefix(candidate.ValidationError, errKnowledgeValidatorRejected.Error())
+	if candidate == nil || candidate.Status != knowledgeCandidateValidationFailed {
+		return false
+	}
+	// Both strings FailKnowledgeCandidateValidation can record: the detailed
+	// rejection and the bare fallback used when the agent reports no reasons.
+	return strings.HasPrefix(candidate.ValidationError, errKnowledgeValidatorRejected.Error()) ||
+		candidate.ValidationError == knowledgeAgentRejectionFallback
 }
 
 func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
@@ -1632,7 +1637,7 @@ func (s *Store) FailKnowledgeCandidateValidation(id, reason string) (KnowledgeCa
 		return KnowledgeCandidate{}, errors.New("knowledge candidate is not ready for review")
 	}
 	if strings.TrimSpace(reason) == "" {
-		reason = "agent semantic validation rejected compiled package"
+		reason = knowledgeAgentRejectionFallback
 	}
 	now := time.Now().UTC()
 	updated := cloneKnowledgeCandidate(candidate)
