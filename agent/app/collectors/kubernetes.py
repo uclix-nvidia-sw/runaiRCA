@@ -2010,6 +2010,18 @@ class KubernetesCollector:
                         },
                     )
                 )
+            # The claims this Pod mounts are named in its own spec, so their
+            # size/class/phase is target-verified configuration — the thing an
+            # operator has to change on a storage failure.
+            artifacts.extend(
+                await _storage_claim_artifacts(
+                    self.name,
+                    self._settings,
+                    target,
+                    topology["pvcs"],
+                    time_range=event_time_range,
+                )
+            )
         if exec_probes:
             exec_successes = [probe for probe in exec_probes if not probe.get("error")]
             # A probe that couldn't START (binary absent, exec subresource down) is
@@ -4011,6 +4023,107 @@ def _container_lifecycle_artifact(
     )
 
 
+_UNBOUND_CLAIM_PHASES = frozenset({"Pending", "Lost"})
+
+
+def _pvc_summary(pvc: dict[str, object]) -> dict[str, object]:
+    """Requested size, class, modes and binding — `kubectl describe pvc` in brief."""
+    metadata = pvc.get("metadata") if isinstance(pvc.get("metadata"), dict) else {}
+    spec = pvc.get("spec") if isinstance(pvc.get("spec"), dict) else {}
+    status = pvc.get("status") if isinstance(pvc.get("status"), dict) else {}
+    resources = spec.get("resources") if isinstance(spec.get("resources"), dict) else {}
+    requests = resources.get("requests") if isinstance(resources.get("requests"), dict) else {}
+    capacity = status.get("capacity") if isinstance(status.get("capacity"), dict) else {}
+    return {
+        "claim": metadata.get("name"),
+        "namespace": metadata.get("namespace"),
+        "phase": status.get("phase"),
+        "requested_storage": requests.get("storage"),
+        # A bound PV can be LARGER than the request; the operator needs the real one.
+        "actual_storage": capacity.get("storage"),
+        "storage_class": spec.get("storageClassName"),
+        "access_modes": [str(mode) for mode in spec.get("accessModes") or []],
+        "volume_mode": spec.get("volumeMode"),
+        "volume_name": spec.get("volumeName"),
+    }
+
+
+async def _storage_claim_artifacts(
+    agent: str,
+    settings: Settings,
+    target: AnalysisTarget,
+    claims: list[str],
+    *,
+    time_range: dict[str, str] | None,
+):
+    """Type each claim the target Pod mounts, with its spec and binding state.
+
+    Identity needs no inference: the claim name came out of this Pod's own
+    ``spec.volumes``.  An unbound claim observed while the alert is still firing
+    is what the Pod is waiting on, so it types as a scoped observation the same
+    way a waiting container state does; a Bound claim stays configuration, which
+    a storage Warning event can still make worth printing.
+    """
+    if not claims or not target.namespace or not _namespace_allowed(settings, target.namespace):
+        return []
+    firing = not str(target.resolved_at or "").strip()
+    artifacts = []
+    for claim in claims[:3]:
+        response = await k8s_read(
+            settings,
+            "persistentvolumeclaims",
+            namespace=target.namespace,
+            name=claim,
+            full_object=True,
+        )
+        payload = _normalize_k8s_payload(response.get("data"))
+        if response.get("error") or not isinstance(payload, dict):
+            continue
+        summary = _pvc_summary(payload)
+        if str(summary.get("claim") or "") != claim:
+            continue
+        unbound = str(summary.get("phase") or "") in _UNBOUND_CLAIM_PHASES
+        blocking = bool(unbound and firing and time_range)
+        observation = {
+            "kind": "kubernetes_storage_claim",
+            "predicate": "kubernetes_storage_claim",
+            "polarity": "present" if blocking else "unknown",
+            "coverage": "scoped" if blocking else "partial",
+            "target_identity_verified": True,
+            "observed_entity": {
+                "kind": "persistentvolumeclaim",
+                "name": claim,
+                "namespace": target.namespace,
+            },
+            "observation_window": time_range if blocking else {},
+            "snapshot_role": "live_incident" if blocking else "current_context",
+        }
+        artifacts.append(
+            artifact(
+                agent=agent,
+                source="kubernetes",
+                type="kubernetes_storage_claim",
+                status="ok",
+                confidence="high" if blocking else "low",
+                title=ko_en(settings, "스토리지 클레임(PVC)", "Storage claim (PVC)"),
+                query=kubectl_repr(
+                    "persistentvolumeclaims", namespace=target.namespace, name=claim
+                ),
+                summary=ko_en(
+                    settings,
+                    f"PVC {claim}: phase {summary.get('phase')}, 요청 "
+                    f"{summary.get('requested_storage')}, storageClass "
+                    f"{summary.get('storage_class')}.",
+                    f"PVC {claim}: phase {summary.get('phase')}, requested "
+                    f"{summary.get('requested_storage')}, storageClass "
+                    f"{summary.get('storage_class')}.",
+                ),
+                result={"observation": observation, **summary},
+            )
+        )
+    return artifacts
+
+
 def _workload_topology(pod_object: object, services: list[dict]) -> dict[str, list[str]]:
     """Stable-identity topology observed on the target pod: the PVC claims its
     spec mounts and the Services whose (non-empty) selector matches its labels."""
@@ -5557,15 +5670,28 @@ async def _collect_gpu_node_resource_observations(
         pods_error = str(pods_result.get("error") or "")
         if not pods_error and not pods_query_ok:
             pods_error = "assigned Pod list was not machine-readable"
+        # A sampled value cannot explain a historical incident, and free GPUs must
+        # never substantiate a shortage. But a node with NO free GPU, sampled while
+        # the alert is still firing, is the exhaustion the pending Pod is waiting
+        # on — the same live-snapshot rule the node conditions already use.
+        exhausted = (
+            request_complete
+            and allocatable is not None
+            and estimated_free is not None
+            and estimated_free <= 0
+        )
+        firing = not str(target.resolved_at or "").strip()
+        window = incident_time_range(target)
+        live_exhaustion = bool(node_verified and exhausted and firing and window)
         observation: dict[str, object] = {
             "kind": "kubernetes_node_gpu_resources",
             "predicate": "kubernetes_node_gpu_resources",
-            # These values are sampled now. They explain current capacity but
-            # cannot prove that the same state caused a historical incident.
-            "polarity": "unknown" if node_verified else "unavailable",
-            "coverage": "partial",
-            "observation_window": {},
-            "snapshot_role": "current_context",
+            "polarity": (
+                "present" if live_exhaustion else "unknown" if node_verified else "unavailable"
+            ),
+            "coverage": "scoped" if live_exhaustion else "partial",
+            "observation_window": window if live_exhaustion else {},
+            "snapshot_role": "live_incident" if live_exhaustion else "current_context",
         }
         if node_verified:
             observation["observed_entity"] = {"kind": "node", "name": node}
@@ -5592,7 +5718,7 @@ async def _collect_gpu_node_resource_observations(
             "node_query_status_code": node_result.get("status_code"),
             "pods_query_url": pods_result.get("url"),
             "pods_query_status_code": pods_result.get("status_code"),
-            "snapshot_role": "current_context",
+            "snapshot_role": "live_incident" if live_exhaustion else "current_context",
             "observation": observation,
         }
 

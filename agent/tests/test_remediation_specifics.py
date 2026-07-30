@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
+
 from app.collectors.base import CollectorResult, artifact, resolve_target
 from app.collectors.kubernetes import (
     _container_diagnostics,
@@ -414,12 +417,258 @@ def test_probe_summary_reads_every_handler_shape() -> None:
     assert _probe_summary({"name": "main"}) == {}
 
 
+def _storage_claim(phase: str, *, blocking: bool) -> object:
+    return artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_storage_claim",
+        status="ok",
+        confidence="high" if blocking else "low",
+        summary="pvc",
+        result={
+            "observation": {
+                "polarity": "present" if blocking else "unknown",
+                "coverage": "scoped" if blocking else "partial",
+                "target_identity_verified": True,
+            },
+            "claim": "data-0",
+            "namespace": "runai-team-a",
+            "phase": phase,
+            "requested_storage": "100Gi",
+            "storage_class": "fast-rwo",
+            "access_modes": ["ReadWriteOnce"],
+            "volume_mode": "Filesystem",
+            **({"volume_name": "pvc-9f3a"} if phase == "Bound" else {}),
+        },
+    )
+
+
+def test_pending_claim_reports_its_size_and_class() -> None:
+    line = "\n".join(_configuration(_storage_claim("Pending", blocking=True)))
+
+    assert "Storage claim (data-0)" in line
+    assert "requested 100Gi" in line
+    assert "storageClass fast-rwo" in line
+    assert "ReadWriteOnce" in line and "phase Pending" in line
+    assert "스토리지 클레임" in "\n".join(
+        _configuration(_storage_claim("Pending", blocking=True), "ko")
+    )
+
+
+def test_bound_claim_needs_a_storage_event_to_be_printed() -> None:
+    """A Bound claim is not blocked; a failed mount makes its spec relevant."""
+    claim = _storage_claim("Bound", blocking=False)
+    mount_failure = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_warning_events",
+        status="ok",
+        confidence="high",
+        summary="events",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "target_identity_verified": True,
+            },
+            "events": [
+                {
+                    "type": "Warning",
+                    "reason": "FailedMount",
+                    "target_identity_verified": True,
+                    "message": "Unable to attach or mount volumes: unmounted volumes=[data]",
+                }
+            ],
+        },
+    )
+
+    quiet = CollectorResult(agent="kubernetes", status="ok", summary="k8s", artifacts=[claim])
+    assign_evidence_ids([quiet])
+    # Bound + no storage event: not this incident's subject.
+    assert pipeline._observed_configuration_lines([quiet], {"E01"}, "en") == []
+
+    noisy = CollectorResult(
+        agent="kubernetes", status="ok", summary="k8s", artifacts=[claim, mount_failure]
+    )
+    assign_evidence_ids([noisy])
+    ids = {str(item.evidence_id) for item in noisy.artifacts}
+    line = "\n".join(pipeline._observed_configuration_lines([noisy], ids, "en"))
+    assert "Storage claim (data-0)" in line and "PV pvc-9f3a" in line
+
+
+def _gpu_snapshot(free: int, *, scoped: bool) -> object:
+    return artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_node_gpu_resources",
+        status="ok",
+        confidence="high",
+        summary="gpu snapshot",
+        result={
+            "observation": {
+                "polarity": "present" if scoped else "unknown",
+                "coverage": "scoped" if scoped else "partial",
+            },
+            "node": "dgx-01",
+            "gpu_capacity": 8,
+            "gpu_allocatable": 8,
+            "gpu_requested": 8 - free,
+            "gpu_estimated_free": free,
+            "scheduled_non_terminal_pods": 4,
+        },
+    )
+
+
+def test_gpu_exhaustion_reports_requested_against_available() -> None:
+    """The comparison a pending GPU workload turns on."""
+    line = "\n".join(_configuration(_gpu_snapshot(0, scoped=True)))
+
+    assert "Node GPUs (dgx-01)" in line
+    assert "free 0/8" in line
+    assert "held by scheduled Pods 8" in line
+    assert "여유 0/8" in "\n".join(_configuration(_gpu_snapshot(0, scoped=True), "ko"))
+
+    # Free GPUs are never promoted, so they can never substantiate a shortage.
+    assert _configuration(_gpu_snapshot(2, scoped=False)) == []
+
+
 def test_configuration_lines_need_eligible_evidence() -> None:
     """No eligible observation means no claim about the target's settings."""
     results = [_lifecycle(_oom_container())]
 
     assert pipeline._observed_configuration_lines(results, set(), "en") == []
     assert pipeline._observed_configuration_lines(results, None, "en") == []
+
+
+def test_storage_claim_collector_types_the_pod_s_own_claims(monkeypatch) -> None:
+    """Identity needs no inference: the claim came out of this Pod's spec.volumes."""
+    from app.collectors import kubernetes as k8s
+
+    async def fake_read(settings, kind, **kwargs):  # noqa: ANN001, ANN202
+        assert kind == "persistentvolumeclaims"
+        assert kwargs["name"] == "data-0" and kwargs["namespace"] == "runai-team-a"
+        return {
+            "kind": kind,
+            "error": None,
+            "data": {
+                "metadata": {"name": "data-0", "namespace": "runai-team-a"},
+                "spec": {
+                    "storageClassName": "fast-rwo",
+                    "accessModes": ["ReadWriteOnce"],
+                    "volumeMode": "Filesystem",
+                    "resources": {"requests": {"storage": "100Gi"}},
+                },
+                "status": {"phase": "Pending"},
+            },
+        }
+
+    monkeypatch.setattr(k8s, "k8s_read", fake_read)
+    target = resolve_target({"namespace": "runai-team-a", "pod": "trainer-0"}, {})
+    items = asyncio.run(
+        k8s._storage_claim_artifacts(
+            "kubernetes",
+            make_settings(),
+            target,
+            ["data-0"],
+            time_range={"start": "2026-07-30T02:00:00Z", "end": "2026-07-30T02:20:00Z"},
+        )
+    )
+
+    assert len(items) == 1
+    observation = items[0].result["observation"]
+    # Firing + unbound: what the Pod is waiting on, so it is a scoped observation.
+    assert observation["polarity"] == "present" and observation["coverage"] == "scoped"
+    assert observation["target_identity_verified"] is True
+    assert items[0].result["requested_storage"] == "100Gi"
+
+    # A resolved incident is not explained by a claim that is unbound right now.
+    resolved = replace(target, resolved_at="2026-07-30T03:00:00Z")
+    historical = asyncio.run(
+        k8s._storage_claim_artifacts(
+            "kubernetes",
+            make_settings(),
+            resolved,
+            ["data-0"],
+            time_range={"start": "2026-07-30T02:00:00Z", "end": "2026-07-30T02:20:00Z"},
+        )
+    )
+    assert historical[0].result["observation"]["polarity"] == "unknown"
+
+
+def test_gpu_snapshot_promotes_only_live_exhaustion() -> None:
+    from app.collectors import kubernetes as k8s
+
+    def snapshot(free_gpus: int, **target_kwargs) -> dict:
+        node = {
+            "metadata": {"name": "dgx-01"},
+            "status": {
+                "capacity": {"nvidia.com/gpu": "8"},
+                "allocatable": {"nvidia.com/gpu": "8"},
+            },
+        }
+        pods = {
+            "items": [
+                {
+                    "spec": {
+                        "nodeName": "dgx-01",
+                        "containers": [
+                            {"resources": {"requests": {"nvidia.com/gpu": str(8 - free_gpus)}}}
+                        ],
+                    },
+                    "status": {"phase": "Running"},
+                }
+            ]
+        }
+        return {"node": node, "pods": pods, "target_kwargs": target_kwargs}
+
+    async def run(free_gpus: int, **target_kwargs) -> dict:
+        async def fake_read(settings, kind, **kwargs):  # noqa: ANN001, ANN202
+            data = snapshot(free_gpus)["node" if kind == "nodes" else "pods"]
+            return {"kind": kind, "error": None, "data": data, "url": "", "status_code": 200}
+
+        import unittest.mock
+
+        target = replace(
+            resolve_target({"namespace": "runai-team-a", "node": "dgx-01"}, {}),
+            fired_at="2026-07-30T02:00:00Z",
+            **target_kwargs,
+        )
+        with unittest.mock.patch.object(k8s, "k8s_read", fake_read):
+            snapshots = await k8s._collect_gpu_node_resource_observations(
+                make_settings(),
+                target,
+                pipeline.InvestigationPlan(
+                    hypotheses=[
+                        {
+                            "family": "k8s_scheduling_error",
+                            "reason": "FailedScheduling: Insufficient nvidia.com/gpu",
+                        }
+                    ]
+                ),
+                [
+                    {
+                        "reason": "FailedScheduling",
+                        "message": "Insufficient nvidia.com/gpu on node dgx-01",
+                        "target_identity_verified": True,
+                    }
+                ],
+            )
+        return snapshots[0]
+
+    exhausted = asyncio.run(run(0))
+    assert exhausted["gpu_estimated_free"] == 0
+    assert exhausted["observation"]["polarity"] == "present"
+    assert exhausted["observation"]["coverage"] == "scoped"
+    assert exhausted["snapshot_role"] == "live_incident"
+
+    # GPUs still free -> a sampled snapshot, never support for a shortage.
+    spare = asyncio.run(run(2))
+    assert spare["observation"]["polarity"] == "unknown"
+    assert spare["snapshot_role"] == "current_context"
+
+    # Exhausted now cannot explain an incident that already ended.
+    historical = asyncio.run(run(0, resolved_at="2026-07-30T03:00:00Z"))
+    assert historical["observation"]["polarity"] == "unknown"
 
 
 def test_configuration_line_skips_a_container_with_no_declared_resources() -> None:

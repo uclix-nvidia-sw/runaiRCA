@@ -412,11 +412,13 @@ class RunAICollector:
             "workload_name": target.workload_name,
             "workload_type": target.workload_type,
             "runai_workload_id": target.runai_workload_id,
-            "gpu_context": {
-                "gpu_request": "",
-                "gpu_allocated": "",
-                "scheduler": "runai-scheduler",
-            },
+            # ponytail: no empty gpu_context placeholder. Nothing read it, and ""
+            # for a GPU request invites a consumer to treat it as zero. The real
+            # request/allocation comparison comes from the Kubernetes side
+            # (kubernetes_node_gpu_resources: allocatable vs Pod requests vs free)
+            # and, once its response fields are measured, Run:ai MCP
+            # list_project_resources for the project quota that node capacity
+            # cannot express.
         }
 
         return CollectorResult(

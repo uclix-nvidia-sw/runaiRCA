@@ -6454,7 +6454,26 @@ _CONFIGURATION_KINDS = (
     "kubernetes_container_lifecycle",
     "kubernetes_probe",
     "kubernetes_pod_scheduling",
+    "kubernetes_storage_claim",
+    "kubernetes_node_gpu_resources",
     "kubernetes_node_condition",
+)
+# Node-scoped artifacts carry no ``target_identity_verified`` flag: they are only
+# ever collected for the alert's own node, so requiring one would drop every line.
+_NODE_SCOPED_CONFIGURATION_KINDS = frozenset(
+    {"kubernetes_node_condition", "kubernetes_node_gpu_resources"}
+)
+# Reasons that make a Bound claim's configuration worth printing: the claim is
+# not itself blocked, but the volume it points at failed to attach or mount.
+_STORAGE_EVENT_REASONS = frozenset(
+    {
+        "FailedAttachVolume",
+        "FailedBinding",
+        "FailedDetachVolume",
+        "FailedMount",
+        "ProvisioningFailed",
+        "VolumeResizeFailed",
+    }
 )
 # Resource keys worth printing, in the order an operator reads them. Anything
 # else the spec carries (hugepages, extended devices) stays in the artifact.
@@ -6465,6 +6484,13 @@ _CONFIG_LABELS = {
         "container": "Configured",
         "probe": "Probe settings",
         "requested": "Requested",
+        "storage": "Storage claim",
+        "requested_size": "requested",
+        "bound_size": "bound",
+        "gpu": "Node GPUs",
+        "gpu_free": "free",
+        "gpu_held": "held by scheduled Pods",
+        "gpu_pods": "pods",
         "node": "Node capacity",
         "selector": "nodeSelector",
         "scheduler": "scheduler",
@@ -6474,6 +6500,13 @@ _CONFIG_LABELS = {
         "container": "현재 설정",
         "probe": "프로브 설정",
         "requested": "요청 리소스",
+        "storage": "스토리지 클레임",
+        "requested_size": "요청",
+        "bound_size": "실제 bound",
+        "gpu": "노드 GPU",
+        "gpu_free": "여유",
+        "gpu_held": "기존 Pod 점유",
+        "gpu_pods": "Pod 수",
         "node": "노드 용량",
         "selector": "nodeSelector",
         "scheduler": "scheduler",
@@ -6524,14 +6557,6 @@ def _observed_configuration_lines(
     labels = _CONFIG_LABELS.get(language, _CONFIG_LABELS["en"])
     unset = labels["unset"]
     lines: dict[str, str] = {}
-    # A container that stays not-Ready has no causal container STATE — the kubelet
-    # reports the failure as an Unhealthy Event. So the evidence that a probe
-    # failed and the probe's own settings live in different artifacts; require the
-    # event to be eligible evidence, then read the settings off the identity-
-    # verified Pod spec.
-    if _probe_failure_observed(results, eligible_evidence_ids):
-        if line := _probe_configuration_line(results, labels):
-            lines["kubernetes_probe"] = line
     for result in results:
         for item in result.artifacts:
             if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
@@ -6541,23 +6566,43 @@ def _observed_configuration_lines(
             if kind in lines or kind not in _CONFIGURATION_KINDS:
                 continue
             # Pod-scoped artifacts prove they are about the alert Pod and use the
-            # full bar. A node condition is only ever collected for the alert's own
-            # node, so it carries no identity flag to check — requiring one would
+            # full bar. Node-scoped ones are only ever collected for the alert's own
+            # node, so they carry no identity flag to check — requiring one would
             # silently drop every node-capacity line.
             verified = (
                 _scoped_present(payload)
-                if kind == "kubernetes_node_condition"
+                if kind in _NODE_SCOPED_CONFIGURATION_KINDS
                 else _typed_artifact_is_verified(payload)
             )
             if verified and (line := _configuration_line(kind, payload, labels, unset)):
                 lines[kind] = line
+    # Two failures leave the responsible SETTING in a different artifact from the
+    # evidence, so they are resolved after the eligible walk and never override it:
+    # a not-Ready container has no causal container state (the kubelet reports an
+    # Unhealthy Event), and a Bound claim is not itself blocked when the volume it
+    # points at fails to attach or mount. In both cases the event must be eligible
+    # evidence; the settings are then read off the identity-verified spec.
+    if "kubernetes_probe" not in lines and _probe_failure_observed(
+        results, eligible_evidence_ids
+    ):
+        if line := _probe_configuration_line(results, labels):
+            lines["kubernetes_probe"] = line
+    if "kubernetes_storage_claim" not in lines and _warning_event_observed(
+        results, eligible_evidence_ids, _STORAGE_EVENT_REASONS
+    ):
+        if line := _identity_verified_configuration_line(
+            results, "kubernetes_storage_claim", labels, unset
+        ):
+            lines["kubernetes_storage_claim"] = line
     return [_safe_line(lines[kind], limit=400) for kind in _CONFIGURATION_KINDS if kind in lines]
 
 
-def _probe_failure_observed(
-    results: list[CollectorResult], eligible_evidence_ids: set[str]
+def _warning_event_observed(
+    results: list[CollectorResult],
+    eligible_evidence_ids: set[str],
+    reasons: frozenset[str],
 ) -> bool:
-    """An eligible, target-verified ``Unhealthy`` Warning event for this incident."""
+    """An eligible, target-verified Warning event with one of these exact reasons."""
     for result in results:
         for item in result.artifacts:
             if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
@@ -6570,11 +6615,41 @@ def _probe_failure_observed(
             for event in payload.get("events", []):
                 if (
                     isinstance(event, dict)
-                    and str(event.get("reason") or "") == "Unhealthy"
+                    and str(event.get("reason") or "") in reasons
                     and event.get("target_identity_verified") is True
                 ):
                     return True
     return False
+
+
+def _probe_failure_observed(
+    results: list[CollectorResult], eligible_evidence_ids: set[str]
+) -> bool:
+    return _warning_event_observed(results, eligible_evidence_ids, frozenset({"Unhealthy"}))
+
+
+def _identity_verified_configuration_line(
+    results: list[CollectorResult], kind: str, labels: dict[str, str], unset: str
+) -> str:
+    """Render a config line from an identity-verified artifact of any polarity.
+
+    Used only when a separate eligible event already established the failure: the
+    artifact supplies WHAT the entity is configured with, never THAT it failed.
+    """
+    for result in results:
+        for item in result.artifacts:
+            if getattr(item, "type", "") != kind:
+                continue
+            payload = getattr(item, "result", None)
+            observation = payload.get("observation") if isinstance(payload, dict) else None
+            if not (
+                isinstance(observation, dict)
+                and observation.get("target_identity_verified") is True
+            ):
+                continue
+            if line := _configuration_line(kind, payload, labels, unset):
+                return line
+    return ""
 
 
 def _probe_configuration_line(results: list[CollectorResult], labels: dict[str, str]) -> str:
@@ -6655,6 +6730,46 @@ def _configuration_line(
         if scheduler := str(payload.get("scheduler") or ""):
             parts.append(f"{labels['scheduler']} {scheduler}")
         return f"- {labels['requested']}: " + " · ".join(parts) if parts else ""
+    if kind == "kubernetes_storage_claim":
+        claim = str(payload.get("claim") or "")
+        parts = []
+        if requested := payload.get("requested_storage"):
+            actual = payload.get("actual_storage")
+            # A bound PV can be larger than the request; both numbers matter.
+            parts.append(
+                f"{labels['requested_size']} {requested}"
+                + (f" ({labels['bound_size']} {actual})" if actual and actual != requested else "")
+            )
+        for key, label in (("storage_class", "storageClass"), ("volume_mode", "volumeMode")):
+            if value := payload.get(key):
+                parts.append(f"{label} {value}")
+        if modes := payload.get("access_modes"):
+            parts.append(", ".join(str(mode) for mode in modes))
+        if phase := payload.get("phase"):
+            parts.append(f"phase {phase}")
+        if volume := payload.get("volume_name"):
+            parts.append(f"PV {volume}")
+        if not parts:
+            return ""
+        subject = f"{labels['storage']} ({claim})" if claim else labels["storage"]
+        return f"- {subject}: " + " · ".join(parts)
+    if kind == "kubernetes_node_gpu_resources":
+        # The comparison a pending GPU workload turns on: what the node can give
+        # against what the Pods already on it hold.
+        node = str(payload.get("node") or "")
+        free, allocatable = payload.get("gpu_estimated_free"), payload.get("gpu_allocatable")
+        if free is None or allocatable is None:
+            return ""
+        parts = [
+            f"{labels['gpu_free']} {free}/{allocatable}",
+            f"{labels['gpu_held']} {payload.get('gpu_requested')}",
+        ]
+        if capacity := payload.get("gpu_capacity"):
+            parts.append(f"capacity {capacity}")
+        if pods := payload.get("scheduled_non_terminal_pods"):
+            parts.append(f"{labels['gpu_pods']} {pods}")
+        subject = f"{labels['gpu']} ({node})" if node else labels["gpu"]
+        return f"- {subject}: " + " · ".join(parts)
     if kind == "kubernetes_node_condition":
         pairs = _flat_resource_pairs(payload.get("allocatable"), _NODE_RESOURCE_KEYS)
         node = str(payload.get("node") or "")
