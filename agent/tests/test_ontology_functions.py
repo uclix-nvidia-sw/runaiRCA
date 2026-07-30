@@ -17,6 +17,8 @@ def test_functions_tql_defines_the_expected_functions() -> None:
         "trigger_for_xid",
         "xids_for_gpu_model",
         "root_xids_for",
+        "_root_xid_ancestors",
+        "root_xid_chain_for",
         "causes_for_symptom",
         "dependencies_for_component",
         "diagnostic_steps_for_runbook",

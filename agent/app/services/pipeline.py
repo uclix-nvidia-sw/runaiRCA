@@ -4660,13 +4660,16 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
     rendered_codes = ", ".join(str(code) for code in codes)
     roots = getattr(graph_fixes, "root_xids", None) or {}
     root_status = getattr(graph_fixes, "root_xid_status", {}) or {}
-    chain = "; ".join(
-        dict.fromkeys(
-            f"XID {root} → XID {observed}"
-            for observed, root_list in sorted(roots.items())
-            for root in root_list
-        )
-    )
+    ordered_chains = [
+        " → ".join(f"XID {node}" for node in [*root_list, observed])
+        for observed, root_list in sorted(roots.items())
+        if root_status.get(observed, "ordered") == "ordered"
+    ]
+    unordered = [
+        (observed, root_list)
+        for observed, root_list in sorted(roots.items())
+        if root_status.get(observed) == "complete-but-unordered"
+    ]
     statuses = set(root_status.values())
     if "degraded" in statuses:
         qualification = (
@@ -4674,40 +4677,67 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
             "may not include the root."
         )
         qualification_ko = " 인과 사슬 조회가 쿼리 실패로 불완전합니다."
-    elif "truncated" in statuses:
-        qualification = (
-            " Causal-chain lookup was capped; shown upstream XIDs may not include the root."
-        )
-        qualification_ko = (
-            " 인과 사슬 조회가 제한되어 표시된 뿌리가 "
-            "불완전할 수 있습니다."
-        )
     else:
         qualification = ""
         qualification_ko = ""
-    chain_label = "root → observed" if not qualification else "upstream → observed"
-    chain_label_ko = "뿌리→관측" if not qualification_ko else "상류→관측"
     if language == "ko":
-        if chain:
+        if ordered_chains:
+            if unordered:
+                details = "; ".join(
+                    f"XID {observed}의 상류 장애(완전, 순서 미상): "
+                    + ", ".join(str(root) for root in root_list)
+                    for observed, root_list in unordered
+                )
+                return (
+                    f"- 관련 GPU 오류(XID): {rendered_codes} — "
+                    f"인과 사슬(뿌리→관측): {'; '.join(ordered_chains)}; {details}. "
+                    "근본 원인을 먼저 조치하세요."
+                )
             return (
                 f"- 관련 GPU 오류(XID): {rendered_codes} — "
-                f"인과 사슬({chain_label_ko}): {chain}. "
+                f"인과 사슬(뿌리→관측): {'; '.join(ordered_chains)}. "
                 + (
                     "뿌리 XID를 먼저 조치하세요."
                     if not qualification_ko
                     else qualification_ko.strip()
                 )
             )
+        if unordered:
+            details = "; ".join(
+                f"XID {observed}의 상류 장애(완전, 순서 미상): "
+                + ", ".join(str(root) for root in root_list)
+                for observed, root_list in unordered
+            )
+            return f"- 관련 GPU 오류(XID): {rendered_codes} — {details}. 근본 원인을 먼저 조치하세요."
         return (
             f"- 관련 GPU 오류(XID): {rendered_codes} — "
             "세부 조치는 아래 권장 조치를 참고."
             + qualification_ko
         )
-    if chain:
+    if ordered_chains:
+        if unordered:
+            details = "; ".join(
+                f"upstream faults of {observed} (complete, order unknown): "
+                + ", ".join(str(root) for root in root_list)
+                for observed, root_list in unordered
+            )
+            return (
+                f"- Related GPU errors (XID): {rendered_codes} — causal chain "
+                f"(root → observed): {'; '.join(ordered_chains)}; {details}. "
+                "Fix the origin first."
+            )
         return (
-            f"- Related GPU errors (XID): {rendered_codes} — causal chain ({chain_label}): "
-            f"{chain}." + (" Fix the root XID first." if not qualification else qualification)
+            f"- Related GPU errors (XID): {rendered_codes} — causal chain (root → observed): "
+            f"{'; '.join(ordered_chains)}."
+            + (" Fix the root XID first." if not qualification else qualification)
         )
+    if unordered:
+        details = "; ".join(
+            f"upstream faults of {observed} (complete, order unknown): "
+            + ", ".join(str(root) for root in root_list)
+            for observed, root_list in unordered
+        )
+        return f"- Related GPU errors (XID): {rendered_codes} — {details}. Fix the origin first."
     return (
         f"- Related GPU errors (XID): {rendered_codes} — "
         "see the recommended actions below."
@@ -5525,29 +5555,15 @@ def _numbered_actions(
         root_codes = {
             root
             for observed, roots in graph_fixes.root_xids.items()
-            if graph_fixes.root_xid_status.get(observed, "complete") == "complete"
-            for root in roots
-        }
-        upstream_codes = {
-            root
-            for observed, roots in graph_fixes.root_xids.items()
-            if graph_fixes.root_xid_status.get(observed) != "complete"
+            if graph_fixes.root_xid_status.get(observed, "ordered") == "ordered"
             for root in roots
         }
         # Fix the ROOT of the causal chain before its downstream symptoms.
         for code in sorted(graph_fixes.xid_fixes, key=lambda c: (c not in root_codes, c)):
             if language == "ko":
-                label = (
-                    "근본 XID"
-                    if code in root_codes
-                    else "상류 XID" if code in upstream_codes else "XID"
-                )
+                label = "근본 XID" if code in root_codes else "XID"
             else:
-                label = (
-                    "root XID"
-                    if code in root_codes
-                    else "upstream XID" if code in upstream_codes else "XID"
-                )
+                label = "root XID" if code in root_codes else "XID"
             fixes = [
                 f"({label} {code}) {fix}"
                 for fix in graph_fixes.xid_fixes[code]

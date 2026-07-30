@@ -138,8 +138,10 @@ select $statement, $outcome;
 _FN_FIXES_FOR_XID = "match let $x in fixes_for_xid({code}); select $x;"
 _FN_TRIGGER_FOR_XID = "match let $x in trigger_for_xid({code}); select $x;"
 _FN_XIDS_FOR_GPU_MODEL = 'match let $x in xids_for_gpu_model("{model}"); select $x;'
-# Reverse leads_to: the root fault(s) that escalate INTO an observed XID.
+# Validated one-hop reverse leads_to, used only to order a complete recursive result.
 _FN_ROOT_XIDS_FOR = "match let $x in root_xids_for({code}); select $x;"
+# Transitive reverse leads_to: every fault that escalates INTO an observed XID.
+_FN_ROOT_XID_CHAIN_FOR = "match let $x in root_xid_chain_for({code}); select $x;"
 _FN_CAUSES_FOR_SYMPTOM = 'match let $x in causes_for_symptom("{symptom}"); select $x;'
 _FN_DEPENDENCIES_FOR_COMPONENT = 'match let $x in dependencies_for_component("{component}"); select $x;'
 _FN_CHECKS_FOR_COMPONENT_PATH = 'match let $x, $y in checks_for_component_path("{component}"); select $x, $y;'
@@ -339,12 +341,9 @@ class GraphRemediation:
     xid_fixes: dict[int, list[str]] = field(default_factory=dict)
     xid_triggers: dict[int, str] = field(default_factory=dict)
     model_xids: dict[str, list[int]] = field(default_factory=dict)
-    # observed XID -> root XID(s) that escalate into it, walked TRANSITIVELY back
-    # along the leads_to chain (nearest hop first). E.g. observing 154 with chain
-    # 144 -> 48 -> 154 yields [48, 144]: both the near cause and the true origin.
+    # observed XID -> complete transitive ancestors, in causal order when known.
     root_xids: dict[int, list[int]] = field(default_factory=dict)
-    # observed XID -> complete, truncated by a traversal cap, or degraded by a
-    # failed one-hop query.
+    # observed XID -> ordered, complete-but-unordered, or degraded.
     root_xid_status: dict[int, str] = field(default_factory=dict)
     verified_actions: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -430,17 +429,12 @@ def _query_remediation(
             if triggers:
                 out.xid_triggers[code] = triggers[0]
             # Drill to the ROOT of the leads_to causal chain: which fault(s)
-            # escalate INTO this observed XID. root_xids_for is one hop back, so
-            # we walk it TRANSITIVELY (bounded BFS) — a chain 144 → 48 → 154 must
-            # surface 144 as the origin of 154, not just the intermediate 48.
+            # escalate INTO this observed XID. TypeDB's recursive function returns
+            # the full chain in one query, so a chain 144 → 48 → 154 surfaces both
+            # the intermediate 48 and true origin 144.
             # Surfacing the true root (and its fix) is the ontology's precision
-            # win: fix the origin, not the downstream symptom. root_xids_for is
-            # newer than the validated functions, so a query error must NOT wipe
-            # the fixes above: _root_chain_for isolates per-hop failures.
-            # TypeDB 3.11 rejects a recursive function whose input is also
-            # read from an attribute. Keep the traversal in Python instead:
-            # it is bounded, cycle-safe, and composes the validated one-hop
-            # root_xids_for function without a failed query per XID.
+            # win: fix the origin, not the downstream symptom. A query error must
+            # NOT wipe the fixes above: _root_chain_for isolates that failure.
             roots, root_status = _root_chain_for(run, code)
             out.root_xid_status[code] = root_status
             if roots:
@@ -462,55 +456,51 @@ def _query_remediation(
     return out
 
 
-# Cap the causal walk so a mis-loaded cyclic edge can never spin forever and the
-# root list stays operator-legible. Real XID chains are short (<= a few hops).
-_MAX_CHAIN_NODES = 16
-_MAX_CHAIN_DEPTH = 6
-
-
 def _root_chain_for(run: Any, code: int) -> tuple[list[int], str]:
-    """Transitive ancestors of `code` along leads_to, nearest hop first.
+    """Complete ancestors, causally ordered only when every hop is available."""
+    try:
+        roots = {
+            int(value)
+            for value in _values(run(_FN_ROOT_XID_CHAIN_FOR.format(code=code)))
+            if _is_int(value)
+        }
+    except Exception:  # noqa: BLE001 - best-effort drill-down, never fatal
+        return [], "degraded"
+    roots.discard(code)
+    nodes = roots | {code}
+    try:
+        parents = {
+            node: {
+                int(value)
+                for value in _values(run(_FN_ROOT_XIDS_FOR.format(code=node)))
+                if _is_int(value)
+            }
+            & nodes
+            for node in sorted(nodes)
+        }
+    except Exception:  # noqa: BLE001 - completeness came from recursion
+        return sorted(roots), "complete-but-unordered"
 
-    Repeatedly applies the validated one-hop `root_xids_for` backward from the
-    observed code, accumulating every fault that (directly or indirectly)
-    escalates into it. Cycle-safe (visited set) and bounded (`_MAX_CHAIN_*`).
-    Best-effort: a failed hop is skipped, never fatal. The accompanying status
-    distinguishes a cap from a failed hop so callers do not present either as
-    a complete root chain.
-    """
+    children = {node: [] for node in nodes}
+    for child, direct_parents in parents.items():
+        for parent in direct_parents:
+            children[parent].append(child)
+    for direct_children in children.values():
+        direct_children.sort()
+
     ordered: list[int] = []
-    seen: set[int] = {code}
-    frontier: list[int] = [code]
-    depth = 0
-    status = "complete"
-    while frontier and depth < _MAX_CHAIN_DEPTH and len(ordered) < _MAX_CHAIN_NODES:
-        depth += 1
-        nxt: list[int] = []
-        for cur in frontier:
-            try:
-                rows = run(_FN_ROOT_XIDS_FOR.format(code=cur))
-            except Exception:  # noqa: BLE001 - best-effort drill-down, never fatal
-                status = "degraded"
-                continue
-            for value in _values(rows):
-                if not _is_int(value):
-                    continue
-                root = int(value)
-                if root in seen:
-                    continue
-                seen.add(root)
-                ordered.append(root)
-                nxt.append(root)
-                if len(ordered) >= _MAX_CHAIN_NODES:
-                    if status == "complete":
-                        status = "truncated"
-                    break
-            if len(ordered) >= _MAX_CHAIN_NODES:
-                break
-        frontier = nxt
-    if frontier and depth >= _MAX_CHAIN_DEPTH and status == "complete":
-        status = "truncated"
-    return ordered, status
+    ready = sorted(node for node, direct_parents in parents.items() if not direct_parents)
+    while ready:
+        node = ready.pop(0)
+        ordered.append(node)
+        for child in children[node]:
+            parents[child].remove(node)
+            if not parents[child]:
+                ready.append(child)
+        ready.sort()
+    if len(ordered) != len(nodes):
+        return sorted(roots), "complete-but-unordered"
+    return [node for node in ordered if node != code], "ordered"
 
 
 def _statements(rows: list[dict[str, Any]]) -> list[str]:

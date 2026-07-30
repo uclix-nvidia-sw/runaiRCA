@@ -47,6 +47,27 @@ fun root_xids_for($code: integer) -> { xid_code }:
     $r has xid_code $root;
   return { $root };
 
+# Transitive XID ancestors. The recursive helper takes the xid_error entity,
+# not an xid_code integer read from an attribute: TypeDB 3.11 rejected that
+# recursive input shape in 88e6bad.
+fun _root_xid_ancestors($xid: xid_error) -> { xid_error }:
+  match
+    {
+      (cause_fault: $ancestor, effect_fault: $xid) isa leads_to;
+    } or {
+      (cause_fault: $next, effect_fault: $xid) isa leads_to;
+      let $ancestor in _root_xid_ancestors($next);
+    };
+  return { $ancestor };
+
+fun root_xid_chain_for($code: integer) -> { xid_code }:
+  match
+    $observed isa xid_error, has xid_code $observed_code;
+    $observed_code == $code;
+    let $ancestor in _root_xid_ancestors($observed);
+    $ancestor has xid_code $ancestor_code;
+  return { $ancestor_code };
+
 # Generic family candidates for a normalized current symptom. The agent invokes
 # this once per LIVE matched symptom and aggregates the returned families in
 # Python: TypeDB lists are not available as function arguments yet.

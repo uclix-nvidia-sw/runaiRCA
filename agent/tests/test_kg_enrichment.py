@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from contextlib import contextmanager
 from dataclasses import replace
 
@@ -37,22 +38,23 @@ def _target() -> AnalysisTarget:
     )
 
 
-def test_root_chain_walks_leads_to_transitively() -> None:
-    """Observing XID 154 must surface the true origin 144 (chain 144 -> 48 -> 154),
-    not just the one-hop intermediate 48."""
+def test_root_chain_queries_typeql_recursion() -> None:
+    """The ordering pass restores 144 -> 48 -> 154, not numeric order."""
     import re
 
-    # reverse leads_to graph: effect -> [immediate causes]
     causes = {154: [48], 48: [144], 144: []}
 
     class FakeClient:
         @contextmanager
         def open_reader(self):
             def run(query: str) -> list[dict]:
+                m = re.search(r"root_xid_chain_for\((\d+)\)", query)
+                if m:
+                    assert m.group(1) == "154"
+                    return [{"x": 48}, {"x": 144}]
                 m = re.search(r"root_xids_for\((\d+)\)", query)
                 if m:
-                    code = int(m.group(1))
-                    return [{"x": c} for c in causes.get(code, [])]
+                    return [{"x": root} for root in causes[int(m.group(1))]]
                 if "fixes_for_xid" in query:
                     return [{"x": "reset the GPU"}]
                 return []
@@ -60,39 +62,43 @@ def test_root_chain_walks_leads_to_transitively() -> None:
             yield run
 
     out = _query_remediation(FakeClient(), "", [154], "")  # type: ignore[arg-type]
-    # Transitive ancestors, nearest hop first.
-    assert out.root_xids[154] == [48, 144]
-    assert out.root_xid_status[154] == "complete"
+    # Recursion supplies completeness; one-hop lookups supply only order.
+    assert out.root_xids[154] == [144, 48]
+    assert out.root_xid_status[154] == "ordered"
     # Fixes fetched for each discovered root too.
     assert 48 in out.xid_fixes and 144 in out.xid_fixes
     assert _causal_chain_line(out, "en") == (
         "- Related GPU errors (XID): 48, 144, 154 — causal chain (root → observed): "
-        "XID 48 → XID 154; XID 144 → XID 154. Fix the root XID first."
+        "XID 144 → XID 48 → XID 154. Fix the root XID first."
+    )
+    assert _causal_chain_line(out, "ko") == (
+        "- 관련 GPU 오류(XID): 48, 144, 154 — 인과 사슬(뿌리→관측): "
+        "XID 144 → XID 48 → XID 154. 뿌리 XID를 먼저 조치하세요."
     )
 
 
-def test_root_chain_is_cycle_safe() -> None:
-    import re
-
-    # pathological cycle 45 -> 74 -> 45; must terminate and not repeat.
-    causes = {45: [74], 74: [45]}
-
+def test_root_chain_excludes_observed_cycle_member() -> None:
     class FakeClient:
         @contextmanager
         def open_reader(self):
             def run(query: str) -> list[dict]:
-                m = re.search(r"root_xids_for\((\d+)\)", query)
-                if m:
-                    return [{"x": c} for c in causes.get(int(m.group(1)), [])]
+                if "root_xid_chain_for(45)" in query:
+                    # A TypeDB cycle includes the observed XID in its result set.
+                    return [{"x": 45}, {"x": 74}]
+                if "root_xids_for(45)" in query:
+                    return [{"x": 74}]
+                if "root_xids_for(74)" in query:
+                    return [{"x": 45}]
                 return []
 
             yield run
 
     out = _query_remediation(FakeClient(), "", [45], "")  # type: ignore[arg-type]
-    assert out.root_xids[45] == [74]  # 45 itself excluded, no infinite loop
+    assert out.root_xids[45] == [74]
+    assert out.root_xid_status[45] == "complete-but-unordered"
 
 
-def test_root_chain_hop_failure_is_isolated() -> None:
+def test_root_chain_query_failure_is_isolated() -> None:
     import re
 
     class FakeClient:
@@ -101,7 +107,7 @@ def test_root_chain_hop_failure_is_isolated() -> None:
             def run(query: str) -> list[dict]:
                 if "fixes_for_xid" in query:
                     return [{"x": "reset the GPU"}]
-                if re.search(r"root_xids_for\(\d+\)", query):
+                if re.search(r"root_xid_chain_for\(\d+\)", query):
                     raise RuntimeError("leads_to function missing on this TypeDB build")
                 return []
 
@@ -112,52 +118,90 @@ def test_root_chain_hop_failure_is_isolated() -> None:
     assert out.xid_fixes[79] == ["reset the GPU"]
     assert 79 not in out.root_xids
     assert out.root_xid_status[79] == "degraded"
-    assert "degraded by a query failure" in _causal_chain_line(out, "en")
+    assert _causal_chain_line(out, "en") == (
+        "- Related GPU errors (XID): 79 — see the recommended actions below. "
+        "Causal-chain lookup was degraded by a query failure; shown upstream XIDs "
+        "may not include the root."
+    )
+    assert _causal_chain_line(out, "ko") == (
+        "- 관련 GPU 오류(XID): 79 — 세부 조치는 아래 권장 조치를 참고. "
+        "인과 사슬 조회가 쿼리 실패로 불완전합니다."
+    )
 
 
-def test_root_chain_node_cap_is_reported_as_truncated() -> None:
-    import re
-
+def test_root_chain_branch_is_deterministic_and_contains_each_ancestor_once() -> None:
     class FakeClient:
         @contextmanager
         def open_reader(self):
             def run(query: str) -> list[dict]:
-                match = re.search(r"root_xids_for\((\d+)\)", query)
-                if match:
-                    return [{"x": root} for root in range(2, 19)] if match.group(1) == "1" else []
+                if "root_xid_chain_for(100)" in query:
+                    return [{"x": root} for root in [30, 10, 20]]
+                if "root_xids_for(10)" in query:
+                    return []
+                if "root_xids_for(20)" in query or "root_xids_for(30)" in query:
+                    return [{"x": 10}]
+                if "root_xids_for(100)" in query:
+                    return [{"x": 30}, {"x": 20}]
                 if "fixes_for_xid" in query:
                     return [{"x": "reset the GPU"}]
                 return []
 
             yield run
 
-    out = _query_remediation(FakeClient(), "", [1], "")  # type: ignore[arg-type]
-    assert len(out.root_xids[1]) == 16
-    assert out.root_xid_status[1] == "truncated"
-    assert "capped; shown upstream XIDs may not include the root" in _causal_chain_line(out, "en")
+    out = _query_remediation(FakeClient(), "", [100], "")  # type: ignore[arg-type]
+    assert out.root_xids[100] == [10, 20, 30]
+    assert out.root_xid_status[100] == "ordered"
+    # \b-bounded: a bare substring count would also match "XID 10" inside "XID 100".
+    line = _causal_chain_line(out, "en")
+    assert len(re.findall(r"\bXID 10\b", line)) == 1
+    assert len(re.findall(r"\bXID 20\b", line)) == 1
+    assert len(re.findall(r"\bXID 30\b", line)) == 1
 
 
-def test_root_chain_depth_cap_is_reported_as_truncated() -> None:
-    import re
-
-    causes = {code: [code + 1] for code in range(1, 8)}
-
+def test_root_chain_ordering_failure_keeps_the_complete_unordered_set() -> None:
     class FakeClient:
         @contextmanager
         def open_reader(self):
             def run(query: str) -> list[dict]:
-                match = re.search(r"root_xids_for\((\d+)\)", query)
-                if match:
-                    return [{"x": root} for root in causes.get(int(match.group(1)), [])]
+                if "root_xid_chain_for(154)" in query:
+                    return [{"x": 48}, {"x": 144}]
+                if "root_xids_for" in query:
+                    raise RuntimeError("one-hop ordering unavailable")
                 if "fixes_for_xid" in query:
                     return [{"x": "reset the GPU"}]
                 return []
 
             yield run
 
+    out = _query_remediation(FakeClient(), "", [154], "")  # type: ignore[arg-type]
+    assert out.root_xids[154] == [48, 144]
+    assert out.root_xid_status[154] == "complete-but-unordered"
+    assert _causal_chain_line(out, "en") == (
+        "- Related GPU errors (XID): 48, 144, 154 — "
+        "upstream faults of 154 (complete, order unknown): 48, 144. Fix the origin first."
+    )
+    assert _causal_chain_line(out, "ko") == (
+        "- 관련 GPU 오류(XID): 48, 144, 154 — "
+        "XID 154의 상류 장애(완전, 순서 미상): 48, 144. 근본 원인을 먼저 조치하세요."
+    )
+
+
+def test_root_chain_keeps_twenty_recursive_ancestors() -> None:
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "root_xid_chain_for(1)" in query:
+                    return [{"x": root} for root in range(21, 1, -1)]
+                if "root_xids_for" in query:
+                    return []
+                return []
+
+            yield run
+
     out = _query_remediation(FakeClient(), "", [1], "")  # type: ignore[arg-type]
-    assert out.root_xids[1] == [2, 3, 4, 5, 6, 7]
-    assert out.root_xid_status[1] == "truncated"
+    assert out.root_xids[1] == list(range(2, 22))
+    assert out.root_xid_status[1] == "ordered"
 
 
 def test_query_remediation_projects_xid_trigger_and_renders_guidance() -> None:
