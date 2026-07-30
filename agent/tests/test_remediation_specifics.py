@@ -574,6 +574,43 @@ def test_quota_line_needs_an_unschedulable_observation() -> None:
     assert "프로젝트 quota" in "\n".join(pipeline._observed_configuration_lines([both], ids, "ko"))
 
 
+def test_unknown_scheduling_reason_still_yields_the_artifact(caplog) -> None:
+    """Run:ai's scheduler writes reasons kube-scheduler never does.
+
+    An allowlist used to drop the whole artifact for those, taking the requests,
+    quota and nodeSelector lines with it.
+    """
+    pod = {
+        "metadata": {"name": "w-0", "namespace": "runai-test1"},
+        "spec": {
+            "schedulerName": "runai-scheduler-default",
+            "containers": [{"name": "main", "resources": {"requests": {"nvidia.com/gpu": "4"}}}],
+        },
+        "status": {
+            "conditions": [
+                {
+                    "type": "PodScheduled",
+                    "status": "False",
+                    "reason": "BindingError",
+                    "message": "failed to bind pod runai-test1/w-0 to node dgx01",
+                }
+            ]
+        },
+    }
+    target = resolve_target({"namespace": "runai-test1", "pod": "w-0"}, {})
+
+    with caplog.at_level("WARNING"):
+        item = _pod_scheduling_artifact("kubernetes", make_settings(), target, pod)
+
+    assert item is not None
+    assert item.result["condition"]["reason"] == "bindingerror"
+    # Reported verbatim, and the absence of a family mapping is diagnosable.
+    assert "unmapped PodScheduled=False reason" in caplog.text
+    line = "\n".join(_configuration(item))
+    assert "nvidia.com/gpu 4" in line
+    assert "scheduler runai-scheduler-default" in line
+
+
 def test_node_pressure_reports_the_capacity_it_ran_out_of() -> None:
     target = resolve_target({"node": "dgx-01"}, {})
     items = _node_condition_artifacts(

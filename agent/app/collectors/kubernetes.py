@@ -3827,6 +3827,12 @@ def _pod_lifecycle_artifact(
     )
 
 
+# kube-scheduler's own PodScheduled=False reasons. The set is NOT a filter — a
+# Pod that is not scheduled is never benign, whoever wrote the reason — it only
+# marks which reasons this agent already understands. Run:ai's KAI scheduler adds
+# its own (the binder reports a post-placement bind failure this way), and an
+# allowlist silently dropped the whole artifact for those: no requests, no quota,
+# no nodeSelector, nothing. Unknown reasons are reported verbatim and logged.
 _POD_SCHEDULING_REASONS = frozenset({"unschedulable", "schedulinggated"})
 
 
@@ -3861,10 +3867,19 @@ def _pod_scheduling_artifact(
         if _boolean_condition_status(condition.get("status")) is not False:
             continue
         reason = str(condition.get("reason") or "").strip().casefold()
-        if reason in _POD_SCHEDULING_REASONS:
-            scheduling_reason = reason
-            scheduling_message = str(condition.get("message") or "")
-            break
+        if not reason:
+            continue
+        if reason not in _POD_SCHEDULING_REASONS:
+            _log.warning(
+                "unmapped PodScheduled=False reason %r on pod %s/%s; reported verbatim "
+                "without a family promotion",
+                reason,
+                target.namespace,
+                target.pod,
+            )
+        scheduling_reason = reason
+        scheduling_message = str(condition.get("message") or "")
+        break
     if not scheduling_reason:
         return None
 
