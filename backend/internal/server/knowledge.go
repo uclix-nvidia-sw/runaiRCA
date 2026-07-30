@@ -573,6 +573,18 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 	}
 	evidenceSource := ""
 	minimumSourceGroups := 2
+	if operatorConfirmed {
+		// Some truths are only ever witnessed by one source group: a container
+		// OOMKill exists in the kubernetes API and nowhere else, so a two-group
+		// floor eliminates those cases permanently — before a reviewer can even
+		// look at them. The operator-confirm path is the human override for
+		// exactly that, and it is not cheap: known/compositional case type,
+		// expected family == snapshot family, resolved/mitigated outcome, the
+		// review's own quality gate, and a written rationale. Canonical
+		// polarity/coverage/window checks, the no-contradiction veto and the
+		// linked-probe floor below still apply unchanged.
+		minimumSourceGroups = 1
+	}
 	if ledgerErr != "" {
 		var ok bool
 		hypothesis, support, contradiction, ok = harnessClaimHypothesis(snapshot, harness, trace)
@@ -794,6 +806,9 @@ func canonicalSupportingEvidenceError(trace map[string]any, support map[string]b
 		sourceGroups[sourceGroup] = true
 	}
 	if minSourceGroups > 0 && len(sourceGroups) < minSourceGroups {
+		if minSourceGroups == 1 {
+			return "supporting evidence requires at least one source group"
+		}
 		return "supporting evidence requires at least two source groups"
 	}
 	return ""

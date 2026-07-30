@@ -1382,3 +1382,30 @@ func TestHarnessClaimLinksUnboundProbesThroughClaimEvidence(t *testing.T) {
 		t.Fatalf("unbound probe must link via claim evidence and foreign-bound probe must not, got %v", ids)
 	}
 }
+
+// A container OOMKill is witnessed by the kubernetes API and nowhere else, so
+// the two-source-group floor used to eliminate such cases permanently, before a
+// reviewer could look at them. Operator confirmation lowers that floor to one.
+func TestOperatorConfirmedAllowsSingleSourceGroupSupport(t *testing.T) {
+	snapshot := cloneCaseSnapshot(eligibleKnowledgeSnapshot())
+	knowledgeTraceForTest(&snapshot)["evidence"].([]any)[1].(map[string]any)["source_group"] = knowledgeTraceForTest(&snapshot)["evidence"].([]any)[0].(map[string]any)["source_group"]
+
+	if candidate := knowledgeCandidateForSnapshotWithOutcome(&snapshot, true, false); candidate == nil || candidate.Status != knowledgeCandidateValidationFailed || candidate.ValidationError != "supporting evidence requires at least two source groups" {
+		t.Fatalf("unconfirmed single-source support must still fail closed, got %+v", candidate)
+	}
+	if candidate := knowledgeCandidateForSnapshotWithOutcome(&snapshot, true, true); candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("operator-confirmed single-source support must reach review, got %+v", candidate)
+	}
+
+	// The floors operator confirmation does not touch.
+	contradicted := cloneCaseSnapshot(&snapshot)
+	knowledgeTraceForTest(&contradicted)["hypotheses"].([]any)[0].(map[string]any)["evidence_against"] = []any{"E-1"}
+	if candidate := knowledgeCandidateForSnapshotWithOutcome(&contradicted, true, true); candidate == nil || candidate.Status != knowledgeCandidateValidationFailed {
+		t.Fatalf("contradicting evidence must veto even when confirmed, got %+v", candidate)
+	}
+	noWindow := cloneCaseSnapshot(&snapshot)
+	knowledgeTraceForTest(&noWindow)["evidence"].([]any)[0].(map[string]any)["observation_window"].(map[string]any)["end"] = ""
+	if candidate := knowledgeCandidateForSnapshotWithOutcome(&noWindow, true, true); candidate == nil || candidate.Status != knowledgeCandidateValidationFailed {
+		t.Fatalf("canonical window check must veto even when confirmed, got %+v", candidate)
+	}
+}
