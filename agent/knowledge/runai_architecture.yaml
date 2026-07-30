@@ -141,6 +141,15 @@
   depends_on: [runai-scheduler-default, runai-container-toolkit]
   checks:
     - "kubectl logs -n runai deploy/binder --tail=200"
+    # Verified on a live 2.26 cluster: for a fractional (shared-GPU) workload the
+    # binder creates a reservation Pod named gpu-reservation-<hash> in its own
+    # reservation namespace, NOT in the workload's namespace, and wires the slice
+    # through a <workload>-<hash>-shared-gpu ConfigMap. A fraction pod stuck in
+    # ContainerCreating therefore has its blocker outside the namespace an
+    # operator would look in. The cross-namespace grep needs no namespace name,
+    # so it keeps working if that namespace is configured differently.
+    - "kubectl get pods -A | grep gpu-reservation   # fraction-GPU slice holder; must be Running"
+    - "kubectl get cm -n <workload-ns> | grep shared-gpu   # slice wiring for a fraction workload"
 
 - component: workload-controller
   layer: cluster

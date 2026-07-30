@@ -5273,6 +5273,9 @@ _RUNAI_ALLOCATION_ANNOTATIONS: dict[str, str] = {
     # all — its slice lives only here and in Run:ai's own device plugin.
     "gpu-fraction": "gpu_fraction",
     "gpu-fraction-num-devices": "gpu_fraction_devices",
+    # Names the ConfigMap that wires the slice; the reservation Pod holding it
+    # lives in another namespace entirely.
+    "runai/shared-gpu-configmap": "shared_gpu_configmap",
     "runai-pending-pods": "pending_pods",
     "runai-running-pods": "running_pods",
     "runai-calculated-status": "runai_status",

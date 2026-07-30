@@ -69,7 +69,16 @@
 - family: runai_scheduling_quota
   symptoms:
     - name: Preempted By Higher Priority
-      keywords: ["preempted by higher priority", "preemption victim", preemptor]
+      # The last two are KAI's own completion log ("Successfully preempted for
+      # job …, preempted tasks …"), which proves preemption HAPPENED. Its search
+      # diagnostics ("Attempting to preempt") are deliberately not keywords: an
+      # attempt is not an outcome.
+      keywords:
+        - "preempted by higher priority"
+        - "preemption victim"
+        - preemptor
+        - "successfully preempted for job"
+        - "preempted tasks"
       actions:
         - "This is expected Run:ai behavior: a higher-priority workload took the resources. Check which workload preempted this one and its project's priority."
         - "If this workload must not be preempted, run it within-quota (guaranteed) instead of over-quota, or raise its project's deserved quota."
@@ -87,7 +96,18 @@
     # Ref: run-ai-docs.nvidia.com/self-hosted/platform-management/runai-scheduler/scheduling/concepts-and-principles
     - name: Reclaimed To Rebalance Fairshare
       component: runai-scheduler-default
-      keywords: [reclaim, reclaimed, reclaiming, fairshare, "fair share", "another project could use"]
+      # The last two are KAI's own completion log ("Reclaimed resources for job
+      # …, evicting reclaimee tasks"), which names the victim list and proves the
+      # reclaim committed rather than merely being considered.
+      keywords:
+        - reclaim
+        - reclaimed
+        - reclaiming
+        - fairshare
+        - "fair share"
+        - "another project could use"
+        - "reclaimed resources for job"
+        - "evicting reclaimee tasks"
       actions:
         - "The Run:ai scheduler reclaimed this workload's OVER-QUOTA GPUs to return them to a project that deserves them (deserved quota) or to rebalance fairshare across projects/departments. This inter-project reclaim is distinct from priority preemption and is expected Run:ai elasticity, not a fault. Read the Run:ai scheduler logs: `kubectl logs -n runai deploy/runai-scheduler-default` and grep the workload/project name for the reclaim decision."
         - "To keep GPUs stable, run the workload WITHIN the project's deserved (guaranteed, non-reclaimable) quota instead of over-quota."
@@ -99,6 +119,42 @@
         - "Run:ai gang-schedules by pod-group: a multi-pod workload is either FULLY scheduled or FULLY pending, so a single unplaceable pod keeps the whole group Pending. Read the runai-scheduler-default logs plus the pod-group-controller / pod-grouper pods in the runai namespace for why the group could not gang."
         - "Verify the SUM of the group's pod requests fits one node pool's free + reclaimable capacity, and that topology/affinity/GPU-fraction constraints are not fragmenting placement."
         - "For distributed (leader/worker) workloads, confirm all sub-groups can be placed together."
+    # KAI's preemption path refuses to evict anyone for an incoming NON-preemptible
+    # job whose own placement would exceed its queue. Distinct from ordinary
+    # over-quota contention: no victim exists to preempt, so waiting cannot help.
+    - name: Non-Preemptible Request Exceeds Queue Quota
+      name_ko: Non-preemptible 요청의 queue quota 초과
+      component: runai-scheduler-default
+      keywords: ["would have placed the queue resources over quota"]
+      reason: "The scheduler refused to preempt for an incoming non-preemptible request because placing it would itself exceed the queue's resources."
+      reason_ko: "incoming non-preemptible 요청을 배치하면 queue resource를 초과하므로, 스케줄러가 이를 위한 preemption을 거부한 상태입니다."
+      actions:
+        - "Compare the workload's request with its Queue's gpu quota, limit, allocated, allocatedNonPreemptible and requested status; the scheduler log names the queue it rejected the placement for."
+        - "Confirm whether the workload is submitted as non-preemptible before touching priority — a non-preemptible request cannot be served from borrowed capacity, so preemption and retries will not clear it."
+        - "Either reduce the request to fit the queue's deserved quota, or raise that project's quota; use a preemptible/over-quota submission only when the workload can tolerate reclaim."
+      actions_ko:
+        - "워크로드 요청량을 해당 Queue의 gpu quota, limit, allocated, allocatedNonPreemptible, requested status와 비교하세요. 스케줄러 로그에 배치를 거부한 queue 이름이 남습니다."
+        - "priority를 건드리기 전에 워크로드가 non-preemptible로 제출됐는지 확인하세요. non-preemptible 요청은 빌린 용량으로 채울 수 없어 preemption이나 재시도로는 해소되지 않습니다."
+        - "요청량을 해당 queue의 deserved quota 안으로 줄이거나 프로젝트 quota를 올리세요. reclaim을 감당할 수 있는 워크로드만 preemptible/over-quota로 제출하세요."
+    # Consolidation moves RUNNING workloads to defragment the cluster for another
+    # job. The victim looks like an unexplained restart, and node pressure is the
+    # usual misdiagnosis, so it needs its own signature.
+    - name: Consolidation Reallocated Running Workloads
+      name_ko: Consolidation에 의한 실행 중 워크로드 재배치
+      component: runai-scheduler-default
+      # Upstream KAI misspells "Successfully" in this log line; keywords are
+      # literal substrings, so the typo is reproduced deliberately.
+      keywords: ["sucesfully consolidated for job", "about to reallocate victims"]
+      reason: "The scheduler consolidated the cluster for another job and selected running workloads to relocate, so the disruption is a placement decision rather than a node or workload fault."
+      reason_ko: "스케줄러가 다른 job을 위해 클러스터를 consolidation하면서 실행 중인 워크로드를 재배치 대상으로 선택했습니다. 즉 노드나 워크로드 결함이 아니라 배치 결정에 의한 중단입니다."
+      actions:
+        - "Take the requesting job and the victim list from the scheduler log, then line the victims up against the restart times of `<workload>` — a consolidation victim looks exactly like an unexplained restart."
+        - "Review the scheduler's consolidation settings (enablement, maximum preemptees, preemption delay) before changing `<workload>` itself."
+        - "For disruption-sensitive workloads, submit them non-preemptible or within deserved quota instead of diagnosing this as node pressure."
+      actions_ko:
+        - "스케줄러 로그에서 요청 job과 victim 목록을 확보한 뒤 `<workload>`의 재시작 시각과 맞춰보세요. consolidation victim은 원인 불명의 재시작과 똑같이 보입니다."
+        - "`<workload>` 자체를 바꾸기 전에 스케줄러의 consolidation 설정(활성화 여부, 최대 preemptee 수, preemption delay)을 확인하세요."
+        - "중단에 민감한 워크로드는 이를 node pressure로 진단하지 말고 non-preemptible 또는 deserved quota 안으로 제출하세요."
     - name: Node Defragmentation
       keywords: [defragment, defragmentation]
       actions:
@@ -123,11 +179,24 @@
         - "decision에 preempted가 있으면 피해 workload와 선점 workload의 project/queue, priority, requested·deserved·over-quota GPU를 비교하세요. 정책 결정이 확인되기 전에는 우선순위를 올리지 마세요."
         - "reclaim·fairshare·over-quota가 보이면 workload request와 project의 deserved quota 및 over-quota 사용량을 비교하세요. 안정적인 GPU가 필요한 workload는 재시도로 reclaim을 가리지 말고 deserved quota 안으로 옮기세요."
     - name: Bind Failed After Scheduling Decision
+      name_ko: 스케줄링 결정 후 bind 실패
       component: binder
-      keywords: ["failed to bind", "bind error", "binding rejected"]
+      # `bindingerror` is the Pod-condition reason KAI's binder writes (verified in
+      # KAI source, not yet seen on a live cluster); the phrase keywords cover its
+      # log/event message. A bind failure is NOT a capacity decision, so this
+      # symptom's actions replace quota/capacity guidance rather than joining it.
+      keywords: ["failed to bind", "bind error", "binding rejected", bindingerror]
+      reason: "A placement was already decided, so the wait is in the hand-off to the node, not in scheduling capacity or project quota."
+      reason_ko: "배치는 이미 결정된 상태이므로, 대기 원인은 스케줄링 용량이나 프로젝트 quota가 아니라 노드로의 인계 단계에 있습니다."
+      exclusive_actions: true
       actions:
-        - "The scheduler DECIDED a placement but the pod never landed on the node — that hand-off is the binder's job (GPU-fraction reservations included): `kubectl logs -n runai deploy/binder --tail=200`."
-        - "For GPU-fraction workloads also check the node's runai-container-toolkit daemonset pod — a broken toolkit on one node fails bindings only there."
+        - "The scheduler DECIDED a placement but the pod never landed on the node — that hand-off is the binder's job (GPU-fraction reservations included). Read the binder logs and the BindRequest for `<pod>`: its status.reason carries the binding error, and `PodScheduled=False` may carry the same reason."
+        - "For a GPU-fraction workload the slice is held by a SEPARATE reservation Pod in Run:ai's reservation namespace, not in `<ns>`, so `kubectl get pods -n <ns>` cannot show the blocker. Find it with `kubectl get pods -A | grep gpu-reservation` and confirm it is Running; the workload's slice is described by its `runai/shared-gpu-configmap`."
+        - "Also check the runai-container-toolkit daemonset pod on `<node>` — a broken toolkit on one node fails bindings only there."
+      actions_ko:
+        - "스케줄러는 배치를 결정했지만 Pod이 노드에 올라가지 못한 상태입니다. 이 인계는 binder의 역할이며(GPU-fraction reservation 포함) binder 로그와 `<pod>`의 BindRequest를 확인하세요. BindRequest의 status.reason에 binding 오류가 담기고, `PodScheduled=False`에도 같은 reason이 실릴 수 있습니다."
+        - "GPU-fraction 워크로드는 GPU 조각을 `<ns>`가 아닌 Run:ai reservation namespace의 **별도 reservation Pod**이 점유합니다. 따라서 `kubectl get pods -n <ns>`로는 원인이 보이지 않습니다. `kubectl get pods -A | grep gpu-reservation`으로 찾아 Running인지 확인하고, 해당 워크로드의 조각 정보는 `runai/shared-gpu-configmap` annotation이 가리키는 configmap에 있습니다."
+        - "`<node>`의 runai-container-toolkit daemonset pod도 확인하세요. 특정 노드의 toolkit이 깨지면 그 노드에서만 binding이 실패합니다."
     # --- added from k8s troubleshooting research (learnk8s flowchart, k8s docs, CNCF) ---
 
 - family: node_kubelet_pressure
