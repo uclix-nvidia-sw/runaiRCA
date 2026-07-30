@@ -1,12 +1,9 @@
 import {
-  Activity,
-  AlertTriangle,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
   Clipboard,
-  ListChecks,
 } from 'lucide-react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
@@ -42,20 +39,16 @@ export function ColumnFilter<T extends string>({
   );
 }
 
-function metricIconFor(label: string) {
+function metricToneFor(label: string) {
   const normalized = label.toLowerCase();
-  if (normalized.includes('resolved')) return CheckCircle2;
-  if (normalized.includes('analyzing')) return Activity;
-  if (normalized.includes('total') || normalized.includes('groups')) return ListChecks;
-  if (normalized.includes('open') || normalized.includes('firing')) return AlertTriangle;
-  return Activity;
+  if (normalized.includes('resolved') || normalized.includes('ready')) return 'is-positive';
+  if (normalized.includes('analyzing') || normalized.includes('active')) return 'is-active';
+  return '';
 }
 
 export function Metric({ label, value }: { label: string; value: string | number }) {
-  const Icon = metricIconFor(label);
   return (
-    <div className="metric">
-      <span className="metric-icon" aria-hidden="true"><Icon size={17} /></span>
+    <div className={`metric ${metricToneFor(label)}`}>
       <span className="metric-copy">
         <strong>{value}</strong>
         <span>{label}</span>

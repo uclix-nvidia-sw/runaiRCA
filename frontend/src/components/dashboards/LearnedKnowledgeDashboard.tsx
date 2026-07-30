@@ -1,4 +1,4 @@
-import { CheckCircle2, FileSearch, PackageCheck, RotateCcw, ShieldCheck, XCircle } from 'lucide-react';
+import { CheckCircle2, FileSearch, ListChecks, PackageCheck, Pencil, RotateCcw, ShieldCheck, Tag, XCircle, Zap } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import {
@@ -177,8 +177,7 @@ export function LearnedKnowledgeDashboard({ query, refreshKey }: { query: string
         <section className="knowledge-panel candidate-list-panel">
           <div className="knowledge-panel-head">
             <div>
-              <p className="eyebrow">Candidate queue</p>
-              <h3>Review candidates</h3>
+              <h3>Candidates</h3>
             </div>
             <div className="knowledge-filters">
               <label className="knowledge-filter">
@@ -367,16 +366,38 @@ export function CandidateDetail({
       </div>
       <div className="knowledge-detail-content">
         <p className="knowledge-summary">{candidate.summary || 'No candidate summary was reported.'}</p>
-        <dl className="knowledge-provenance">
-          <div><dt>Root cause family</dt><dd><code>{candidate.root_cause_family || 'unclassified'}</code></dd></div>
-          <div><dt>Cause (mechanism)</dt><dd>{mechanism || 'not reported'}</dd></div>
-          <div>
-            <dt>Observed symptoms</dt>
-            <dd>{observedKeywords.length > 0 ? observedKeywords.join(' · ') : 'not reported'}</dd>
+        <dl className="knowledge-causal-chain">
+          <div className="knowledge-causal-step">
+            <span className="knowledge-causal-icon" aria-hidden="true"><Tag size={15} /></span>
+            <div>
+              <dt>Root cause family</dt>
+              <dd><code>{candidate.root_cause_family || 'unclassified'}</code></dd>
+            </div>
           </div>
-          <div>
-            <dt>Confirmed actions</dt>
-            <dd>
+          <div className="knowledge-causal-step">
+            <span className="knowledge-causal-icon" aria-hidden="true"><Zap size={15} /></span>
+            <div>
+              <dt>Cause (mechanism)</dt>
+              <dd>{mechanism || 'not reported'}</dd>
+            </div>
+          </div>
+          <div className="knowledge-causal-step">
+            <span className="knowledge-causal-icon" aria-hidden="true"><ListChecks size={15} /></span>
+            <div>
+              <dt>Observed symptoms</dt>
+              <dd>{observedKeywords.length > 0 ? observedKeywords.join(' · ') : 'not reported'}</dd>
+              <small className="knowledge-causal-substep">
+                {diagnosticSteps.length > 0
+                  ? `Confirmed via ${diagnosticSteps.map((step) => [step.label, step.tool, step.verdict].filter(Boolean).join(' · ')).join(', ')}`
+                  : 'none linked — promoted on the harness root-cause claim without a probe run'}
+              </small>
+            </div>
+          </div>
+          <div className="knowledge-causal-step knowledge-causal-step-action">
+            <span className="knowledge-causal-icon" aria-hidden="true"><CheckCircle2 size={15} /></span>
+            <div>
+              <dt>Confirmed actions</dt>
+              <dd>
               {editingActions ? (
                 <span className="knowledge-action-editor">
                   <textarea
@@ -408,14 +429,14 @@ export function CandidateDetail({
                     : 'none recorded — add the effective action in the evaluation review'}
                   {canReview && onEditActions && (
                     <button
-                      className="ghost-button knowledge-action-edit"
+                      className="knowledge-action-edit"
                       type="button"
                       onClick={() => {
                         setDraftActions(confirmedActions.join('\n'));
                         setEditingActions(true);
                       }}
                     >
-                      Edit
+                      <Pencil size={12} /> Edit
                     </button>
                   )}
                 </>
@@ -423,22 +444,20 @@ export function CandidateDetail({
               {rawActions.length > 0 && rawActions.join('\u0000') !== confirmedActions.join('\u0000') && (
                 <small className="knowledge-raw-actions">Operator&apos;s original: {rawActions.join(' · ')}</small>
               )}
-            </dd>
+              </dd>
+            </div>
           </div>
-          <div>
-            <dt>Diagnostic steps</dt>
-            <dd>{diagnosticSteps.length > 0
-              ? diagnosticSteps.map((step) => [step.label, step.tool, step.verdict].filter(Boolean).join(' · ')).join(', ')
-              : 'none linked — promoted on the harness root-cause claim without a probe run'}</dd>
-          </div>
-          <div><dt>Incident</dt><dd>{candidate.incident_id || 'not reported'}</dd></div>
-          <div><dt>Observed</dt><dd>{candidate.created_at ? formatTime(candidate.created_at) : 'not reported'}</dd></div>
-          {candidate.decided_at && <div><dt>Decided</dt><dd>{formatTime(candidate.decided_at)}</dd></div>}
-          {candidate.decided_by && <div><dt>Decided by</dt><dd>{candidate.decided_by}</dd></div>}
-          {provenance.map(([key, value]) => (
-            <div key={key}><dt>{labelFor(key)}</dt><dd>{value}</dd></div>
-          ))}
         </dl>
+
+        <div className="knowledge-meta-line">
+          <span>Incident {candidate.incident_id || 'not reported'}</span>
+          <span>Observed {candidate.created_at ? formatTime(candidate.created_at) : 'not reported'}</span>
+          {candidate.decided_at && <span>Decided {formatTime(candidate.decided_at)}</span>}
+          {candidate.decided_by && <span>by {candidate.decided_by}</span>}
+          {provenance.map(([key, value]) => (
+            <span key={key}>{labelFor(key)} {String(value)}</span>
+          ))}
+        </div>
 
         {candidate.validation_error && <p className="knowledge-validation-error">Validation: {candidate.validation_error}</p>}
 
