@@ -96,10 +96,15 @@ def test_attempt_only_logs_are_not_signatures(modes: dict[str, list[dict]]) -> N
 def test_new_symptoms_stay_bilingual_and_in_the_closed_family_set(
     modes: dict[str, list[dict]],
 ) -> None:
+    # All five KAI signatures, including the three that landed on entries which
+    # already existed: extending their keywords makes them fire more often, so an
+    # English-only remedy would now reach more Korean reports than before.
     added = {
         "Non-Preemptible Request Exceeds Queue Quota",
         "Consolidation Reallocated Running Workloads",
         "Bind Failed After Scheduling Decision",
+        "Preempted By Higher Priority",
+        "Reclaimed To Rebalance Fairshare",
     }
     found = {
         str(symptom.get("symptom") or symptom.get("name")): family
