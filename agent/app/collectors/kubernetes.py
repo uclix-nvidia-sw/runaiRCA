@@ -3896,6 +3896,14 @@ def _pod_scheduling_artifact(
             "pod": observed_target.pod,
             "namespace": observed_target.namespace,
             "resources": pod_summary.get("resources") or {},
+            # Run:ai's scheduler accounting for the same Pod: a workload can be
+            # unschedulable because the cluster is full OR because its own
+            # project/gang accounting says it may not run yet.
+            **(
+                {"runai_allocation": pod_summary["runai_allocation"]}
+                if pod_summary.get("runai_allocation")
+                else {}
+            ),
             **({"node_selector": node_selector} if node_selector else {}),
             **(
                 {"scheduler": str(spec.get("schedulerName"))}
@@ -5110,6 +5118,39 @@ def _event_message_mentions_target(message: str, target: AnalysisTarget) -> bool
     return False
 
 
+# The Run:ai scheduler writes its own accounting onto every workload Pod it
+# admits. This is the request-vs-allocated comparison a pending GPU workload
+# turns on, and it needs no Run:ai API: the base collector already reads the Pod.
+# Closed vocabulary, keys observed on a live 2.26 cluster — an unknown key is
+# ignored rather than guessed at.
+_RUNAI_ALLOCATION_ANNOTATIONS: dict[str, str] = {
+    "runai-current-requested-gpus": "requested_gpus",
+    "runai-current-allocated-gpus": "allocated_gpus",
+    "runai-podgroup-requested-gpus": "podgroup_requested_gpus",
+    "runai-total-requested-gpus": "total_requested_gpus",
+    "runai-current-allocated-gpus-memory": "allocated_gpu_memory",
+    "runai-pending-pods": "pending_pods",
+    "runai-running-pods": "running_pods",
+    "runai-calculated-status": "runai_status",
+    # "Regular" on an in-quota workload; the scheduler distinguishes borrowed
+    # capacity here, so it is reported verbatim rather than interpreted.
+    "received-resource-type": "resource_type",
+    "runai-used-nodes": "used_nodes",
+    "pod-group-name": "pod_group",
+}
+
+
+def _runai_allocation(annotations: object) -> dict[str, str]:
+    """Run:ai's own scheduling accounting, as written on the Pod."""
+    if not isinstance(annotations, dict):
+        return {}
+    return {
+        field: str(annotations[key]).strip()
+        for key, field in _RUNAI_ALLOCATION_ANNOTATIONS.items()
+        if str(annotations.get(key) or "").strip()
+    }
+
+
 def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
     metadata = pod.get("metadata") if isinstance(pod.get("metadata"), dict) else {}
     status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
@@ -5146,6 +5187,11 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
         "containerStatuses": compact(containers, limit=5),
         "resources": resources,
         **({"probes": probes} if probes else {}),
+        **(
+            {"runai_allocation": allocation}
+            if (allocation := _runai_allocation(metadata.get("annotations")))
+            else {}
+        ),
         **({"reason": status["reason"]} if status.get("reason") else {}),
         **({"message": status["message"]} if status.get("message") else {}),
     }

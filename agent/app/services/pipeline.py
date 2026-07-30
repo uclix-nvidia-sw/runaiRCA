@@ -66,9 +66,11 @@ from app.services.planner import plan_investigation
 from app.services.query_memory import QueryMemory
 from app.services.remediation import (
     fill_placeholders,
+    format_memory,
     image_repository,
     image_typo_hint,
     memory_sizing_action,
+    parse_memory,
 )
 from app.services.root_cause_ranking import (
     FAMILIES,
@@ -6296,11 +6298,14 @@ def _scheduling_detail(messages: list[str], language: str) -> str:
                 else "Specifically, a nodeSelector/affinity mismatch prevents scheduling."
             ) + verdict
         if match := re.search(r"Insufficient (\S+)", message, re.IGNORECASE):
+            # The scheduler ends the sentence right after the resource name, and
+            # `nvidia.com/gpu` has internal dots — strip only trailing punctuation.
+            resource = match.group(1).rstrip(".,;")
             return (
-                f"구체적으로는 스케줄 가능한 노드의 {match.group(1)} 리소스가 부족합니다."
+                f"구체적으로는 스케줄 가능한 노드의 {resource} 리소스가 부족합니다."
                 if language == "ko"
                 else (
-                    f"Specifically, schedulable nodes have insufficient {match.group(1)} resources."
+                    f"Specifically, schedulable nodes have insufficient {resource} resources."
                 )
             ) + verdict
         if re.search(r"untolerated taint", message, re.IGNORECASE):
@@ -6494,6 +6499,11 @@ _CONFIG_LABELS = {
         "node": "Node capacity",
         "selector": "nodeSelector",
         "scheduler": "scheduler",
+        "runai_gpus": "Run:ai GPUs allocated/requested",
+        "runai_gang": "pod group requests",
+        "runai_pods": "gang",
+        "runai_type": "resource type",
+        "runai_state": "Run:ai status",
         "unset": "unset",
     },
     "ko": {
@@ -6510,9 +6520,34 @@ _CONFIG_LABELS = {
         "node": "노드 용량",
         "selector": "nodeSelector",
         "scheduler": "scheduler",
+        "runai_gpus": "Run:ai GPU 할당/요청",
+        "runai_gang": "pod group 요청",
+        "runai_pods": "gang",
+        "runai_type": "리소스 유형",
+        "runai_state": "Run:ai 상태",
         "unset": "미설정",
     },
 }
+
+
+_BYTE_RESOURCE_KEYS = frozenset({"memory", "ephemeral-storage"})
+
+
+def _resource_display(key: str, value: object) -> str:
+    """Show `memory: 419430400` as 400Mi — a real spec writes plain bytes.
+
+    Only when the unit form is EXACT: ``format_memory`` rounds up for anything
+    that is not a whole binary unit, and a report must not restate a limit as a
+    number the spec does not contain.
+    """
+    text = str(value)
+    if key not in _BYTE_RESOURCE_KEYS or not text.isdigit():
+        return text
+    size = parse_memory(text)
+    if size is None:
+        return text
+    formatted = format_memory(size)
+    return formatted if parse_memory(formatted) == size else text
 
 
 def _resource_pairs(resources: object, keys: tuple[str, ...], unset: str) -> list[str]:
@@ -6526,8 +6561,10 @@ def _resource_pairs(resources: object, keys: tuple[str, ...], unset: str) -> lis
         limit, request = limits.get(key), requests.get(key)
         if not limit and not request:
             continue
-        sides = [f"limit {limit}" if limit else f"limit {unset}"]
-        sides.append(f"request {request}" if request else f"request {unset}")
+        sides = [f"limit {_resource_display(key, limit)}" if limit else f"limit {unset}"]
+        sides.append(
+            f"request {_resource_display(key, request)}" if request else f"request {unset}"
+        )
         pairs.append(f"{key} " + " / ".join(sides))
     return pairs
 
@@ -6536,7 +6573,42 @@ def _flat_resource_pairs(resources: object, keys: tuple[str, ...]) -> list[str]:
     """``memory 128Gi`` for a single-sided mapping (node allocatable, requests)."""
     if not isinstance(resources, dict):
         return []
-    return [f"{key} {resources[key]}" for key in keys if resources.get(key)]
+    return [
+        f"{key} {_resource_display(key, resources[key])}" for key in keys if resources.get(key)
+    ]
+
+
+def _runai_allocation_parts(allocation: object, labels: dict[str, str]) -> list[str]:
+    """Run:ai's own accounting: what it asked the scheduler for, what it got.
+
+    ``allocated < requested`` is the pending workload's answer, and it is a
+    DIFFERENT limit from node capacity — a project can be at its quota while GPUs
+    sit free. Values are printed verbatim; the scheduler's vocabulary for the
+    resource type is its own.
+    """
+    if not isinstance(allocation, dict) or not allocation:
+        return []
+    parts: list[str] = []
+    requested = str(allocation.get("requested_gpus") or "")
+    allocated = str(allocation.get("allocated_gpus") or "")
+    if requested or allocated:
+        parts.append(
+            f"{labels['runai_gpus']} {allocated or '?'}/{requested or '?'}"
+        )
+    gang = str(allocation.get("podgroup_requested_gpus") or "")
+    if gang and gang != requested:
+        parts.append(f"{labels['runai_gang']} {gang}")
+    pending, running = (
+        str(allocation.get("pending_pods") or ""),
+        str(allocation.get("running_pods") or ""),
+    )
+    # A gang that is partly up is the classic Run:ai pending shape.
+    if pending and pending != "0":
+        parts.append(f"{labels['runai_pods']} {running or '0'} running / {pending} pending")
+    for key, label in (("resource_type", "runai_type"), ("runai_status", "runai_state")):
+        if value := str(allocation.get(key) or ""):
+            parts.append(f"{labels[label]} {value}")
+    return parts
 
 
 def _observed_configuration_lines(
@@ -6729,6 +6801,7 @@ def _configuration_line(
             parts.append(f"{labels['selector']} {rendered}")
         if scheduler := str(payload.get("scheduler") or ""):
             parts.append(f"{labels['scheduler']} {scheduler}")
+        parts.extend(_runai_allocation_parts(payload.get("runai_allocation"), labels))
         return f"- {labels['requested']}: " + " · ".join(parts) if parts else ""
     if kind == "kubernetes_storage_claim":
         claim = str(payload.get("claim") or "")

@@ -109,11 +109,32 @@ def fill_placeholders(text: str, facts: dict[str, str]) -> str:
     return text
 
 
+# `kubectl set resources` only understands the built-in controllers. A Run:ai or
+# Grove workload Pod is owned by a CRD (TrainingWorkload, PodClique, RunaiJob),
+# where the same command fails — those need the CR's own pod template edited.
+_SET_RESOURCES_KINDS = frozenset(
+    {
+        "cronjob",
+        "daemonset",
+        "deployment",
+        "job",
+        "replicaset",
+        "replicationcontroller",
+        "statefulset",
+    }
+)
+
+
 def _set_resources_command(facts: dict[str, str], limit: str, request: str) -> str:
+    """The command when kubectl can do it; otherwise the field path to edit."""
     namespace = str(facts.get("namespace") or "").strip()
     kind = str(facts.get("workload_kind") or "").strip().lower()
     workload = str(facts.get("workload") or "").strip()
     container = str(facts.get("container") or "").strip()
+    if kind and kind not in _SET_RESOURCES_KINDS:
+        scope = f"{kind}/{workload}" if workload else kind
+        target = f"-n {namespace} {scope}" if namespace else scope
+        return f"kubectl edit {target}  # raise the memory on its pod template"
     scope = f"{kind}/{workload}" if kind and workload else "<kind>/<workload>"
     parts = ["kubectl"]
     if namespace:
@@ -143,24 +164,37 @@ def memory_sizing_action(facts: dict[str, str], language: str) -> str:
     request_text = str(facts.get("memory_request") or "")
     container = str(facts.get("container") or "").strip()
     command = _set_resources_command(facts, new_limit, new_request)
+    # A container whose request already equals its limit needs no request change;
+    # "400Mi → 400Mi" reads like an instruction and is none.
+    request_unchanged = parse_memory(request_text) == current_limit
     if language == "ko":
         target = f"컨테이너 `{container}`의 " if container else ""
-        current = (
-            f"`resources.limits.memory` {limit_text} → {new_limit}(초과한 상한의 2배), "
-            f"`resources.requests.memory` "
+        request_clause = (
+            f"`resources.requests.memory`는 {new_request} 유지"
+            if request_unchanged
+            else "`resources.requests.memory` "
             + (f"{request_text} → " if request_text else "미설정 → ")
             + f"{new_request}(OOM 시점에 실제로 사용한 양)"
+        )
+        current = (
+            f"`resources.limits.memory` {limit_text} → {new_limit}(초과한 상한의 2배), "
+            + request_clause
         )
         return (
             f"{target}메모리를 증설하세요: {current}. 실행: `{command}` "
             "(Run:ai 워크로드는 submit/CR spec의 메모리 값을 수정)."
         )
     target = f"container `{container}`" if container else "the container"
-    current = (
-        f"`resources.limits.memory` {limit_text} → {new_limit} (2x the ceiling it hit) and "
-        f"`resources.requests.memory` "
+    request_clause = (
+        f"`resources.requests.memory` stays at {new_request}"
+        if request_unchanged
+        else "`resources.requests.memory` "
         + (f"{request_text} → " if request_text else "unset → ")
         + f"{new_request} (what it actually used when it was killed)"
+    )
+    current = (
+        f"`resources.limits.memory` {limit_text} → {new_limit} (2x the ceiling it hit) and "
+        + request_clause
     )
     return (
         f"Raise memory for {target}: {current}. Run: `{command}` "

@@ -10,6 +10,7 @@ from app.collectors.kubernetes import (
     _container_diagnostics,
     _node_condition_artifacts,
     _pod_scheduling_artifact,
+    _runai_allocation,
 )
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
@@ -275,6 +276,131 @@ def test_unschedulable_pod_reports_what_it_asked_for() -> None:
     # Run:ai's scheduler is its own subsystem — naming it routes the investigation.
     assert "scheduler runai-scheduler-default" in line
     assert "요청 리소스" in "\n".join(_configuration(item, "ko"))
+
+
+# Verbatim from a live Run:ai 2.26 cluster (super-agg-ingress-0-vllmworker,
+# a Grove PodClique-owned vLLM worker): the scheduler's own accounting.
+_LIVE_RUNAI_ANNOTATIONS = {
+    "pod-group-name": "pg-super-agg-ingress-0-vllmworker-j6f2l-49b17049",
+    "received-resource-type": "Regular",
+    "runai-allocated-gpu-memory": "343597",
+    "runai-allocated-gpus": "4",
+    "runai-calculated-status": "Running",
+    "runai-current-allocated-gpus": "4",
+    "runai-current-allocated-gpus-memory": "343597",
+    "runai-current-requested-gpus": "4",
+    "runai-pending-pods": "0",
+    "runai-podgroup-requested-gpus": "4",
+    "runai-running-pods": "1",
+    "runai-total-requested-gpus": "4",
+    "runai-used-nodes": "dgx01",
+    "cni.projectcalico.org/podIP": "10.33.94.191/32",
+}
+
+
+def test_runai_allocation_is_read_off_the_pod_annotations() -> None:
+    """Request-vs-allocated needs no Run:ai API — the scheduler writes it here."""
+    from app.collectors.kubernetes import _pod_summary
+
+    allocation = _runai_allocation(_LIVE_RUNAI_ANNOTATIONS)
+    assert allocation["requested_gpus"] == "4"
+    assert allocation["allocated_gpus"] == "4"
+    assert allocation["resource_type"] == "Regular"
+    assert allocation["pending_pods"] == "0"
+    # Unknown keys are ignored, never guessed at.
+    assert "cni.projectcalico.org/podIP" not in allocation.values()
+
+    summary = _pod_summary(
+        {
+            "metadata": {"name": "w-0", "annotations": _LIVE_RUNAI_ANNOTATIONS},
+            "spec": {"containers": []},
+            "status": {},
+        }
+    )
+    assert summary["runai_allocation"]["allocated_gpus"] == "4"
+    # No annotations at all -> the key is absent, not an empty dict.
+    assert "runai_allocation" not in _pod_summary(
+        {"metadata": {"name": "w-0"}, "spec": {}, "status": {}}
+    )
+
+
+def test_pending_gang_reports_allocated_against_requested() -> None:
+    """The shape that answers "why is it pending": granted less than it asked."""
+    pending = {
+        **_LIVE_RUNAI_ANNOTATIONS,
+        "runai-current-allocated-gpus": "0",
+        "runai-pending-pods": "2",
+        "runai-running-pods": "1",
+        "runai-podgroup-requested-gpus": "12",
+        "runai-calculated-status": "Pending",
+    }
+    scheduling = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_scheduling",
+        status="ok",
+        confidence="high",
+        summary="scheduling",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "target_identity_verified": True,
+            },
+            "resources": {"main": {"requests": {"nvidia.com/gpu": "4"}}},
+            "runai_allocation": _runai_allocation(pending),
+            "scheduler": "runai-scheduler-default",
+            "condition": {"reason": "Unschedulable", "message": "0/3 nodes are available"},
+        },
+    )
+
+    line = "\n".join(_configuration(scheduling))
+    assert "Run:ai GPUs allocated/requested 0/4" in line
+    assert "pod group requests 12" in line  # gang wants more than this Pod
+    assert "gang 1 running / 2 pending" in line
+    assert "resource type Regular" in line
+    assert "Run:ai status Pending" in line
+    assert "Run:ai GPU 할당/요청 0/4" in "\n".join(_configuration(scheduling, "ko"))
+
+
+def test_set_resources_command_only_for_kinds_kubectl_can_patch() -> None:
+    """A Grove/Run:ai Pod is CRD-owned; `kubectl set resources` fails on it."""
+    facts = {
+        "oom": "true",
+        "container": "main",
+        "memory_limit": "512Mi",
+        "namespace": "runai-test1",
+        "workload": "trainer",
+    }
+
+    builtin = memory_sizing_action({**facts, "workload_kind": "Deployment"}, "en")
+    assert "kubectl -n runai-test1 set resources deployment/trainer" in builtin
+
+    crd = memory_sizing_action({**facts, "workload_kind": "PodClique"}, "en")
+    assert "set resources" not in crd  # the command kubectl would reject
+    assert "kubectl edit -n runai-test1 podclique/trainer" in crd
+    assert "512Mi → 1Gi" in crd  # the numbers still stand
+
+
+def test_memory_request_in_raw_bytes_is_understood() -> None:
+    """A live cluster wrote `memory: 419430400` — bytes, not a Mi suffix."""
+    assert parse_memory("419430400") == 419430400
+    assert format_memory(419430400) == "400Mi"
+    # Displayed in the unit form only when it is exact.
+    assert pipeline._resource_display("memory", "419430400") == "400Mi"
+    assert pipeline._resource_display("memory", "1500000000") == "1500000000"
+    assert pipeline._resource_display("cpu", "400") == "400"
+
+
+def test_request_already_at_the_limit_is_not_told_to_change() -> None:
+    action = memory_sizing_action(
+        {"oom": "true", "container": "main", "memory_limit": "400Mi", "memory_request": "400Mi"},
+        "en",
+    )
+
+    assert "400Mi → 800Mi" in action
+    assert "stays at 400Mi" in action
+    assert "400Mi → 400Mi" not in action
 
 
 def test_node_pressure_reports_the_capacity_it_ran_out_of() -> None:
