@@ -3850,6 +3850,10 @@ def _pod_scheduling_artifact(
         return None
 
     observed_target = resolved_pod_anchor or target
+    # What the Pod ASKED FOR is the other half of "no node could take it": the
+    # scheduler's message names the shortage, these name the demand that hit it.
+    spec = pod_object.get("spec") if isinstance(pod_object.get("spec"), dict) else {}
+    node_selector = spec.get("nodeSelector") if isinstance(spec.get("nodeSelector"), dict) else {}
     return artifact(
         agent=agent,
         source="kubernetes",
@@ -3879,6 +3883,13 @@ def _pod_scheduling_artifact(
             },
             "pod": observed_target.pod,
             "namespace": observed_target.namespace,
+            "resources": pod_summary.get("resources") or {},
+            **({"node_selector": node_selector} if node_selector else {}),
+            **(
+                {"scheduler": str(spec.get("schedulerName"))}
+                if spec.get("schedulerName")
+                else {}
+            ),
             "condition": {
                 "type": "PodScheduled",
                 "status": "False",
@@ -4244,6 +4255,8 @@ def _container_diagnostics(pod_summary: dict[str, object] | None) -> list[dict[s
     # layers read, so a fact absent here can never reach the operator.
     spec_resources = pod_summary.get("resources")
     spec_resources = spec_resources if isinstance(spec_resources, dict) else {}
+    spec_probes = pod_summary.get("probes")
+    spec_probes = spec_probes if isinstance(spec_probes, dict) else {}
     diagnostics: list[dict[str, object]] = []
     for item in statuses:
         if not isinstance(item, dict):
@@ -4251,6 +4264,7 @@ def _container_diagnostics(pod_summary: dict[str, object] | None) -> list[dict[s
         state = item.get("state") if isinstance(item.get("state"), dict) else {}
         last_state = item.get("lastState") if isinstance(item.get("lastState"), dict) else {}
         resources = spec_resources.get(str(item.get("name") or ""))
+        probes = spec_probes.get(str(item.get("name") or ""))
         diagnostics.append(
             {
                 "name": item.get("name"),
@@ -4263,6 +4277,7 @@ def _container_diagnostics(pod_summary: dict[str, object] | None) -> list[dict[s
                 else None,
                 **({"image": item["image"]} if item.get("image") else {}),
                 **({"resources": resources} if isinstance(resources, dict) and resources else {}),
+                **({"probes": probes} if isinstance(probes, dict) and probes else {}),
             }
         )
     return diagnostics
@@ -4990,9 +5005,14 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
     # Per-container limits/requests — the `kubectl describe` fact an operator
     # reaches for first on a memory/CPU-limit alert.
     resources: dict[str, object] = {}
+    # Probe settings sit next to the resources for the same reason: a container
+    # that stays not-Ready is failing a probe whose thresholds are the fix.
+    probes: dict[str, object] = {}
     for container in spec.get("containers", []) if isinstance(spec.get("containers"), list) else []:
         if isinstance(container, dict) and isinstance(container.get("name"), str):
             resources[container["name"]] = container.get("resources") or {}
+            if probe_summary := _probe_summary(container):
+                probes[container["name"]] = probe_summary
     conditions = [
         condition for condition in status.get("conditions", []) if isinstance(condition, dict)
     ]
@@ -5012,9 +5032,54 @@ def _pod_summary(pod: dict[str, object]) -> dict[str, object]:
         "conditions": compact(conditions, limit=5),
         "containerStatuses": compact(containers, limit=5),
         "resources": resources,
+        **({"probes": probes} if probes else {}),
         **({"reason": status["reason"]} if status.get("reason") else {}),
         **({"message": status["message"]} if status.get("message") else {}),
     }
+
+
+_PROBE_TIMING_FIELDS = (
+    "initialDelaySeconds",
+    "periodSeconds",
+    "timeoutSeconds",
+    "failureThreshold",
+    "successThreshold",
+)
+
+
+def _probe_summary(container: dict[str, object]) -> dict[str, object]:
+    """Handler + thresholds for each configured probe, dropping k8s defaults."""
+    summary: dict[str, object] = {}
+    for kind in ("livenessProbe", "readinessProbe", "startupProbe"):
+        probe = container.get(kind)
+        if not isinstance(probe, dict):
+            continue
+        entry: dict[str, object] = {
+            field: probe[field] for field in _PROBE_TIMING_FIELDS if probe.get(field) is not None
+        }
+        if handler := _probe_handler(probe):
+            entry["handler"] = handler
+        if entry:
+            summary[kind.removesuffix("Probe")] = entry
+    return summary
+
+
+def _probe_handler(probe: dict[str, object]) -> str:
+    """``httpGet /healthz:8080`` — what the kubelet actually calls."""
+    http = probe.get("httpGet")
+    if isinstance(http, dict):
+        scheme = str(http.get("scheme") or "HTTP").lower()
+        return f"{scheme}GET {http.get('path') or '/'}:{http.get('port')}"
+    tcp = probe.get("tcpSocket")
+    if isinstance(tcp, dict):
+        return f"tcpSocket {tcp.get('port')}"
+    grpc = probe.get("grpc")
+    if isinstance(grpc, dict):
+        return f"grpc {grpc.get('port')}"
+    command = probe.get("exec")
+    if isinstance(command, dict) and isinstance(command.get("command"), list):
+        return "exec " + " ".join(str(part) for part in command["command"][:4])
+    return ""
 
 
 def _condition_is_failure(condition: dict[str, object]) -> bool:
@@ -5805,6 +5870,10 @@ def _node_condition_artifacts(
                         "node": node,
                         "condition": condition_type,
                         "status": raw_status or "Unknown",
+                        # "kubelet has disk pressure" says nothing about how much
+                        # the node had to begin with; the capacity it is measured
+                        # against belongs with the condition.
+                        "allocatable": data.get("allocatable") or {},
                         "timestamp_provenance": timestamps,
                         "matched_incident_timestamps": matched_timestamps,
                         "observation": observation,

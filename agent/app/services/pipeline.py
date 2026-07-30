@@ -4398,6 +4398,9 @@ def _detail_from(
         facets = _facets_line(root_cause_candidates[0], language)
         if facets:
             lines.append(facets)
+    # What the failing entity was configured with — the limit that was exceeded,
+    # the request no node could satisfy, the capacity a node ran out of.
+    lines.extend(_observed_configuration_lines(results, eligible_support_ids, language))
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
     lines.extend(
@@ -5975,7 +5978,7 @@ def _reason_specific_detail(
             reason, observations = deeper[0], [deeper]
         else:
             exit_code = next((item[2] for item in terminated if item[2] is not None), None)
-            return _restart_loop_detail(exit_code, language)
+            return _restart_loop_detail(exit_code, _observed_restarts(terminated), language)
     if reason == "CreateContainerConfigError":
         detail = _config_error_detail([item[1] for item in observations], language)
         return detail or _config_error_generic(language)
@@ -6103,13 +6106,20 @@ def _typed_last_terminated_observations(
     return found
 
 
-def _typed_artifact_is_verified(payload: object) -> bool:
+def _scoped_present(payload: object) -> bool:
+    """A typed observation that actually happened inside the incident window."""
     observation = payload.get("observation") if isinstance(payload, dict) else None
     return bool(
         isinstance(observation, dict)
         and observation.get("polarity") == "present"
         and observation.get("coverage") == "scoped"
-        and observation.get("target_identity_verified") is True
+    )
+
+
+def _typed_artifact_is_verified(payload: object) -> bool:
+    observation = payload.get("observation") if isinstance(payload, dict) else None
+    return _scoped_present(payload) and bool(
+        isinstance(observation, dict) and observation.get("target_identity_verified") is True
     )
 
 
@@ -6200,8 +6210,27 @@ def _container_create_detail(messages: list[str], language: str) -> str:
     )
 
 
-def _restart_loop_detail(exit_code: object | None, language: str) -> str:
-    suffix = f" (exit {exit_code})" if exit_code is not None else ""
+def _observed_restarts(
+    observations: list[tuple[str, str, object | None, dict[str, Any]]],
+) -> int | None:
+    """Kubernetes' own restart counter for the target container."""
+    for _, _, _, source in observations:
+        container = source.get("container", {})
+        if isinstance(container, dict) and isinstance(container.get("restartCount"), int):
+            return int(container["restartCount"])
+    return None
+
+
+def _restart_loop_detail(
+    exit_code: object | None, restarts: int | None = None, language: str = "en"
+) -> str:
+    """"Restarting" without the counter reads the same at 2 restarts and at 400."""
+    facts = []
+    if exit_code is not None:
+        facts.append(f"exit {exit_code}")
+    if restarts:
+        facts.append(f"{restarts}회 재시작" if language == "ko" else f"{restarts} restarts")
+    suffix = f" ({', '.join(facts)})" if facts else ""
     return (
         f"컨테이너가 반복 재시작 중입니다{suffix}."
         if language == "ko"
@@ -6256,12 +6285,16 @@ def _memory_sizing(
 
 def _scheduling_detail(messages: list[str], language: str) -> str:
     for message in messages:
+        # One canned sentence per pattern loses the rest of the scheduler's own
+        # per-node tally ("2 Insufficient gpu, 3 didn't match affinity"), which is
+        # the whole breakdown an operator needs. Quote the verdict alongside it.
+        verdict = _scheduler_verdict(message, language)
         if "didn't match Pod's node affinity/selector" in message:
             return (
                 "구체적으로는 Pod의 nodeSelector/affinity 불일치로 스케줄링할 수 없습니다."
                 if language == "ko"
                 else "Specifically, a nodeSelector/affinity mismatch prevents scheduling."
-            )
+            ) + verdict
         if match := re.search(r"Insufficient (\S+)", message, re.IGNORECASE):
             return (
                 f"구체적으로는 스케줄 가능한 노드의 {match.group(1)} 리소스가 부족합니다."
@@ -6269,7 +6302,7 @@ def _scheduling_detail(messages: list[str], language: str) -> str:
                 else (
                     f"Specifically, schedulable nodes have insufficient {match.group(1)} resources."
                 )
-            )
+            ) + verdict
         if re.search(r"untolerated taint", message, re.IGNORECASE):
             return (
                 "구체적으로는 Pod가 노드 taint를 tolerate하지 않아 스케줄링할 수 없습니다."
@@ -6278,8 +6311,24 @@ def _scheduling_detail(messages: list[str], language: str) -> str:
                     "Specifically, the Pod does not tolerate a node taint, so it cannot be "
                     "scheduled."
                 )
-            )
+            ) + verdict
     return ""
+
+
+_SCHEDULER_VERDICT = re.compile(r"\d+/\d+ nodes are available", re.IGNORECASE)
+
+
+def _scheduler_verdict(message: str, language: str) -> str:
+    """The scheduler's verbatim node tally, bounded — machine text, not a guess.
+
+    Quoted whole rather than cut at the first period: resource names carry dots
+    ("2 Insufficient nvidia.com/gpu"), and the tail of the tally is the part that
+    lists every OTHER reason nodes were rejected.
+    """
+    if not _SCHEDULER_VERDICT.search(message or ""):
+        return ""
+    verdict = _short_sentence(message, limit=220)
+    return f" (스케줄러: {verdict})" if language == "ko" else f" (scheduler: {verdict})"
 
 
 def _scheduling_error_generic(language: str) -> str:
@@ -6397,6 +6446,223 @@ def _facets_line(top: RankedCause, language: str) -> str:
         return ""
     label = "분류(Facets)" if ko else "Facets"
     return f"- {label}: " + " · ".join(parts)
+
+
+# Typed artifacts that carry the configuration of the entity they type, in the
+# order the report reads: the container, then the Pod's demand, then the node.
+_CONFIGURATION_KINDS = (
+    "kubernetes_container_lifecycle",
+    "kubernetes_probe",
+    "kubernetes_pod_scheduling",
+    "kubernetes_node_condition",
+)
+# Resource keys worth printing, in the order an operator reads them. Anything
+# else the spec carries (hugepages, extended devices) stays in the artifact.
+_CONTAINER_RESOURCE_KEYS = ("memory", "cpu", "nvidia.com/gpu", "ephemeral-storage")
+_NODE_RESOURCE_KEYS = ("memory", "cpu", "ephemeral-storage", "pods", "nvidia.com/gpu")
+_CONFIG_LABELS = {
+    "en": {
+        "container": "Configured",
+        "probe": "Probe settings",
+        "requested": "Requested",
+        "node": "Node capacity",
+        "selector": "nodeSelector",
+        "scheduler": "scheduler",
+        "unset": "unset",
+    },
+    "ko": {
+        "container": "현재 설정",
+        "probe": "프로브 설정",
+        "requested": "요청 리소스",
+        "node": "노드 용량",
+        "selector": "nodeSelector",
+        "scheduler": "scheduler",
+        "unset": "미설정",
+    },
+}
+
+
+def _resource_pairs(resources: object, keys: tuple[str, ...], unset: str) -> list[str]:
+    """``memory limit 512Mi / request 256Mi`` for every key the spec actually sets."""
+    if not isinstance(resources, dict):
+        return []
+    limits = resources.get("limits") if isinstance(resources.get("limits"), dict) else {}
+    requests = resources.get("requests") if isinstance(resources.get("requests"), dict) else {}
+    pairs: list[str] = []
+    for key in keys:
+        limit, request = limits.get(key), requests.get(key)
+        if not limit and not request:
+            continue
+        sides = [f"limit {limit}" if limit else f"limit {unset}"]
+        sides.append(f"request {request}" if request else f"request {unset}")
+        pairs.append(f"{key} " + " / ".join(sides))
+    return pairs
+
+
+def _flat_resource_pairs(resources: object, keys: tuple[str, ...]) -> list[str]:
+    """``memory 128Gi`` for a single-sided mapping (node allocatable, requests)."""
+    if not isinstance(resources, dict):
+        return []
+    return [f"{key} {resources[key]}" for key in keys if resources.get(key)]
+
+
+def _observed_configuration_lines(
+    results: list[CollectorResult],
+    eligible_evidence_ids: set[str] | None,
+    language: str,
+) -> list[str]:
+    """The problem entity's own settings, from the typed artifacts that named it.
+
+    Every mechanism sentence answers WHAT failed; an operator's next question is
+    always what the thing was configured with — the limit that was exceeded, the
+    request no node could satisfy, the capacity a node ran out of.  Each typed
+    artifact carries the configuration of the entity it types, so this walks the
+    same eligible, target-verified evidence and needs no per-family table.
+    """
+    if not eligible_evidence_ids:
+        return []
+    labels = _CONFIG_LABELS.get(language, _CONFIG_LABELS["en"])
+    unset = labels["unset"]
+    lines: dict[str, str] = {}
+    # A container that stays not-Ready has no causal container STATE — the kubelet
+    # reports the failure as an Unhealthy Event. So the evidence that a probe
+    # failed and the probe's own settings live in different artifacts; require the
+    # event to be eligible evidence, then read the settings off the identity-
+    # verified Pod spec.
+    if _probe_failure_observed(results, eligible_evidence_ids):
+        if line := _probe_configuration_line(results, labels):
+            lines["kubernetes_probe"] = line
+    for result in results:
+        for item in result.artifacts:
+            if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
+                continue
+            kind = getattr(item, "type", "")
+            payload = getattr(item, "result", None)
+            if kind in lines or kind not in _CONFIGURATION_KINDS:
+                continue
+            # Pod-scoped artifacts prove they are about the alert Pod and use the
+            # full bar. A node condition is only ever collected for the alert's own
+            # node, so it carries no identity flag to check — requiring one would
+            # silently drop every node-capacity line.
+            verified = (
+                _scoped_present(payload)
+                if kind == "kubernetes_node_condition"
+                else _typed_artifact_is_verified(payload)
+            )
+            if verified and (line := _configuration_line(kind, payload, labels, unset)):
+                lines[kind] = line
+    return [_safe_line(lines[kind], limit=400) for kind in _CONFIGURATION_KINDS if kind in lines]
+
+
+def _probe_failure_observed(
+    results: list[CollectorResult], eligible_evidence_ids: set[str]
+) -> bool:
+    """An eligible, target-verified ``Unhealthy`` Warning event for this incident."""
+    for result in results:
+        for item in result.artifacts:
+            if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
+                continue
+            if getattr(item, "type", "") != "kubernetes_warning_events":
+                continue
+            payload = getattr(item, "result", None)
+            if not _typed_artifact_is_verified(payload):
+                continue
+            for event in payload.get("events", []):
+                if (
+                    isinstance(event, dict)
+                    and str(event.get("reason") or "") == "Unhealthy"
+                    and event.get("target_identity_verified") is True
+                ):
+                    return True
+    return False
+
+
+def _probe_configuration_line(results: list[CollectorResult], labels: dict[str, str]) -> str:
+    """Probe handler and thresholds from the identity-verified target Pod spec."""
+    for result in results:
+        for item in result.artifacts:
+            if getattr(item, "type", "") != "kubernetes_container_lifecycle":
+                continue
+            payload = getattr(item, "result", None)
+            observation = payload.get("observation") if isinstance(payload, dict) else None
+            if not (
+                isinstance(observation, dict)
+                and observation.get("target_identity_verified") is True
+            ):
+                continue
+            for container in payload.get("containers", []):
+                probes = container.get("probes") if isinstance(container, dict) else None
+                if not isinstance(probes, dict) or not probes:
+                    continue
+                rendered = [
+                    f"{kind} " + _probe_text(settings)
+                    for kind, settings in probes.items()
+                    if isinstance(settings, dict)
+                ]
+                name = str(container.get("name") or "")
+                subject = f"{labels['probe']} ({name})" if name else labels["probe"]
+                return f"- {subject}: " + " · ".join(rendered)
+    return ""
+
+
+def _probe_text(settings: dict[str, Any]) -> str:
+    handler = str(settings.get("handler") or "")
+    timings = ", ".join(
+        f"{_PROBE_LABELS[field]} {settings[field]}" + ("s" if field.endswith("Seconds") else "")
+        for field in _PROBE_LABELS
+        if settings.get(field) is not None
+    )
+    return f"{handler} ({timings})" if handler and timings else handler or timings
+
+
+# Kubernetes' own field names, shortened but not renamed — an operator has to
+# find these keys in the spec to change them.
+_PROBE_LABELS = {
+    "initialDelaySeconds": "delay",
+    "periodSeconds": "period",
+    "timeoutSeconds": "timeout",
+    "failureThreshold": "failures",
+    "successThreshold": "successes",
+}
+
+
+def _configuration_line(
+    kind: str, payload: dict[str, Any], labels: dict[str, str], unset: str
+) -> str:
+    if kind == "kubernetes_container_lifecycle":
+        for container in payload.get("containers", []):
+            if not isinstance(container, dict):
+                continue
+            pairs = _resource_pairs(container.get("resources"), _CONTAINER_RESOURCE_KEYS, unset)
+            if image := str(container.get("image") or ""):
+                pairs.append(f"image {image}")
+            if pairs:
+                name = str(container.get("name") or "")
+                subject = f"{labels['container']} ({name})" if name else labels["container"]
+                return f"- {subject}: " + " · ".join(pairs)
+        return ""
+    if kind == "kubernetes_pod_scheduling":
+        resources = payload.get("resources")
+        parts: list[str] = []
+        for name, spec in (resources or {}).items() if isinstance(resources, dict) else ():
+            requested = spec.get("requests") if isinstance(spec, dict) else None
+            if pairs := _flat_resource_pairs(requested, _CONTAINER_RESOURCE_KEYS):
+                parts.append(f"{name}: " + ", ".join(pairs))
+        selector = payload.get("node_selector")
+        if isinstance(selector, dict) and selector:
+            rendered = ", ".join(f"{key}={value}" for key, value in sorted(selector.items()))
+            parts.append(f"{labels['selector']} {rendered}")
+        if scheduler := str(payload.get("scheduler") or ""):
+            parts.append(f"{labels['scheduler']} {scheduler}")
+        return f"- {labels['requested']}: " + " · ".join(parts) if parts else ""
+    if kind == "kubernetes_node_condition":
+        pairs = _flat_resource_pairs(payload.get("allocatable"), _NODE_RESOURCE_KEYS)
+        node = str(payload.get("node") or "")
+        if not pairs:
+            return ""
+        subject = f"{labels['node']} ({node})" if node else labels["node"]
+        return f"- {subject}: " + ", ".join(pairs)
+    return ""
 
 
 def _as_sentence(text: str) -> str:
