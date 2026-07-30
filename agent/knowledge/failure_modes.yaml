@@ -808,9 +808,11 @@
       reason_ko: "Pod의 컨테이너 이미지를 노드의 kubelet이 레지스트리에서 받아오지 못해 ImagePullBackOff가 반복되고 있습니다. 상태명만으로는 repository·tag·인증·network 중 어느 원인인지 확정할 수 없습니다."
       actions:
         - "Read the exact pull error and image reference from `kubectl describe pod <pod> -n <namespace>` before choosing a repository, tag, authentication, TLS, DNS, or rate-limit fix."
+        - "Confirm the reference is real before chasing auth or network: `crane manifest <image:tag>` (or `skopeo inspect docker://<image:tag>`). A missing repository or tag means `spec.containers[].image` is wrong — check it for typos and letter case; `crane ls <repo>` lists the tags that do exist."
         - "Use the returned registry error to select one discriminating check; ImagePullBackOff is a retry state, not the root cause by itself."
       actions_ko:
         - "원인별 조치를 선택하기 전에 `kubectl describe pod <pod> -n <namespace>`에서 정확한 pull 오류와 image reference를 확인하세요."
+        - "인증·network를 의심하기 전에 이미지가 실제로 존재하는지 확인하세요: `crane manifest <image:tag>` 또는 `skopeo inspect docker://<image:tag>`. repository나 tag가 없다면 `spec.containers[].image`의 오타·대소문자를 확인하고, `crane ls <repo>`로 실제 존재하는 tag를 확인하세요."
         - "반환된 registry 오류에 따라 repository·tag·인증·TLS·DNS·rate-limit 중 하나를 판별하세요. ImagePullBackOff는 근본 원인이 아니라 재시도 상태입니다."
     - name: Bad Image Tag — Manifest For Tag Not Found
       name_ko: 이미지 tag 또는 platform manifest 없음

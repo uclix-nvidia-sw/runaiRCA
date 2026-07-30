@@ -4237,12 +4237,20 @@ def _container_diagnostics(pod_summary: dict[str, object] | None) -> list[dict[s
     statuses = pod_summary.get("containerStatuses")
     if not isinstance(statuses, list):
         return []
+    # The spec's per-container resources and the image reference ride along with
+    # the lifecycle facts: an OOMKilled report has to name the limit/request it
+    # was configured with, and an ImagePullBackOff report the reference it failed
+    # to pull.  This typed artifact is what the report's cause and remediation
+    # layers read, so a fact absent here can never reach the operator.
+    spec_resources = pod_summary.get("resources")
+    spec_resources = spec_resources if isinstance(spec_resources, dict) else {}
     diagnostics: list[dict[str, object]] = []
     for item in statuses:
         if not isinstance(item, dict):
             continue
         state = item.get("state") if isinstance(item.get("state"), dict) else {}
         last_state = item.get("lastState") if isinstance(item.get("lastState"), dict) else {}
+        resources = spec_resources.get(str(item.get("name") or ""))
         diagnostics.append(
             {
                 "name": item.get("name"),
@@ -4253,6 +4261,8 @@ def _container_diagnostics(pod_summary: dict[str, object] | None) -> list[dict[s
                 "lastTerminated": _state_reason(last_state.get("terminated"))
                 if isinstance(last_state.get("terminated"), dict)
                 else None,
+                **({"image": item["image"]} if item.get("image") else {}),
+                **({"resources": resources} if isinstance(resources, dict) and resources else {}),
             }
         )
     return diagnostics

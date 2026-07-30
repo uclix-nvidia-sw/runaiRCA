@@ -64,6 +64,12 @@ from app.services.general_guidance import general_guidance_lines
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.query_memory import QueryMemory
+from app.services.remediation import (
+    fill_placeholders,
+    image_repository,
+    image_typo_hint,
+    memory_sizing_action,
+)
 from app.services.root_cause_ranking import (
     FAMILIES,
     RankedCause,
@@ -4435,6 +4441,7 @@ def _detail_from(
         allow_cause_specific_actions=allow_cause_specific_actions,
         language=language,
         self_check_next=self_check_next,
+        facts=_remediation_facts(results, eligible_support_ids, target),
     )
     if numbered:
         lines.extend(numbered)
@@ -5457,6 +5464,76 @@ def _known_issue_cause_lines(
     return out
 
 
+_OOM_REASONS = frozenset({"OOMKilled"})
+_IMAGE_PULL_REASONS = frozenset(
+    {"ImagePullBackOff", "ErrImagePull", "InvalidImageName", "ErrImageNeverPull"}
+)
+
+
+def _remediation_facts(
+    results: list[CollectorResult],
+    eligible_evidence_ids: set[str] | None,
+    target: AnalysisTarget,
+) -> dict[str, str]:
+    """Observed values that make curated guidance executable for THIS incident.
+
+    Curated actions are family-level knowledge written with placeholders, and the
+    sizing advice for an OOMKill needs a number no catalogue can carry.  Both come
+    from the same eligible, target-verified typed artifacts the cause statement
+    uses, so a rendered command can never name a pod, image, or limit this run did
+    not actually observe.
+    """
+    facts = {
+        "namespace": target.namespace,
+        "pod": target.pod,
+        "node": target.node,
+        "workload": target.workload_name,
+        "workload_kind": target.workload_type,
+    }
+    facts = {key: value for key, value in facts.items() if value}
+    if not eligible_evidence_ids:
+        return facts
+    for result in results:
+        for item in result.artifacts:
+            if str(getattr(item, "evidence_id", "") or "") not in eligible_evidence_ids:
+                continue
+            payload = getattr(item, "result", None)
+            if getattr(item, "type", "") != "kubernetes_container_lifecycle":
+                continue
+            if not _typed_artifact_is_verified(payload):
+                continue
+            # The live Pod the collector actually read beats a stale alert label.
+            for key in ("pod", "namespace"):
+                if str(payload.get(key) or ""):
+                    facts[key] = str(payload[key])
+            for container in payload.get("containers", []):
+                if not isinstance(container, dict):
+                    continue
+                reasons = {
+                    str(state.get("reason") or "")
+                    for key in ("state", "lastTerminated")
+                    if isinstance(state := container.get(key), dict)
+                }
+                resources = container.get("resources")
+                resources = resources if isinstance(resources, dict) else {}
+                if reasons & _OOM_REASONS and "oom" not in facts:
+                    limits = resources.get("limits")
+                    requests = resources.get("requests")
+                    facts["oom"] = "true"
+                    facts["container"] = str(container.get("name") or "")
+                    if isinstance(limits, dict) and limits.get("memory"):
+                        facts["memory_limit"] = str(limits["memory"])
+                    if isinstance(requests, dict) and requests.get("memory"):
+                        facts["memory_request"] = str(requests["memory"])
+                if reasons & _IMAGE_PULL_REASONS and "image" not in facts:
+                    image = str(container.get("image") or "")
+                    if image:
+                        facts["image"] = image
+                        facts["repo"] = image_repository(image)
+                        facts.setdefault("container", str(container.get("name") or ""))
+    return {key: value for key, value in facts.items() if value}
+
+
 def _numbered_actions(
     plan: InvestigationPlan | None,
     graph_fixes: GraphRemediation | None,
@@ -5472,6 +5549,7 @@ def _numbered_actions(
     allow_cause_specific_actions: bool | None = None,
     language: str = "en",
     self_check_next: str = "",
+    facts: dict[str, str] | None = None,
 ) -> list[str]:
     """One deduped priority list: self-check and matched symptom first, then
     alert/component/known-issue and signature-specific graph guidance."""
@@ -5494,6 +5572,20 @@ def _numbered_actions(
     # disappear when Korean synthesis fails and the deterministic report wins.
     if self_check_next.strip():
         ordered.append(self_check_next)
+    # Sizing and spelling advice derived from the observed spec. The catalogue can
+    # only say "compare the limit with the working set"; these carry the actual
+    # values, so they lead the list — including under ``exclusive_actions``, whose
+    # curated text they quantify rather than contradict.
+    observed = facts or {}
+    if allow_cause_specific_actions:
+        ordered.extend(
+            line
+            for line in (
+                memory_sizing_action(observed, language),
+                image_typo_hint(observed, language),
+            )
+            if line
+        )
     if (
         allow_cause_specific_actions
         and symptom_matches[0:1]
@@ -5508,7 +5600,11 @@ def _numbered_actions(
             dict.fromkeys(
                 action
                 for raw in actions
-                if (action := _safe_line(raw, limit=420, masker=masker))
+                if (
+                    action := _safe_line(
+                        fill_placeholders(str(raw), observed), limit=420, masker=masker
+                    )
+                )
             )
         )
         return [f"{index}. {action}" for index, action in enumerate(rendered[:8], start=1)]
@@ -5590,7 +5686,9 @@ def _numbered_actions(
     numbered: list[str] = []
     action_masker = build_masker(())
     for action in ordered:
-        action = _safe_line(action, limit=420, masker=action_masker)
+        action = _safe_line(
+            fill_placeholders(str(action), observed), limit=420, masker=action_masker
+        )
         if not action or action in seen:
             continue
         seen.add(action)
@@ -5890,24 +5988,22 @@ def _reason_specific_detail(
     if reason == "CreateContainerError":
         return _container_create_detail([item[1] for item in observations], language)
     if reason == "OOMKilled":
-        limit = _memory_limit(observations)
-        if language == "ko":
-            return "컨테이너가 메모리 limit을 초과해 커널이 OOM kill(exit 137) 했습니다" + (
-                f" (limit: {limit})." if limit else "."
-            )
-        return "The container exceeded its memory limit and the kernel OOM-killed it (exit 137)" + (
-            f" (limit: {limit})." if limit else "."
-        )
+        return _oom_detail(_memory_sizing(observations), language)
     if reason in {"Unschedulable", "SchedulingGated"}:
         detail = _scheduling_detail([item[1] for item in observations], language)
         return detail or _scheduling_error_generic(language)
     if reason in {"ImagePullBackOff", "ErrImagePull"}:
-        detail = _image_pull_detail([item[1] for item in observations], language)
-        return detail or _image_pull_generic(language)
+        observed = _observed_image(observations)
+        detail = _image_pull_detail([item[1] for item in observations], language, observed)
+        return detail or _image_pull_generic(language, observed)
     if reason == "InvalidImageName":
-        return _invalid_image_name_detail([item[1] for item in observations], language)
+        return _invalid_image_name_detail(
+            [item[1] for item in observations], language, _observed_image(observations)
+        )
     if reason == "ErrImageNeverPull":
-        return _never_pull_detail([item[1] for item in observations], language)
+        return _never_pull_detail(
+            [item[1] for item in observations], language, _observed_image(observations)
+        )
     return ""
 
 
@@ -6113,7 +6209,33 @@ def _restart_loop_detail(exit_code: object | None, language: str) -> str:
     )
 
 
-def _memory_limit(observations: list[tuple[str, str, object | None, dict[str, Any]]]) -> str:
+def _oom_detail(sizing: tuple[str, str, str], language: str) -> str:
+    """Name the configured ceiling and reservation that the kill happened under."""
+    container, limit, request = sizing
+    if language == "ko":
+        base = "컨테이너가 메모리 limit을 초과해 커널이 OOM kill(exit 137) 했습니다"
+        if not limit:
+            return f"{base}."
+        subject = f"컨테이너 `{container}`의 현재 설정은" if container else "현재 설정은"
+        reservation = f"request {request}" if request else "request 미설정"
+        return f"{base}. {subject} memory limit {limit}, {reservation}입니다."
+    base = "The container exceeded its memory limit and the kernel OOM-killed it (exit 137)"
+    if not limit:
+        return f"{base}."
+    subject = f"container `{container}` is" if container else "it is"
+    reservation = f"request {request}" if request else "no memory request"
+    return f"{base}. Currently {subject} configured with memory limit {limit} and {reservation}."
+
+
+def _memory_sizing(
+    observations: list[tuple[str, str, object | None, dict[str, Any]]],
+) -> tuple[str, str, str]:
+    """Observed ``(container, limits.memory, requests.memory)`` for the OOM detail.
+
+    An operator's first question on an OOMKill is which ceiling was exceeded and
+    what was reserved, so both sides of the spec are reported — a set limit with
+    an unset request is itself a finding.
+    """
     for _, _, _, source in observations:
         container = source.get("container", {})
         resources = container.get("resources") if isinstance(container, dict) else None
@@ -6121,8 +6243,15 @@ def _memory_limit(observations: list[tuple[str, str, object | None, dict[str, An
             resources = source.get("payload", {}).get("resources", {})
         limits = resources.get("limits") if isinstance(resources, dict) else None
         if isinstance(limits, dict) and limits.get("memory"):
-            return str(limits["memory"])
-    return ""
+            requests = resources.get("requests") if isinstance(resources, dict) else None
+            request = (
+                str(requests["memory"])
+                if isinstance(requests, dict) and requests.get("memory")
+                else ""
+            )
+            name = str(container.get("name") or "") if isinstance(container, dict) else ""
+            return name, str(limits["memory"]), request
+    return "", "", ""
 
 
 def _scheduling_detail(messages: list[str], language: str) -> str:
@@ -6161,10 +6290,27 @@ def _scheduling_error_generic(language: str) -> str:
     )
 
 
-def _image_pull_detail(messages: list[str], language: str) -> str:
+def _observed_image(
+    observations: list[tuple[str, str, object | None, dict[str, Any]]],
+) -> str:
+    """The image the target container is configured to run, from typed state.
+
+    The kubelet Event message usually repeats the reference, but not in every
+    failure mode; the Pod's own container status always carries it, so the report
+    can name the exact reference instead of a bare "could not pull the image".
+    """
+    for _, _, _, source in observations:
+        container = source.get("container", {})
+        if isinstance(container, dict) and container.get("image"):
+            return str(container["image"])
+    return ""
+
+
+def _image_pull_detail(messages: list[str], language: str, observed: str = "") -> str:
     for message in messages:
         image = _IMAGE_REFERENCE.search(message)
-        suffix = f" ('{image.group(1)}')" if image else ""
+        reference = image.group(1) if image else observed
+        suffix = f" ('{reference}')" if reference else ""
         if re.search(r"not found|manifest unknown", message, re.IGNORECASE):
             return (
                 f"구체적으로는 이미지 또는 tag{suffix}가 registry에 없습니다."
@@ -6180,16 +6326,20 @@ def _image_pull_detail(messages: list[str], language: str) -> str:
     return ""
 
 
-def _image_pull_generic(language: str) -> str:
+def _image_pull_generic(language: str, observed: str = "") -> str:
+    suffix = f" '{observed}'" if observed else ""
     return (
-        "구체적으로는 registry에서 이미지를 pull하지 못했습니다."
+        f"구체적으로는 registry에서 이미지{suffix}를 pull하지 못했습니다."
         if language == "ko"
-        else "Specifically, Kubernetes could not pull the image from the registry."
+        else f"Specifically, Kubernetes could not pull image{suffix} from the registry."
     )
 
 
-def _invalid_image_name_detail(messages: list[str], language: str) -> str:
-    name = next((match.group(1) for message in messages if (match := _IMAGE_REFERENCE.search(message))), "")
+def _invalid_image_name_detail(messages: list[str], language: str, observed: str = "") -> str:
+    name = (
+        next((match.group(1) for message in messages if (match := _IMAGE_REFERENCE.search(message))), "")
+        or observed
+    )
     suffix = f" '{name}'" if name else ""
     return (
         f"구체적으로는 이미지 참조{suffix} 형식이 올바르지 않습니다."
@@ -6198,8 +6348,11 @@ def _invalid_image_name_detail(messages: list[str], language: str) -> str:
     )
 
 
-def _never_pull_detail(messages: list[str], language: str) -> str:
-    name = next((match.group(1) for message in messages if (match := _IMAGE_REFERENCE.search(message))), "")
+def _never_pull_detail(messages: list[str], language: str, observed: str = "") -> str:
+    name = (
+        next((match.group(1) for message in messages if (match := _IMAGE_REFERENCE.search(message))), "")
+        or observed
+    )
     suffix = f" '{name}'" if name else ""
     return (
         f"구체적으로는 imagePullPolicy Never인데 이미지{suffix}가 노드에 없습니다."
