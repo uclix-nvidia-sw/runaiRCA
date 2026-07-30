@@ -363,6 +363,78 @@ def test_pending_gang_reports_allocated_against_requested() -> None:
     assert "Run:ai GPU 할당/요청 0/4" in "\n".join(_configuration(scheduling, "ko"))
 
 
+# Verbatim from a live fractional (shared-GPU) workload Pod. Note there is NO
+# nvidia.com/gpu request anywhere in its spec — the slice exists only here.
+_LIVE_FRACTION_ANNOTATIONS = {
+    "gpu-fraction": "0.5",
+    "gpu-fraction-num-devices": "1",
+    "pod-group-name": "pg-fraction-0-74e237bd",
+    "received-resource-type": "Fraction",
+    "runai-allocated-gpu-memory": "21474",
+    "runai-allocated-gpus": "0.5",
+    "runai-allocated-mig-gpus": "0",
+    "runai-calculated-status": "Running",
+    "runai-nodepools": "default",
+}
+
+
+def test_fraction_workload_reports_its_slice() -> None:
+    """A whole-GPU report would show nothing: there is no nvidia.com/gpu request."""
+    allocation = _runai_allocation(_LIVE_FRACTION_ANNOTATIONS)
+    assert allocation["allocated_gpus"] == "0.5"
+    assert allocation["gpu_fraction"] == "0.5"
+    assert allocation["resource_type"] == "Fraction"
+
+    scheduling = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_scheduling",
+        status="ok",
+        confidence="high",
+        summary="scheduling",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "target_identity_verified": True,
+            },
+            # cpu/memory only — exactly what a fraction Pod declares.
+            "resources": {"main": {"requests": {"cpu": "50m", "memory": "52428800"}}},
+            "runai_allocation": allocation,
+            "condition": {"reason": "Unschedulable", "message": "0/2 nodes are available"},
+        },
+    )
+    line = "\n".join(_configuration(scheduling))
+
+    assert "Run:ai GPUs allocated 0.5" in line
+    assert "GPU fraction 0.5" in line
+    assert "× 1" not in line  # a single device adds no information
+    assert "resource type Fraction" in line
+    assert "Run:ai GPU 할당 0.5" in "\n".join(_configuration(scheduling, "ko"))
+
+
+def test_fraction_pods_are_counted_against_node_gpus() -> None:
+    """A node packed with half-GPU Pods used to report its GPUs as entirely free."""
+    from app.collectors.kubernetes import _pod_gpu_request
+
+    fraction_pod = {
+        "metadata": {"annotations": _LIVE_FRACTION_ANNOTATIONS},
+        "spec": {"containers": [{"resources": {"requests": {"cpu": "50m"}}}]},
+    }
+    quantity, invalid = _pod_gpu_request(fraction_pod)
+    assert (float(quantity), invalid) == (0.5, 0)
+
+    # A whole-GPU Pod declares both; it must not be counted twice.
+    whole = {
+        "metadata": {"annotations": {"runai-allocated-gpus": "4"}},
+        "spec": {"containers": [{"resources": {"requests": {"nvidia.com/gpu": "4"}}}]},
+    }
+    assert float(_pod_gpu_request(whole)[0]) == 4.0
+
+    # No Run:ai annotation at all stays zero.
+    assert _pod_gpu_request({"spec": {"containers": [{}]}})[0] == 0
+
+
 def test_set_resources_command_only_for_kinds_kubectl_can_patch() -> None:
     """A Grove/Run:ai Pod is CRD-owned; `kubectl set resources` fails on it."""
     facts = {
@@ -401,6 +473,105 @@ def test_request_already_at_the_limit_is_not_told_to_change() -> None:
     assert "400Mi → 800Mi" in action
     assert "stays at 400Mi" in action
     assert "400Mi → 400Mi" not in action
+
+
+# Verbatim from `kubectl get queues.scheduling.run.ai -o yaml` on a live cluster.
+_LIVE_QUEUE = {
+    "metadata": {
+        "name": "project-test-a",
+        "labels": {
+            "project": "project-test-a",
+            "runai/department-name": "default",
+            "run.ai/project-id": "1b3b0e46-088d-4080-b73e-5b7a995241ad",
+        },
+    },
+    "spec": {
+        "displayName": "project-test-a",
+        "parentQueue": "q-4500000",
+        "priority": 100,
+        "resources": {
+            "cpu": {"limit": -1, "overQuotaWeight": 1, "quota": -1},
+            "gpu": {"limit": -1, "overQuotaWeight": 1, "quota": 1},
+            "memory": {"limit": -1, "overQuotaWeight": 1, "quota": -1},
+        },
+    },
+    "status": {
+        "allocated": {"cpu": "16", "memory": "64G", "nvidia.com/gpu": "1"},
+        "requested": {"cpu": "16", "memory": "64G", "nvidia.com/gpu": "1"},
+    },
+}
+
+
+def test_queue_quota_summary_reads_the_measured_shape() -> None:
+    from app.collectors.kubernetes import _queue_quota_summary
+
+    summary = _queue_quota_summary(_LIVE_QUEUE)
+
+    assert summary["gpu_quota"] == "1"
+    assert summary["gpu_requested"] == "1"
+    assert summary["gpu_allocated"] == "1"
+    assert summary["gpu_over_quota_weight"] == "1"
+    assert summary["department"] == "default"
+    assert summary["parent_queue"] == "q-4500000"
+    # -1 means unset: it must not be printed as a real ceiling of minus one GPU.
+    assert "gpu_limit" not in summary
+
+
+def test_quota_line_needs_an_unschedulable_observation() -> None:
+    """Quota states the ceiling; only the pending Pod makes it relevant."""
+    from app.collectors.kubernetes import _queue_quota_summary
+
+    quota = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="runai_queue_quota",
+        status="ok",
+        confidence="medium",
+        summary="quota",
+        result={
+            # Deliberately NOT scoped: reading a policy object proves nothing
+            # about the incident window.
+            "observation": {
+                "polarity": "unknown",
+                "coverage": "partial",
+                "target_identity_verified": True,
+            },
+            **_queue_quota_summary(_LIVE_QUEUE),
+        },
+    )
+    alone = CollectorResult(agent="kubernetes", status="ok", summary="k8s", artifacts=[quota])
+    assign_evidence_ids([alone])
+    assert pipeline._observed_configuration_lines([alone], {"E01"}, "en") == []
+
+    scheduling = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="kubernetes_pod_scheduling",
+        status="ok",
+        confidence="high",
+        summary="scheduling",
+        result={
+            "observation": {
+                "polarity": "present",
+                "coverage": "scoped",
+                "target_identity_verified": True,
+            },
+            "resources": {"main": {"requests": {"nvidia.com/gpu": "2"}}},
+            "condition": {"reason": "Unschedulable", "message": "0/2 nodes are available"},
+        },
+    )
+    both = CollectorResult(
+        agent="kubernetes", status="ok", summary="k8s", artifacts=[scheduling, quota]
+    )
+    assign_evidence_ids([both])
+    ids = {str(item.evidence_id) for item in both.artifacts}
+    line = "\n".join(pipeline._observed_configuration_lines([both], ids, "en"))
+
+    assert "Project quota (project-test-a)" in line
+    assert "GPUs requested/quota 1/1" in line
+    assert "over-quota weight 1" in line
+    assert "hard limit" not in line  # -1 is unset, not a ceiling
+    assert "프로젝트 quota" in "\n".join(pipeline._observed_configuration_lines([both], ids, "ko"))
 
 
 def test_node_pressure_reports_the_capacity_it_ran_out_of() -> None:

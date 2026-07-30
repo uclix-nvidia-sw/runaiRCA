@@ -6459,6 +6459,7 @@ _CONFIGURATION_KINDS = (
     "kubernetes_container_lifecycle",
     "kubernetes_probe",
     "kubernetes_pod_scheduling",
+    "runai_queue_quota",
     "kubernetes_storage_claim",
     "kubernetes_node_gpu_resources",
     "kubernetes_node_condition",
@@ -6500,10 +6501,19 @@ _CONFIG_LABELS = {
         "selector": "nodeSelector",
         "scheduler": "scheduler",
         "runai_gpus": "Run:ai GPUs allocated/requested",
+        "runai_allocated": "Run:ai GPUs allocated",
+        "runai_fraction": "GPU fraction",
         "runai_gang": "pod group requests",
         "runai_pods": "gang",
         "runai_type": "resource type",
         "runai_state": "Run:ai status",
+        "quota": "Project quota",
+        "quota_gpu": "GPUs requested/quota",
+        "quota_allocated": "allocated",
+        "quota_limit": "hard limit",
+        "quota_weight": "over-quota weight",
+        "quota_pool": "node pool",
+        "unlimited": "unlimited",
         "unset": "unset",
     },
     "ko": {
@@ -6521,10 +6531,19 @@ _CONFIG_LABELS = {
         "selector": "nodeSelector",
         "scheduler": "scheduler",
         "runai_gpus": "Run:ai GPU 할당/요청",
+        "runai_allocated": "Run:ai GPU 할당",
+        "runai_fraction": "GPU fraction",
         "runai_gang": "pod group 요청",
         "runai_pods": "gang",
         "runai_type": "리소스 유형",
         "runai_state": "Run:ai 상태",
+        "quota": "프로젝트 quota",
+        "quota_gpu": "GPU 요청/quota",
+        "quota_allocated": "할당",
+        "quota_limit": "상한",
+        "quota_weight": "over-quota 가중치",
+        "quota_pool": "node pool",
+        "unlimited": "무제한",
         "unset": "미설정",
     },
 }
@@ -6590,11 +6609,19 @@ def _runai_allocation_parts(allocation: object, labels: dict[str, str]) -> list[
         return []
     parts: list[str] = []
     requested = str(allocation.get("requested_gpus") or "")
-    allocated = str(allocation.get("allocated_gpus") or "")
-    if requested or allocated:
-        parts.append(
-            f"{labels['runai_gpus']} {allocated or '?'}/{requested or '?'}"
-        )
+    # What the Pod holds NOW beats the assigned figure when both are present.
+    allocated = str(
+        allocation.get("current_allocated_gpus") or allocation.get("allocated_gpus") or ""
+    )
+    if requested and allocated:
+        parts.append(f"{labels['runai_gpus']} {allocated}/{requested}")
+    elif allocated:
+        # A fractional workload publishes no requested figure — only its slice.
+        parts.append(f"{labels['runai_allocated']} {allocated}")
+    if fraction := str(allocation.get("gpu_fraction") or ""):
+        devices = str(allocation.get("gpu_fraction_devices") or "")
+        suffix = f" × {devices}" if devices and devices != "1" else ""
+        parts.append(f"{labels['runai_fraction']} {fraction}{suffix}")
     gang = str(allocation.get("podgroup_requested_gpus") or "")
     if gang and gang != requested:
         parts.append(f"{labels['runai_gang']} {gang}")
@@ -6659,6 +6686,14 @@ def _observed_configuration_lines(
     ):
         if line := _probe_configuration_line(results, labels):
             lines["kubernetes_probe"] = line
+    # Quota is a policy object read live: it states the ceiling, never that the
+    # ceiling was hit in this window. The eligible unschedulable observation is
+    # what makes it relevant, exactly as the event does for probes and claims.
+    if "runai_queue_quota" not in lines and "kubernetes_pod_scheduling" in lines:
+        if line := _identity_verified_configuration_line(
+            results, "runai_queue_quota", labels, unset
+        ):
+            lines["runai_queue_quota"] = line
     if "kubernetes_storage_claim" not in lines and _warning_event_observed(
         results, eligible_evidence_ids, _STORAGE_EVENT_REASONS
     ):
@@ -6803,6 +6838,29 @@ def _configuration_line(
             parts.append(f"{labels['scheduler']} {scheduler}")
         parts.extend(_runai_allocation_parts(payload.get("runai_allocation"), labels))
         return f"- {labels['requested']}: " + " · ".join(parts) if parts else ""
+    if kind == "runai_queue_quota":
+        parts = []
+        quota = str(payload.get("gpu_quota") or "")
+        requested = str(payload.get("gpu_requested") or "")
+        if quota or requested:
+            # requested/quota is the borrow question: above quota, the project is
+            # only served from idle capacity, and only if its weight allows it.
+            parts.append(
+                f"{labels['quota_gpu']} {requested or '?'}/{quota or labels['unlimited']}"
+            )
+        if allocated := str(payload.get("gpu_allocated") or ""):
+            parts.append(f"{labels['quota_allocated']} {allocated}")
+        if limit := str(payload.get("gpu_limit") or ""):
+            parts.append(f"{labels['quota_limit']} {limit}")
+        if weight := str(payload.get("gpu_over_quota_weight") or ""):
+            parts.append(f"{labels['quota_weight']} {weight}")
+        if pool := str(payload.get("node_pool") or ""):
+            parts.append(f"{labels['quota_pool']} {pool}")
+        if not parts:
+            return ""
+        queue = str(payload.get("queue") or "")
+        subject = f"{labels['quota']} ({queue})" if queue else labels["quota"]
+        return f"- {subject}: " + " · ".join(parts)
     if kind == "kubernetes_storage_claim":
         claim = str(payload.get("claim") or "")
         parts = []

@@ -1798,6 +1798,13 @@ class KubernetesCollector:
         artifacts.append(_pod_lifecycle_artifact(self.name, target, responses))
         if scheduling_artifact is not None:
             artifacts.append(scheduling_artifact)
+            # The Pod cannot be scheduled, so the project's scheduler quota is
+            # worth one read: a project at its quota waits even with free GPUs.
+            artifacts.extend(
+                await _queue_quota_artifacts(
+                    self.name, self._settings, target, time_range=causal_time_range
+                )
+            )
         artifacts.append(
             _container_lifecycle_artifact(
                 self.name,
@@ -4031,6 +4038,119 @@ def _container_lifecycle_artifact(
     )
 
 
+_UNLIMITED_QUOTA = "-1"
+
+
+def _queue_quota_summary(queue: dict[str, object]) -> dict[str, object]:
+    """Project quota vs what the queue holds, from a scheduling.run.ai/v2 Queue.
+
+    ``quota`` is the deserved share and ``limit`` the hard ceiling, both -1 when
+    unset; ``overQuotaWeight`` decides how much idle capacity the project may
+    borrow. A project sits at its quota while GPUs are free elsewhere in the
+    cluster, which is why node capacity alone cannot explain a pending workload.
+    """
+    metadata = queue.get("metadata") if isinstance(queue.get("metadata"), dict) else {}
+    spec = queue.get("spec") if isinstance(queue.get("spec"), dict) else {}
+    status = queue.get("status") if isinstance(queue.get("status"), dict) else {}
+    labels = metadata.get("labels") if isinstance(metadata.get("labels"), dict) else {}
+    resources = spec.get("resources") if isinstance(spec.get("resources"), dict) else {}
+    gpu = resources.get("gpu") if isinstance(resources.get("gpu"), dict) else {}
+    summary: dict[str, object] = {
+        "queue": metadata.get("name"),
+        "project": labels.get("project"),
+        # A project has one queue per node pool plus a top-level one.
+        "node_pool": labels.get("runai/node-pool"),
+        "department": labels.get("runai/department-name"),
+        "parent_queue": spec.get("parentQueue"),
+        "priority": spec.get("priority"),
+    }
+    for field, key in (("quota", "gpu_quota"), ("limit", "gpu_limit")):
+        value = gpu.get(field)
+        if value is not None and str(value) != _UNLIMITED_QUOTA:
+            summary[key] = str(value)
+    if gpu.get("overQuotaWeight") is not None:
+        summary["gpu_over_quota_weight"] = str(gpu["overQuotaWeight"])
+    for field, key in (("requested", "gpu_requested"), ("allocated", "gpu_allocated")):
+        values = status.get(field)
+        if isinstance(values, dict) and values.get(_GPU_RESOURCE) is not None:
+            summary[key] = str(values[_GPU_RESOURCE])
+    return summary
+
+
+async def _queue_quota_artifacts(
+    agent: str,
+    settings: Settings,
+    target: AnalysisTarget,
+    *,
+    time_range: dict[str, str] | None,
+):
+    """Read the alert project's scheduler queues when its Pod cannot be scheduled.
+
+    Only reached for an unschedulable target, so the quota is fetched exactly when
+    it can explain the wait. The queue is CURRENT state — it types as context, not
+    as proof about the incident window; the report prints it as configuration.
+    """
+    if not target.project:
+        return []
+    response = await k8s_read(
+        settings, "queues", label_selector=f"project={target.project}", full_object=True
+    )
+    payload = _normalize_k8s_payload(response.get("data"))
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if response.get("error") or not isinstance(items, list):
+        return []
+    artifacts = []
+    for queue in items[:3]:
+        if not isinstance(queue, dict):
+            continue
+        summary = _queue_quota_summary(queue)
+        if str(summary.get("project") or "") != target.project:
+            continue
+        if "gpu_quota" not in summary and "gpu_requested" not in summary:
+            continue
+        artifacts.append(
+            artifact(
+                agent=agent,
+                source="kubernetes",
+                type="runai_queue_quota",
+                status="ok",
+                confidence="medium",
+                title=ko_en(settings, "Run:ai 프로젝트 quota", "Run:ai project quota"),
+                query=kubectl_repr("queues", name=str(summary.get("queue") or "")),
+                summary=ko_en(
+                    settings,
+                    f"Queue {summary.get('queue')}: GPU quota "
+                    f"{summary.get('gpu_quota', '무제한')}, 요청 "
+                    f"{summary.get('gpu_requested', '?')}, 할당 "
+                    f"{summary.get('gpu_allocated', '?')}.",
+                    f"Queue {summary.get('queue')}: GPU quota "
+                    f"{summary.get('gpu_quota', 'unlimited')}, requested "
+                    f"{summary.get('gpu_requested', '?')}, allocated "
+                    f"{summary.get('gpu_allocated', '?')}.",
+                ),
+                result={
+                    "observation": {
+                        "kind": "runai_queue_quota",
+                        "predicate": "runai_queue_quota",
+                        # Quota is a live read of a policy object. It explains the
+                        # ceiling, never that the ceiling was hit in this window.
+                        "polarity": "unknown",
+                        "coverage": "partial",
+                        "target_identity_verified": True,
+                        "observed_entity": {
+                            "kind": "queue",
+                            "name": str(summary.get("queue") or ""),
+                        },
+                        "observation_window": {},
+                        "snapshot_role": "current_context",
+                    },
+                    **summary,
+                },
+            )
+        )
+    return artifacts
+
+
 _UNBOUND_CLAIM_PHASES = frozenset({"Pending", "Lost"})
 
 
@@ -5124,18 +5244,28 @@ def _event_message_mentions_target(message: str, target: AnalysisTarget) -> bool
 # Closed vocabulary, keys observed on a live 2.26 cluster — an unknown key is
 # ignored rather than guessed at.
 _RUNAI_ALLOCATION_ANNOTATIONS: dict[str, str] = {
+    # Written on every admitted Pod. The ``-current-`` pair appears on gang
+    # workloads and can lag the desired figure, so both are kept: "current" is
+    # what the Pod holds now, the plain key is what the scheduler assigned.
+    "runai-allocated-gpus": "allocated_gpus",
+    "runai-current-allocated-gpus": "current_allocated_gpus",
     "runai-current-requested-gpus": "requested_gpus",
-    "runai-current-allocated-gpus": "allocated_gpus",
     "runai-podgroup-requested-gpus": "podgroup_requested_gpus",
     "runai-total-requested-gpus": "total_requested_gpus",
-    "runai-current-allocated-gpus-memory": "allocated_gpu_memory",
+    "runai-allocated-gpu-memory": "allocated_gpu_memory",
+    "runai-allocated-mig-gpus": "allocated_mig_gpus",
+    # A fractional (shared-GPU) workload declares NO nvidia.com/gpu resource at
+    # all — its slice lives only here and in Run:ai's own device plugin.
+    "gpu-fraction": "gpu_fraction",
+    "gpu-fraction-num-devices": "gpu_fraction_devices",
     "runai-pending-pods": "pending_pods",
     "runai-running-pods": "running_pods",
     "runai-calculated-status": "runai_status",
-    # "Regular" on an in-quota workload; the scheduler distinguishes borrowed
-    # capacity here, so it is reported verbatim rather than interpreted.
+    # "Regular" whole-GPU vs "Fraction" shared-GPU; the scheduler also names
+    # borrowed capacity here, so it is reported verbatim, never interpreted.
     "received-resource-type": "resource_type",
     "runai-used-nodes": "used_nodes",
+    "runai-nodepools": "node_pools",
     "pod-group-name": "pod_group",
 }
 
@@ -5602,7 +5732,34 @@ def _pod_gpu_request(pod: object) -> tuple[Decimal, int]:
         overhead_gpu, valid = _gpu_quantity(overhead.get(_GPU_RESOURCE))
         effective += overhead_gpu
         invalid += 0 if valid else 1
+    if effective == 0:
+        # Consulted ONLY when Kubernetes sees no GPU request, so a whole-GPU
+        # workload (which declares both) can never be counted twice.
+        fraction, bad = _runai_shared_gpu_request(pod)
+        effective += fraction
+        invalid += bad
     return effective, invalid
+
+
+def _runai_shared_gpu_request(pod: dict[str, object]) -> tuple[Decimal, int]:
+    """A shared-GPU Pod's slice, which is invisible to Kubernetes.
+
+    Run:ai fractional workloads reserve GPU memory through their own device
+    plugin and declare no ``nvidia.com/gpu`` at all, so a node packed with
+    half-GPU Pods used to report its GPUs as entirely free. The scheduler records
+    what it actually handed out in this annotation.
+
+    MIG is deliberately excluded: ``runai-allocated-mig-gpus`` was 0 on every Pod
+    measured, so whether its unit is devices or whole-GPU equivalents is unknown,
+    and a wrong multiplier here would silently corrupt the node's free-GPU figure.
+    """
+    metadata = pod.get("metadata") if isinstance(pod.get("metadata"), dict) else {}
+    annotations = metadata.get("annotations")
+    raw = annotations.get("runai-allocated-gpus") if isinstance(annotations, dict) else None
+    if raw in (None, ""):
+        return Decimal(0), 0
+    quantity, valid = _gpu_quantity(raw)
+    return (quantity, 0) if valid else (Decimal(0), 1)
 
 
 def _display_gpu_quantity(value: Decimal | None) -> int | float | None:
