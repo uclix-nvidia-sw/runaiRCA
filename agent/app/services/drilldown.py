@@ -1729,7 +1729,18 @@ def _implicated_architecture(
             effect = entry.get("failure_effect") or entry.get("purpose") or ""
             if effect:
                 lines.append(f"{dep}: {effect}")
-    return lines[:10]
+    # The curated checks say WHERE to look, and some of them are the only record
+    # that the evidence lives outside the obvious place (a fraction workload's GPU
+    # slice is held by a reservation Pod in another namespace entirely). Without
+    # them this loop told the agent which component to suspect and nothing about
+    # how to interrogate it — the checks reached only the report's playbook, after
+    # the investigation was already over.
+    for name in implicated[:2]:
+        for check in (components.get(name) or {}).get("checks") or []:
+            text = " ".join(str(check).split())
+            if text:
+                lines.append(f"{name} check: {text}")
+    return lines[:14]
 
 
 _HEALTHY_COMPONENT_SUFFIX_RE = re.compile(
