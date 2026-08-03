@@ -209,7 +209,14 @@ func (s *Store) SimilarIncidentsForAlert(alert Alert, incidentID string, limit i
 	s.mu.RLock()
 	query := s.similarIncidentQueryLocked(alert, incidentID)
 	s.mu.RUnlock()
-	if results, ok := s.dbSearchSimilarIncidents(query, incidentID, limit); ok && len(results) > 0 {
+	// Prefer the dense index only when it is actually semantic (a real embedding
+	// model, remote basis). Without EMBEDDING_URL configured -- the chart
+	// default -- pgvector still answers, but "dense-lexical" is signed feature
+	// hashing over the same bag of words the sparse path already has, now IDF-
+	// weighted; the hash has no IDF, so it is the WEAKER of the two, not the
+	// stronger. retrieval_kind carries the basis: all rows from one dbSearch
+	// call share it, so checking results[0] is enough.
+	if results, ok := s.dbSearchSimilarIncidents(query, incidentID, limit); ok && len(results) > 0 && results[0].RetrievalKind == retrievalKindDenseSemantic {
 		return results
 	}
 	s.mu.RLock()
@@ -328,12 +335,13 @@ func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident 
 	queryVector := textVector(query)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	df, corpusSize := corpusDocFreqLocked(s.memories)
 	results := make([]SimilarIncident, 0, len(s.memories))
 	for _, memory := range s.memories {
 		if memory == nil || !incidentUserApproved(s.incidents[memory.IncidentID]) || incidentDeleted(s.incidents[memory.IncidentID]) {
 			continue
 		}
-		score := cosineSimilarity(queryVector, memory.Vector)
+		score := idfCosineSimilarity(queryVector, memory.Vector, df, corpusSize)
 		if score <= 0.05 {
 			continue
 		}
@@ -352,7 +360,7 @@ func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident 
 			CommentCount:     len(summary.Comments),
 			Labels:           cloneMap(memory.Labels),
 			CreatedAt:        memory.CreatedAt,
-			RetrievalKind:    "sparse-identity",
+			RetrievalKind:    retrievalKindSparseIdentity,
 		})
 	}
 	sort.Slice(results, func(i, j int) bool {
@@ -643,6 +651,7 @@ func (s *Store) similarIncidentsLocked(
 ) []SimilarIncident {
 	limit = capSimilarIncidentLimit(limit)
 	queryVector := textVector(s.similarIncidentQueryLocked(alert, currentIncidentID))
+	df, corpusSize := corpusDocFreqLocked(s.memories)
 	results := make([]SimilarIncident, 0, len(s.memories))
 	for _, memory := range s.memories {
 		if memory == nil {
@@ -652,7 +661,7 @@ func (s *Store) similarIncidentsLocked(
 		if !incidentUserApproved(incident) || memory.IncidentID == currentIncidentID || incidentDeleted(incident) {
 			continue
 		}
-		score := blendedSimilarity(queryVector, memory.Vector, alert.Labels, memory.Labels)
+		score := blendedSimilarity(queryVector, memory.Vector, alert.Labels, memory.Labels, df, corpusSize)
 		if score <= 0.05 {
 			continue
 		}
@@ -680,7 +689,7 @@ func (s *Store) similarIncidentsLocked(
 			CommentCount:     len(summary.Comments),
 			Labels:           cloneMap(memory.Labels),
 			CreatedAt:        memory.CreatedAt,
-			RetrievalKind:    "sparse-identity",
+			RetrievalKind:    retrievalKindSparseIdentity,
 		})
 	}
 	sort.Slice(results, func(i, j int) bool {
@@ -933,6 +942,87 @@ func cosineSimilarity(a, b map[string]float64) float64 {
 	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
+// corpusDocFreqLocked computes document frequency (how many memories contain
+// each token at least once) and the corpus size over s.memories. Callers
+// compute this ONCE per query/search call, before the per-candidate ranking
+// loop, and pass the result down -- not per comparison. A search is already an
+// O(len(s.memories)) pass (cosine + feedback lookups per candidate); this is a
+// second pass of the same order, not a new complexity class. Caching it across
+// calls (e.g. keyed on a corpus generation counter) would add invalidation
+// bookkeeping at every upsert/hard-delete/reload site to save work that is
+// already cheap -- not worth it unless the corpus size becomes a real problem.
+func corpusDocFreqLocked(memories map[string]*IncidentMemory) (df map[string]int, corpusSize int) {
+	df = make(map[string]int, 64)
+	for _, memory := range memories {
+		if memory == nil {
+			continue
+		}
+		corpusSize++
+		for token := range memory.Vector {
+			df[token]++
+		}
+	}
+	return df, corpusSize
+}
+
+// idfWeight is the smoothed inverse-document-frequency of a token appearing in
+// df of corpusSize documents: ln((1+N)/(1+df)) + 1, the same smoothing
+// scikit-learn's TfidfVectorizer uses by default. It is always >= 1, so it
+// never zeroes out a vector and never divides by zero:
+//   - corpusSize == 0 (nothing stored yet): every token gets the neutral
+//     weight 1 -- IDF has no corpus to reason about, so this is plain term
+//     counts.
+//   - a token in EVERY document (df == corpusSize), e.g. the Alertmanager
+//     boilerplate every incident of the same alertname shares: weight bottoms
+//     out at exactly the floor, 1 -- never zero, but the smallest possible
+//     weight, so it cannot outweigh a token that sets one document apart from
+//     the rest.
+//   - a single-document corpus (corpusSize == 1): its only document's tokens
+//     all have df == corpusSize == 1, so they all sit at the floor too -- one
+//     document gives IDF no basis to call anything rare, so this degrades to
+//     unweighted term-count cosine rather than collapsing to an all-zero
+//     vector.
+func idfWeight(df, corpusSize int) float64 {
+	if corpusSize <= 0 {
+		return 1
+	}
+	return math.Log(float64(1+corpusSize)/float64(1+df)) + 1
+}
+
+// idfWeightedVector scales each term count by its corpus IDF weight. Applied at
+// COMPARE time to both the query and the stored vector -- textVector and the
+// persisted memory documents are untouched, so this needs no re-storing and no
+// migration.
+func idfWeightedVector(vector map[string]float64, df map[string]int, corpusSize int) map[string]float64 {
+	if len(vector) == 0 {
+		return vector
+	}
+	weighted := make(map[string]float64, len(vector))
+	for token, count := range vector {
+		// df == 0 means no stored document contains this token, so it can never
+		// enter the dot product -- keeping it at the MAX idf weight would only
+		// inflate the vector norm. Worse, that tax grows with the corpus, so the
+		// same pair scored LOWER as unrelated incidents were approved (measured:
+		// 0.1277 at n=1, 0.0921 at n=3, versus a stable 0.5000 when dropped) and
+		// every fixed threshold silently tightened over time. Dropping it is what
+		// sklearn's transform does, and it changes no ranking: the norm is the
+		// same constant for every candidate of one query.
+		if df[token] == 0 {
+			continue
+		}
+		weighted[token] = count * idfWeight(df[token], corpusSize)
+	}
+	return weighted
+}
+
+// idfCosineSimilarity is cosineSimilarity with both sides IDF-weighted first.
+// idfWeight is always >= 1 (never negative), so the weighted vectors stay
+// non-negative and the result stays a normalized similarity in [0,1] --
+// comparable with the dense path's 1-distance.
+func idfCosineSimilarity(a, b map[string]float64, df map[string]int, corpusSize int) float64 {
+	return cosineSimilarity(idfWeightedVector(a, df, corpusSize), idfWeightedVector(b, df, corpusSize))
+}
+
 // The controlled label keys that identify a recurrence. No "pod": an ephemeral
 // name never repeats across occurrences, so it can only ever withhold identity
 // credit from a genuine recurrence.
@@ -945,28 +1035,35 @@ var identityLabelKeys = []string{
 // A flat additive bonus could not do that. Every label value is also a token in
 // alertSearchText and memoryText, so labels already move the cosine -- but the
 // stored document is a full RCA while the query is a short alert, so those few
-// tokens are diluted to nearly nothing. (Drop the correction outright and a
-// genuine recurrence falls under the 0.05 floor; a test pins that.) The old
+// tokens used to be diluted to nearly nothing by plain term-count cosine. (Drop
+// the correction outright under the OLD unweighted cosine and a genuine
+// recurrence falls under the 0.05 floor; a test pinned that.) The old
 // correction was +0.035 per matching key -- up to +0.21 added to a [0,1] cosine,
 // wider than the gap between a same-alertname match and a same-root-cause one.
 // That is how a kube-scheduler predicate failure outranked a GPU-shortage
 // incident for a Run:ai fractional-GPU alert.
 //
+// content is now idfCosineSimilarity, not plain cosineSimilarity: the shared
+// Alertmanager boilerplate every same-alertname incident carries is now
+// downweighted by document frequency instead of counting equally with the
+// terms that actually separate two root causes, so content alone carries much
+// more of the identity signal than it used to. The label blend stays anyway --
+// it is a hard, controlled-vocabulary signal (exact key match, not textual
+// similarity), and keeping it means identity is never entirely a function of
+// which words happen to survive tokenization.
+//
 // Blending two NORMALIZED signals keeps identity load-bearing without letting it
 // outvote content: labelWeight of the score is the share of the alert's OWN
 // controlled label keys that matched, and the rest is cosine. Keys the alert
 // does not carry are not counted against a candidate.
-//
-// ponytail: the dilution is the deeper defect -- IDF weighting in textVector
-// would let content carry identity by itself. Until then this bounds the damage
-// rather than hiding it.
 const labelWeight = 0.25
 
 func blendedSimilarity(
 	queryVector, memoryVector map[string]float64,
 	alertLabels, memoryLabels map[string]string,
+	df map[string]int, corpusSize int,
 ) float64 {
-	content := cosineSimilarity(queryVector, memoryVector)
+	content := idfCosineSimilarity(queryVector, memoryVector, df, corpusSize)
 	present, matched := 0, 0
 	for _, key := range identityLabelKeys {
 		if alertLabels[key] == "" {

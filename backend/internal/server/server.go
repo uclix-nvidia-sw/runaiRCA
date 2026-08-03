@@ -59,6 +59,16 @@ type Artifact struct {
 	Highlights []string `json:"highlights,omitempty"`
 }
 
+// retrieval_kind values for SimilarIncident.RetrievalKind. Named once here so
+// the producers (dbSearchMemoryExcluding's dense tagging in store_postgres.go,
+// the sparse paths in memory.go) and the dense-vs-sparse preference check in
+// SimilarIncidentsForAlert can't drift apart via a typo in a duplicated literal.
+const (
+	retrievalKindDenseSemantic  = "dense-semantic"  // real embedding model (remote basis)
+	retrievalKindDenseLexical   = "dense-lexical"   // signed feature hashing, no IDF
+	retrievalKindSparseIdentity = "sparse-identity" // in-memory IDF-weighted cosine + label blend
+)
+
 type SimilarIncident struct {
 	IncidentID       string            `json:"incident_id"`
 	AlertID          string            `json:"alert_id,omitempty"`
@@ -156,7 +166,7 @@ type Incident struct {
 	IsAnalyzing    bool       `json:"is_analyzing"`
 	// AnalysisSeq counts Slack-notified analyses (1 = Initial Analysis). Runs
 	// are updated in place on re-analysis, so rows can't be counted instead.
-	AnalysisSeq      int       `json:"analysis_seq"`
+	AnalysisSeq   int    `json:"analysis_seq"`
 	SlackThreadTS string `json:"-"`
 	// LatestActivityAt is alert activity (fire/resolve). On the wire it carries
 	// the EFFECTIVE activity the list is ordered by — cloneIncident folds in
@@ -300,7 +310,7 @@ func hostedCostEstimates(promptTokens, completionTokens int) []HostedCostEstimat
 		out = append(out, HostedCostEstimate{
 			Provider: rate.Provider,
 			Model:    rate.Model,
-			CostUSD: (float64(promptTokens)*rate.In + float64(completionTokens)*rate.Out) / perMillion,
+			CostUSD:  (float64(promptTokens)*rate.In + float64(completionTokens)*rate.Out) / perMillion,
 		})
 	}
 	return out
@@ -361,25 +371,29 @@ type Server struct {
 
 const (
 	similarIncidentLimit = 3
-	// Cross-incident feedback/comments are only imported as learning hints above
-	// this similarity — matches the agent planner's "trustworthy" bar. Below it,
-	// another incident's comments are noise, not guidance.
-	// Blended scale (see blendedSimilarity): identity contributes at most
-	// labelWeight, so a score no longer saturates near 1.0 the way the old
-	// additive bonus made it. The bar is unchanged in MEANING -- under the old
-	// formula an all-labels-match candidate cleared 0.80 with content ~0.59,
-	// and 0.75*0.59 + 0.25 = 0.69 -- only in units.
+	// Blended scale with an IDF-weighted cosine (see idfWeight / blendedSimilarity).
+	// Measured end to end through SimilarIncidentsForAlert on this package's own
+	// fixtures, with identity labels held IDENTICAL so only content differs:
+	//
+	//   genuine same-root-cause match ............ 0.8840
+	//   same-alertname, different root cause ..... 0.5620
+	//
+	// 0.70 sits mid-gap, ~0.14 clear of both. It is not a restored guess: the
+	// bar briefly went to 0.60 while idfWeightedVector still charged the query
+	// for tokens no stored document has, which taxed every score and made the
+	// same pair score lower as the corpus grew. Dropping those tokens removed
+	// the tax, and the measurement above is on the corrected formula.
 	minFeedbackHintSimilarity = 0.70
 	// Recurrence counting still runs the additive identity formula, so it keeps
 	// the original bar. Sharing one constant across two scales would silently
 	// loosen "did this fire again in 7d".
 	minRecurrenceSimilarity = 0.80
-	flappingGroupWindow       = 30 * time.Minute
-	maxListLimit              = 200
-	maxJSONBodyBytes          = 1 << 20
-	maxProgressBodyBytes      = 64 << 10
-	maxEmbeddingQueryBytes    = 4000
-	maxWebhookAlerts          = 500
+	flappingGroupWindow     = 30 * time.Minute
+	maxListLimit            = 200
+	maxJSONBodyBytes        = 1 << 20
+	maxProgressBodyBytes    = 64 << 10
+	maxEmbeddingQueryBytes  = 4000
+	maxWebhookAlerts        = 500
 	// Default caps; overridable via MAX_AUTO_ANALYZE_FANOUT / MAX_CONCURRENT_AGENT_RUNS.
 	maxAutoAnalyzeFanout      = 50
 	maxManualAnalyzeFanout    = 50
@@ -542,8 +556,8 @@ func NewServer() *Server {
 		backfillInterval:      time.Duration(getenvInt("ANALYSIS_BACKFILL_INTERVAL_SECONDS", 300)) * time.Second,
 		backfillBatch:         backfillBatch,
 		backfillRetryCooldown: time.Duration(getenvInt("ANALYSIS_BACKFILL_RETRY_COOLDOWN_SECONDS", 900)) * time.Second,
-		trashRetention: time.Duration(trashRetentionDays) * 24 * time.Hour,
-		slack:          NewSlackNotifierFromEnv(),
+		trashRetention:        time.Duration(trashRetentionDays) * 24 * time.Hour,
+		slack:                 NewSlackNotifierFromEnv(),
 		// ECB reference rates, no API key. The .dev/v1 host is where the older
 		// frankfurter.app URL redirects — naming it directly skips the hop. A
 		// cluster without egress keeps the configured fallback so the won

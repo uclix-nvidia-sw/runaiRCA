@@ -879,9 +879,9 @@ func (s *Store) dbSearchMemoryExcluding(query, excludedIncidentID string, limit 
 		log.Printf("WARNING: embedding query fell back to hash; using sparse similarity to avoid cross-basis results: %v", queryEmbedding.err)
 		return nil, false
 	}
-	retrievalKind := "dense-lexical"
+	retrievalKind := retrievalKindDenseLexical
 	if queryEmbedding.basis == embeddingBasisRemote {
-		retrievalKind = "dense-semantic"
+		retrievalKind = retrievalKindDenseSemantic
 	}
 	literal := embeddingLiteral(queryEmbedding.vector)
 	queryLimit := limit * 3

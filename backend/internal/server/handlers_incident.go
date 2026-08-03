@@ -183,6 +183,15 @@ func (s *Server) handleIncident(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if detail, ok := s.store.IncidentDetail(id); ok {
+		// Prefer the set captured right after THIS incident's own analysis
+		// completed (CompleteAnalysisRun / CompleteAnalysisRunWithSlackDelivery
+		// schedule that refresh in the background once the run's own RCA text
+		// exists to query with, and persist it on the run). It is stable and
+		// already content-based, so it saves the embedding+pgvector round trip
+		// below on every page view. Only live-recompute when no run has
+		// produced one yet -- still analyzing, or the background refresh has
+		// not landed.
+		//
 		// Rank the panel by the SAME retrieval the analysis cited. Embedding and
 		// pgvector are network I/O that must never run under the store lock, so
 		// the locked IncidentDetail build can only ever reach the sparse-identity
@@ -191,7 +200,9 @@ func (s *Server) handleIncident(w http.ResponseWriter, r *http.Request) {
 		// same pair. Re-resolve out here, where dense can be tried first; it
 		// enforces the same approved/not-deleted/not-self gates as the fallback,
 		// and returns the fallback verbatim when pgvector is unavailable.
-		if len(detail.Alerts) > 0 {
+		if postAnalysis, ok := s.store.PostAnalysisSimilarIncidentsForIncident(id); ok {
+			detail.SimilarIncidents = postAnalysis
+		} else if len(detail.Alerts) > 0 {
 			detail.SimilarIncidents = s.store.SimilarIncidentsForAlert(
 				alertFromRecord(detail.Alerts[0]), id, similarIncidentLimit,
 			)

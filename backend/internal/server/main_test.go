@@ -3219,6 +3219,160 @@ func TestTokenizeKeepsKoreanAndSimilarityIsHighForNearDuplicates(t *testing.T) {
 	}
 }
 
+func TestIDFWeightHandlesDegenerateCorpora(t *testing.T) {
+	// Empty corpus: nothing to compare against, so every token is neutral (the
+	// same weight plain term counts would give it) -- not a divide-by-zero.
+	for _, df := range []int{0, 1, 5} {
+		if got := idfWeight(df, 0); got != 1 {
+			t.Fatalf("empty corpus should give the neutral weight 1, got idfWeight(%d, 0)=%v", df, got)
+		}
+	}
+
+	// Single-document corpus: its only document's tokens all have df == corpusSize
+	// == 1, so they all sit at the floor -- IDF has no basis to call anything
+	// rare with one document, so this must degrade to the neutral weight, not
+	// collapse toward zero.
+	if got := idfWeight(1, 1); got != 1 {
+		t.Fatalf("single-document corpus should floor at the neutral weight 1, got idfWeight(1,1)=%v", got)
+	}
+
+	// A token in EVERY document of a larger corpus (shared boilerplate) also
+	// bottoms out at the floor -- the smallest the formula ever produces, never
+	// zero and never negative.
+	for _, n := range []int{2, 5, 100} {
+		if got := idfWeight(n, n); got != 1 {
+			t.Fatalf("a token present in all %d documents should floor at 1, got %v", n, got)
+		}
+	}
+
+	// A token unique to one document out of many is amplified well above the
+	// floor, and a token absent from every document (df=0, e.g. a word only the
+	// query used) is amplified even further -- but both stay finite.
+	rare := idfWeight(1, 100)
+	unseen := idfWeight(0, 100)
+	universal := idfWeight(100, 100)
+	if !(unseen > rare && rare > universal) {
+		t.Fatalf("expected unseen(%v) > rare(%v) > universal(%v)", unseen, rare, universal)
+	}
+
+	// No NaN, no Inf, never below the floor of 1, across a grid of df/corpusSize
+	// combinations including the degenerate ones.
+	for _, n := range []int{0, 1, 2, 10, 1000} {
+		for df := 0; df <= n; df++ {
+			got := idfWeight(df, n)
+			if math.IsNaN(got) || math.IsInf(got, 0) {
+				t.Fatalf("idfWeight(%d, %d) is not finite: %v", df, n, got)
+			}
+			if got < 1 {
+				t.Fatalf("idfWeight(%d, %d) fell below the floor of 1: %v", df, n, got)
+			}
+		}
+	}
+}
+
+func TestCorpusDocFreqLockedCountsDocumentsNotOccurrences(t *testing.T) {
+	// df counts how many DOCUMENTS contain a token at least once, not how many
+	// times it appears across the corpus -- a token repeated 5 times in one
+	// document must not outweigh one that appears once in each of two others.
+	memories := map[string]*IncidentMemory{
+		"a":                    {IncidentID: "a", Vector: map[string]float64{"repeated": 5, "onlya": 1}},
+		"b":                    {IncidentID: "b", Vector: map[string]float64{"shared": 1, "onlyb": 1}},
+		"c":                    {IncidentID: "c", Vector: map[string]float64{"shared": 1, "onlyc": 1}},
+		"nil-entry-is-skipped": nil,
+	}
+	df, n := corpusDocFreqLocked(memories)
+	if n != 3 {
+		t.Fatalf("expected 3 documents (nil entries excluded), got %d", n)
+	}
+	if df["repeated"] != 1 {
+		t.Fatalf("repeated occurrences within one document must count as df=1, got %d", df["repeated"])
+	}
+	if df["shared"] != 2 {
+		t.Fatalf("a token in two distinct documents must have df=2, got %d", df["shared"])
+	}
+	if df["onlya"] != 1 || df["onlyb"] != 1 || df["onlyc"] != 1 {
+		t.Fatalf("unique tokens must have df=1, got onlya=%d onlyb=%d onlyc=%d", df["onlya"], df["onlyb"], df["onlyc"])
+	}
+
+	// Never-seen token: absent from the map entirely, df defaults to Go's zero
+	// value (0) on lookup -- idfWeight must treat that as "unseen", not panic.
+	if got := idfWeight(df["never-seen"], n); got <= 1 {
+		t.Fatalf("an unseen token should be amplified above the floor, got %v", got)
+	}
+}
+
+// TestIDFCosineSimilarityBoilerplateVsDistinguishingTerms is the concrete case
+// motivating Part 1: a stored memory document is a full RCA and the query is a
+// short alert, so under plain term-count cosine, boilerplate every same-
+// alertname incident shares weighed exactly as much as the words that actually
+// tell two root causes apart. IDF must fix that at compare time.
+//
+// Controlled token sets, not prose: isolates what IDF does to a token from how
+// long the surrounding sentence happens to be. Every document in a 15-document
+// corpus shares the SAME 5 boilerplate tokens (roughly an Alertmanager
+// "non-ready state" sentence's worth) plus 8 tokens unique to that one
+// document (a short RCA's worth of distinguishing content).
+func TestIDFCosineSimilarityBoilerplateVsDistinguishingTerms(t *testing.T) {
+	const boilerplateSize, distinguishingSize, corpusSize = 5, 8, 15
+	memories := map[string]*IncidentMemory{}
+	for i := 0; i < corpusSize; i++ {
+		vec := map[string]float64{}
+		for b := 0; b < boilerplateSize; b++ {
+			vec["boilerplate"+strconv.Itoa(b)] = 1
+		}
+		for d := 0; d < distinguishingSize; d++ {
+			vec["doc"+strconv.Itoa(i)+"cause"+strconv.Itoa(d)] = 1
+		}
+		id := "INC-" + strconv.Itoa(i)
+		memories[id] = &IncidentMemory{IncidentID: id, Vector: vec}
+	}
+	df, n := corpusDocFreqLocked(memories)
+	target := memories["INC-0"]
+
+	boilerplateOnlyQuery := map[string]float64{}
+	for b := 0; b < boilerplateSize; b++ {
+		boilerplateOnlyQuery["boilerplate"+strconv.Itoa(b)] = 1
+	}
+	boilerplateOnlyScore := idfCosineSimilarity(boilerplateOnlyQuery, target.Vector, df, n)
+
+	matchingQuery := map[string]float64{}
+	for k, v := range boilerplateOnlyQuery {
+		matchingQuery[k] = v
+	}
+	for d := 0; d < distinguishingSize; d++ {
+		matchingQuery["doc0cause"+strconv.Itoa(d)] = 1
+	}
+	matchingScore := idfCosineSimilarity(matchingQuery, target.Vector, df, n)
+
+	// Boilerplate shared by every one of the 15 documents contributes ~nothing:
+	// a query that ONLY echoes the boilerplate scores far below the 0.6-0.8
+	// range a shared-substring match of this size would get under plain cosine.
+	// (Measured: 0.2487.)
+	if boilerplateOnlyScore > 0.3 {
+		t.Fatalf("boilerplate shared by every document should contribute ~nothing, got %.4f", boilerplateOnlyScore)
+	}
+	// A distinguishing token set unique to one document dominates: adding it to
+	// the same query pushes the score to the ceiling (the query then equals the
+	// target exactly). (Measured: 1.0000.) Compared with a fixed floor rather
+	// than a multiple of boilerplateOnlyScore, which would leave razor-thin
+	// margin once boilerplateOnlyScore sits close to its own 0.3 ceiling.
+	if matchingScore < 0.9 {
+		t.Fatalf("distinguishing overlap should dominate boilerplate-only overlap: matching=%.4f boilerplate-only=%.4f", matchingScore, boilerplateOnlyScore)
+	}
+
+	// Pin WHY: under the OLD plain-count cosine, the gap between "boilerplate
+	// only" and "boilerplate + matching cause" is far narrower, because every
+	// boilerplate token counts exactly as much as the distinguishing ones.
+	oldBoilerplateOnly := cosineSimilarity(boilerplateOnlyQuery, target.Vector)
+	oldMatching := cosineSimilarity(matchingQuery, target.Vector)
+	oldGap := oldMatching - oldBoilerplateOnly
+	newGap := matchingScore - boilerplateOnlyScore
+	if newGap <= oldGap {
+		t.Fatalf("IDF should widen the boilerplate-vs-content gap, got old=%.4f (boilerplate=%.4f matching=%.4f) new=%.4f (boilerplate=%.4f matching=%.4f)",
+			oldGap, oldBoilerplateOnly, oldMatching, newGap, boilerplateOnlyScore, matchingScore)
+	}
+}
+
 func TestIncidentLifecycleViewsAndDeletedGuards(t *testing.T) {
 	store := NewStore()
 	webhook := AlertmanagerWebhook{GroupKey: "lifecycle"}

@@ -42,9 +42,26 @@ from app.services.decision_tree import resolve_tree, walk_tree
 _log = logging.getLogger(__name__)
 
 # A similar incident is only trustworthy above its retrieval-kind floor.
+#
+# Measured end to end on the backend's own fixtures after the sparse cosine
+# became IDF-weighted, with identity labels held IDENTICAL so only content
+# differs: a genuine same-root-cause match scores 0.8840 and a
+# same-alertname/different-root-cause candidate 0.5620. The sparse bar was
+# 0.80, which left only 0.04 of headroom under a real match -- and before IDF
+# that same match scored 0.7024, i.e. this floor admitted nothing at all.
+# 0.78 keeps ~0.07-0.10 of headroom under a real match and ~0.22 above the
+# same-labels/different-cause one. It stays ABOVE dense-semantic on purpose: a
+# real embedding match is the more trustworthy signal, only the sparse scale was
+# measured here, and a test pins that the two kinds do not share a bar. Seeding
+# an investigation off a wrong prior is worse than citing one in a report, so
+# both stay stricter than the pipeline's citation floor (0.70).
 _SIMILARITY_FLOORS = {
     "dense-semantic": 0.75,
-    "sparse-identity": 0.80,
+    "sparse-identity": 0.78,
+    # SimilarIncidentsForAlert prefers the dense index only when it is genuinely
+    # semantic, so a lexical-basis result never reaches the agent today. Kept
+    # (and strictest) because the tag still exists on the backend and a future
+    # preference change must not silently admit hashed bag-of-words matches.
     "dense-lexical": 0.85,
 }
 _DEFAULT_SIMILARITY_FLOOR = 0.80

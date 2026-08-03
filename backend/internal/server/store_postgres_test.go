@@ -108,9 +108,49 @@ func TestPGVectorSimilarIncidentsTagDenseLexicalWithoutEndpoint(t *testing.T) {
 		Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning", "queue": "gpu-a"},
 		Annotations: map[string]string{"summary": "GPU quota blocked scheduling"},
 	}
+
+	// The dense index itself is still tagged dense-lexical on a hash-basis query
+	// (no remote embedder) -- that tagging in dbSearchMemoryExcluding is
+	// unchanged. Call it directly to pin that.
+	dense, ok := store.dbSearchSimilarIncidents(alertSearchText(alert), "INC-current", 1)
+	if !ok || len(dense) != 1 || dense[0].RetrievalKind != retrievalKindDenseLexical {
+		t.Fatalf("expected hash-basis pgvector result to be tagged dense-lexical, got ok=%t %+v", ok, dense)
+	}
+
+	// But SimilarIncidentsForAlert no longer prefers it: dense-lexical is signed
+	// feature hashing with no IDF, weaker than the now IDF-weighted sparse path,
+	// so sparse wins.
 	similar := store.SimilarIncidentsForAlert(alert, "INC-current", 1)
-	if len(similar) != 1 || similar[0].RetrievalKind != "dense-lexical" {
-		t.Fatalf("expected hash-basis pgvector result to be dense-lexical, got %+v", similar)
+	if len(similar) != 1 || similar[0].RetrievalKind != retrievalKindSparseIdentity {
+		t.Fatalf("expected the weaker dense-lexical result to lose to IDF-weighted sparse, got %+v", similar)
+	}
+}
+
+// The other direction of the same preference: with a REAL embedder configured
+// (remote basis), the dense hit is dense-semantic, and that stays primary over
+// the sparse path exactly as before -- only the lexical (hash-basis) case lost
+// its seat.
+func TestPGVectorSimilarIncidentsPrefersDenseSemanticOverSparse(t *testing.T) {
+	state := testsupport.NewPostgresState(false)
+	store := NewStore()
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		vector := make([]float32, embeddingDim)
+		vector[0] = 1
+		writeJSON(w, http.StatusOK, map[string]any{"data": []map[string]any{{"embedding": vector}}})
+	}))
+	defer embedSrv.Close()
+	store.embedder = &embedder{endpoint: embedSrv.URL, dim: embeddingDim, client: embedSrv.Client()}
+
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "severity": "warning", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "GPU quota blocked scheduling"},
+	}
+	similar := store.SimilarIncidentsForAlert(alert, "INC-current", 1)
+	if len(similar) != 1 || similar[0].RetrievalKind != retrievalKindDenseSemantic {
+		t.Fatalf("expected a real embedder's dense-semantic result to stay primary, got %+v", similar)
 	}
 }
 
@@ -337,12 +377,24 @@ func assertLoadedPostgresMemory(t *testing.T, store *Store) {
 // never run there, so the locked build can only reach the sparse-identity
 // fallback -- which is how one report quoted "similarity 0.97" from the dense
 // index while the card beside it showed 78% from sparse, for the same pair.
-// The GET handler re-resolves outside the lock, where dense is tried first.
+// The GET handler re-resolves outside the lock, where dense is tried first --
+// but only when it is actually semantic (a real embedder, remote basis): a
+// hash-basis pgvector hit (dense-lexical) has no IDF and loses to the
+// IDF-weighted sparse path now, so this configures a remote embedder to
+// exercise the case dense should still win.
 func TestIncidentDetailHandlerServesDenseSimilarity(t *testing.T) {
 	state := testsupport.NewPostgresState(false)
+	embedSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		vector := make([]float32, embeddingDim)
+		vector[0] = 1
+		writeJSON(w, http.StatusOK, map[string]any{"data": []map[string]any{{"embedding": vector}}})
+	}))
+	defer embedSrv.Close()
+
 	server := NewServer()
 	server.store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
 	defer server.store.db.Close()
+	server.store.embedder = &embedder{endpoint: embedSrv.URL, dim: embeddingDim, client: embedSrv.Client()}
 
 	locked, ok := server.store.IncidentDetail("INC-db")
 	if !ok {
@@ -373,7 +425,7 @@ func TestIncidentDetailHandlerServesDenseSimilarity(t *testing.T) {
 	// The fake driver answers the <=> query, so this is the pgvector path the
 	// panel could never take before. (It ignores bind parameters, so the
 	// self-exclusion the real SQL applies is not exercised here.)
-	if kind := body.Data.SimilarIncidents[0].RetrievalKind; !strings.HasPrefix(kind, "dense") {
-		t.Fatalf("panel must use the dense index, got kind=%q", kind)
+	if kind := body.Data.SimilarIncidents[0].RetrievalKind; kind != retrievalKindDenseSemantic {
+		t.Fatalf("panel must use the dense-semantic index when a real embedder is configured, got kind=%q", kind)
 	}
 }

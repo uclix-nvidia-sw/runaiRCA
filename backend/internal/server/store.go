@@ -2080,6 +2080,9 @@ func (s *Store) AppendAnalysisProgress(runID string, entry map[string]any) (Anal
 
 func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse) (AnalysisRun, bool) {
 	run, _, ok := s.completeAnalysisRun(runID, response, "")
+	if ok {
+		s.scheduleSimilarIncidentsRefresh(run)
+	}
 	return run, ok
 }
 
@@ -2088,7 +2091,11 @@ func (s *Store) CompleteAnalysisRun(runID string, response AgentAnalysisResponse
 // after this method can delay delivery, but the retry worker always has the
 // exact completed attempt to resume from.
 func (s *Store) CompleteAnalysisRunWithSlackDelivery(runID string, response AgentAnalysisResponse, incidentID string) (AnalysisRun, SlackAnalysisDelivery, bool) {
-	return s.completeAnalysisRun(runID, response, incidentID)
+	run, delivery, ok := s.completeAnalysisRun(runID, response, incidentID)
+	if ok {
+		s.scheduleSimilarIncidentsRefresh(run)
+	}
+	return run, delivery, ok
 }
 
 func (s *Store) completeAnalysisRun(runID string, response AgentAnalysisResponse, slackIncidentID string) (AnalysisRun, SlackAnalysisDelivery, bool) {
@@ -2134,6 +2141,116 @@ func (s *Store) completeAnalysisRun(runID string, response AgentAnalysisResponse
 		return cloneAnalysisRun(run), SlackAnalysisDelivery{}, false
 	}
 	return cloneAnalysisRun(run), delivery, true
+}
+
+// analysisRunSimilarIncidentsMetadataKey stores a run's own post-analysis
+// similar-incidents snapshot inside Metadata rather than a dedicated
+// AnalysisRun field. persistAnalysisRunLocked (store_postgres.go) writes
+// named columns one at a time, so a new top-level field would never survive
+// a Postgres round trip without also touching that file; Metadata already
+// round-trips as its own jsonb column. It also rides the existing
+// lastGoodMetadataSnapshot / restorePreviousSuccessMetadata machinery for
+// free: a failed re-analysis restores the whole prior Metadata map,
+// including this key, so a bad retry can never clobber a good snapshot with
+// a worse (or missing) one.
+const analysisRunSimilarIncidentsMetadataKey = "similar_incidents_post_analysis"
+
+// scheduleSimilarIncidentsRefresh re-resolves this incident's similar
+// incidents now that the run carries a real RCA, and persists the result
+// onto THIS run so every downstream reader gets the content-based
+// (diagnosis vs diagnosis) set that similarIncidentQueryLocked can only build
+// once a completed run exists -- instead of the alert-only set every earlier
+// caller was stuck with. This does NOT reach back and fix what the agent
+// already received at run creation (compactAgentSimilarIncidents in
+// analysis_runs.go, or any similarity line already baked into the generated
+// report text) -- that ordering happened before this RCA existed and cannot
+// be undone after the fact.
+//
+// Runs in its own goroutine, deliberately: SimilarIncidentsForAlert does
+// embedding + pgvector network I/O that must never run under the store lock
+// (see its own comment) and must never delay the completion path -- the SSE
+// broadcast and Slack delivery that follow CompleteAnalysisRun /
+// CompleteAnalysisRunWithSlackDelivery. This is best-effort context, never
+// evidence: any failure here (alert gone, embeddings down, run superseded
+// before this lands) just leaves the metadata key unset or unchanged, and
+// every reader already falls back to a live re-resolution.
+func (s *Store) scheduleSimilarIncidentsRefresh(run AnalysisRun) {
+	if run.RunID == "" || run.IncidentID == "" || run.AlertID == "" {
+		return
+	}
+	go func() {
+		alert, _, _, _, _, ok := s.AnalysisTarget("alert", run.AlertID)
+		if !ok {
+			return
+		}
+		items := s.SimilarIncidentsForAlert(alert, run.IncidentID, similarIncidentLimit)
+		s.persistPostAnalysisSimilarIncidents(run.RunID, run.UpdatedAt, items)
+	}()
+}
+
+// persistPostAnalysisSimilarIncidents attaches a freshly re-resolved
+// similar-incidents set to the run that requested it. completedAt must still
+// match the run's current UpdatedAt: if the run moved on since the refresh
+// was scheduled -- failed, superseded-then-failed, or already reused and
+// completed again by a faster subsequent re-analysis -- this write is for a
+// completion that is no longer current, and skipping it is what keeps a
+// slow/late refresh from ever overwriting a better, newer snapshot (or
+// writing one onto a run that no longer represents a good result).
+func (s *Store) persistPostAnalysisSimilarIncidents(runID string, completedAt time.Time, items []SimilarIncident) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run := s.analysisRuns[runID]
+	if run == nil || run.Status != "complete" || !run.UpdatedAt.Equal(completedAt) {
+		return
+	}
+	before := cloneAnalysisRun(run)
+	if run.Metadata == nil {
+		run.Metadata = map[string]any{}
+	}
+	run.Metadata[analysisRunSimilarIncidentsMetadataKey] = items
+	if !s.persistAnalysisRunLocked(run) {
+		*run = before
+	}
+}
+
+// PostAnalysisSimilarIncidentsForIncident returns the similar-incidents set
+// captured right after the incident's current analysis run completed, when
+// scheduleSimilarIncidentsRefresh has landed one. It selects "current run"
+// the same way similarIncidentQueryLocked does (latestAnalysisRunForIncidentLocked),
+// so whatever RCA text is presently shown for the incident -- including a
+// failed re-analysis that restored the last-good run's content and metadata
+// together -- is exactly what this snapshot was computed against.
+func (s *Store) PostAnalysisSimilarIncidentsForIncident(incidentID string) ([]SimilarIncident, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return postAnalysisSimilarIncidentsFromRun(s.latestAnalysisRunForIncidentLocked(incidentID))
+}
+
+// postAnalysisSimilarIncidentsFromRun extracts a run's persisted
+// post-analysis snapshot. Within one process it is a native []SimilarIncident
+// value; a run hydrated from Postgres after a restart decodes Metadata as
+// generic JSON (map[string]interface{} / []interface{}), so a failed type
+// assertion is retried as a JSON round trip before giving up.
+func postAnalysisSimilarIncidentsFromRun(run *AnalysisRun) ([]SimilarIncident, bool) {
+	if run == nil {
+		return nil, false
+	}
+	raw, ok := run.Metadata[analysisRunSimilarIncidentsMetadataKey]
+	if !ok || raw == nil {
+		return nil, false
+	}
+	if items, ok := raw.([]SimilarIncident); ok {
+		return items, true
+	}
+	blob, err := json.Marshal(raw)
+	if err != nil {
+		return nil, false
+	}
+	var items []SimilarIncident
+	if err := json.Unmarshal(blob, &items); err != nil {
+		return nil, false
+	}
+	return items, true
 }
 
 func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (AnalysisRun, bool) {

@@ -2044,3 +2044,212 @@ func TestAutoRunReusesBackfillRowForSameAlert(t *testing.T) {
 		t.Fatalf("expected one run row per alert, got %d", len(store.analysisRuns))
 	}
 }
+
+// waitForPostAnalysisSimilarIncidents polls for the background refresh that
+// CompleteAnalysisRun / CompleteAnalysisRunWithSlackDelivery schedule
+// (scheduleSimilarIncidentsRefresh in store.go): it runs in its own
+// goroutine specifically so completion never blocks on it, so tests observe
+// the persisted result the same way any other reader would -- by polling,
+// not by assuming it lands synchronously.
+func waitForPostAnalysisSimilarIncidents(t *testing.T, store *Store, incidentID string) []SimilarIncident {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if items, ok := store.PostAnalysisSimilarIncidentsForIncident(incidentID); ok {
+			return items
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("post-analysis similar incidents for %q were never persisted", incidentID)
+	return nil
+}
+
+// TestCompleteAnalysisRunRefreshesSimilarIncidentsFromRCA is the first-analysis
+// case: similarIncidentQueryLocked can only compare diagnosis to diagnosis once
+// THIS incident has a completed run, so the pre-analysis query is the alert
+// alone (see its own doc comment) and cannot find a prior incident that only
+// shares a root cause, not alert text. Once CompleteAnalysisRun runs, the
+// background refresh re-resolves with the fresh RCA in the query and the
+// persisted set picks up what the alert-only query could not.
+func TestCompleteAnalysisRunRefreshesSimilarIncidentsFromRCA(t *testing.T) {
+	store := NewStore()
+	const priorRCA = "GPU fell off the bus with xid 79; the driver reset the device."
+
+	seedApprovedMemoryIncidentForTest(store, "INC-prior-xid79", time.Now().UTC())
+	prior := &IncidentMemory{
+		IncidentID:      "INC-prior-xid79",
+		Title:           "GPU node alert",
+		Labels:          map[string]string{"alertname": "GPUXidError", "namespace": "runai-vision"},
+		AnalysisSummary: priorRCA,
+	}
+	prior.Vector = textVector(memoryText(*prior))
+	store.memories[prior.IncidentID] = prior
+
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "fp-similarity-refresh"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-similarity-refresh",
+	})
+
+	// Pre-analysis: the query is the alert alone, which shares nothing with
+	// the prior incident's diagnosis, so it must not match.
+	before := store.SimilarIncidentsForAlert(alertFromRecord(*alert), incident.IncidentID, 5)
+	for _, item := range before {
+		if item.IncidentID == prior.IncidentID {
+			t.Fatalf("prior incident must not match on alert text alone: %+v", before)
+		}
+	}
+
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	if _, ok := store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: priorRCA,
+		AnalysisDetail:  "## Root Cause\n\n" + priorRCA,
+		AnalysisQuality: "high",
+	}); !ok {
+		t.Fatalf("complete failed")
+	}
+
+	after := waitForPostAnalysisSimilarIncidents(t, store, incident.IncidentID)
+	var match *SimilarIncident
+	for i := range after {
+		if after[i].IncidentID == prior.IncidentID {
+			match = &after[i]
+		}
+	}
+	if match == nil || match.Similarity <= 0 {
+		t.Fatalf("post-analysis set did not pick up the prior incident once the RCA text matched: before=%+v after=%+v", before, after)
+	}
+}
+
+// TestFailedReanalysisPreservesPostAnalysisSimilarIncidents covers the
+// correctness requirement that a run which fails (including the superseded
+// case, which also terminates through FailAnalysisRun with its content
+// preserved) must not overwrite a good post-analysis set with a worse one.
+// Storing the snapshot in Metadata means this falls out of the existing
+// lastGoodMetadataSnapshot / restorePreviousSuccessMetadata machinery with no
+// extra code: a failed re-analysis restores the WHOLE prior metadata map,
+// this key included, alongside the last-good AnalysisSummary/Detail it was
+// computed against.
+func TestFailedReanalysisPreservesPostAnalysisSimilarIncidents(t *testing.T) {
+	store := NewStore()
+	const priorRCA = "GPU thermal throttling triggered by a blocked chassis fan."
+
+	seedApprovedMemoryIncidentForTest(store, "INC-prior-thermal", time.Now().UTC())
+	prior := &IncidentMemory{
+		IncidentID:      "INC-prior-thermal",
+		Title:           "GPU thermal alert",
+		Labels:          map[string]string{"alertname": "GPUThermalThrottle"},
+		AnalysisSummary: priorRCA,
+	}
+	prior.Vector = textVector(memoryText(*prior))
+	store.memories[prior.IncidentID] = prior
+
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "fp-failed-reanalysis"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-failed-reanalysis",
+	})
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Initial", "")
+	if _, ok := store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: priorRCA}); !ok {
+		t.Fatalf("initial complete failed")
+	}
+	good := waitForPostAnalysisSimilarIncidents(t, store, incident.IncidentID)
+	if len(good) == 0 {
+		t.Fatalf("setup did not produce a post-analysis set worth protecting")
+	}
+
+	// A reanalysis starts (reuses the same row -- CreateAnalysisRunIfAllowed
+	// resets Metadata but snapshots it into previous_success_metadata first)
+	// and then fails outright, e.g. the agent was unavailable.
+	reused, created := store.CreateAnalysisRunIfAllowed("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Retry", "")
+	if !created || reused.RunID != run.RunID {
+		t.Fatalf("expected the reanalysis to reuse the same run row: created=%t run=%+v", created, reused)
+	}
+	failed, ok := store.FailAnalysisRun(reused.RunID, AgentAnalysisResponse{AnalysisSummary: "agent unavailable"})
+	if !ok || failed.Status != "failed" {
+		t.Fatalf("expected the retry to fail: ok=%t run=%+v", ok, failed)
+	}
+
+	after, ok := store.PostAnalysisSimilarIncidentsForIncident(incident.IncidentID)
+	if !ok || len(after) != len(good) || after[0].IncidentID != good[0].IncidentID {
+		t.Fatalf("failed reanalysis must not clobber the last-good post-analysis set: good=%+v after=%+v ok=%t", good, after, ok)
+	}
+}
+
+// TestCompleteAnalysisRunSucceedsWhenSimilarIncidentsRefreshCannotResolveAlert
+// covers the "best-effort, never evidence" requirement: the background
+// refresh cannot resolve an alert (deleted, or in this case never existed),
+// so it gives up silently, and that failure must not affect the already-
+// -returned completion in any way.
+func TestCompleteAnalysisRunSucceedsWhenSimilarIncidentsRefreshCannotResolveAlert(t *testing.T) {
+	store := NewStore()
+	store.incidents["INC-orphan-refresh"] = &Incident{IncidentID: "INC-orphan-refresh", Status: "firing"}
+	store.analysisRuns["ANL-orphan-refresh"] = &AnalysisRun{
+		RunID:      "ANL-orphan-refresh",
+		Source:     "manual",
+		Status:     "analyzing",
+		TargetType: "incident",
+		TargetID:   "INC-orphan-refresh",
+		IncidentID: "INC-orphan-refresh",
+		AlertID:    "ALT-does-not-exist",
+		CreatedAt:  time.Now().UTC(),
+		UpdatedAt:  time.Now().UTC(),
+	}
+
+	completed, ok := store.CompleteAnalysisRun("ANL-orphan-refresh", AgentAnalysisResponse{
+		AnalysisSummary: "done despite no resolvable alert",
+	})
+	if !ok || completed.Status != "complete" || completed.AnalysisSummary != "done despite no resolvable alert" {
+		t.Fatalf("completion must succeed synchronously regardless of whether the background refresh can run: ok=%t run=%+v", ok, completed)
+	}
+
+	// Give the background goroutine a chance to run and give up; it must never
+	// manage to write anything, but it also must never be relied on to have
+	// finished by any particular time.
+	time.Sleep(50 * time.Millisecond)
+	if items, ok := store.PostAnalysisSimilarIncidentsForIncident("INC-orphan-refresh"); ok {
+		t.Fatalf("expected no post-analysis snapshot when the run's alert cannot be resolved, got %+v", items)
+	}
+	after, ok := store.AnalysisRun("ANL-orphan-refresh")
+	if !ok || after.Status != "complete" || after.AnalysisSummary != "done despite no resolvable alert" {
+		t.Fatalf("completion must remain intact after a failed background refresh: ok=%t run=%+v", ok, after)
+	}
+}
+
+// TestPostAnalysisSimilarIncidentsSkipsStaleCompletion is a direct,
+// timing-independent test of the guard in persistPostAnalysisSimilarIncidents:
+// a refresh for a completion that is no longer the run's current one (here,
+// a faster second completion landed first) must not overwrite the newer
+// snapshot, however plausible it looks in isolation.
+func TestPostAnalysisSimilarIncidentsSkipsStaleCompletion(t *testing.T) {
+	store := NewStore()
+	store.incidents["INC-stale-guard"] = &Incident{IncidentID: "INC-stale-guard", Status: "firing"}
+	t1 := time.Now().UTC()
+	run := &AnalysisRun{
+		RunID:           "ANL-stale-guard",
+		Status:          "complete",
+		IncidentID:      "INC-stale-guard",
+		AnalysisSummary: "v2 RCA text",
+		UpdatedAt:       t1,
+	}
+	store.analysisRuns[run.RunID] = run
+
+	fresh := []SimilarIncident{{IncidentID: "INC-fresh-match"}}
+	store.persistPostAnalysisSimilarIncidents(run.RunID, t1, fresh)
+	if got, ok := store.PostAnalysisSimilarIncidentsForIncident("INC-stale-guard"); !ok || len(got) != 1 || got[0].IncidentID != "INC-fresh-match" {
+		t.Fatalf("expected the matching-timestamp write to land: ok=%t got=%+v", ok, got)
+	}
+
+	// The run moves on (e.g. a faster subsequent completion) before a slow
+	// refresh for the OLD completion returns.
+	run.UpdatedAt = time.Now().UTC()
+	stale := []SimilarIncident{{IncidentID: "INC-stale-match"}}
+	store.persistPostAnalysisSimilarIncidents(run.RunID, t1, stale)
+
+	got, ok := store.PostAnalysisSimilarIncidentsForIncident("INC-stale-guard")
+	if !ok || len(got) != 1 || got[0].IncidentID != "INC-fresh-match" {
+		t.Fatalf("a stale refresh clobbered the newer completion's snapshot: ok=%t got=%+v", ok, got)
+	}
+}
