@@ -2134,3 +2134,103 @@ async def test_prometheus_followup_reuses_query_from_an_earlier_agent_path(monke
 
     assert result == []
     assert prom.artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_similar_incidents_are_researched_from_the_run_s_own_evidence(monkeypatch):
+    """A FIRST analysis has no RCA, so run creation could only match the alert.
+
+    By synthesis time the run has its observed evidence and a ranked family, so
+    the report's "Similar past incident" line is re-resolved from that instead
+    of from labels and Alertmanager boilerplate.
+    """
+    from app.services import pipeline
+    from app.services.root_cause_ranking import RankedCause
+
+    sent: dict = {}
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        sent["url"] = url
+        sent["body"] = json_body
+        return SimpleNamespace(
+            ok=True,
+            status_code=200,
+            data={"data": {"results": [{
+                "incident_id": "INC-BY-CONTENT",
+                "title": "Quota saturated",
+                "similarity": 0.91,
+                "analysis_summary": "Run:AI queue gpu-a was saturated.",
+                "retrieval_kind": "sparse-identity",
+            }]}},
+        )
+
+    monkeypatch.setattr(pipeline, "post_json", fake_post_json)
+
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubePodNotReady", "namespace": "runai-test1"},
+            annotations={"summary": "Pod has been in a non-ready state."},
+            fingerprint="fp-research",
+        ),
+        incident_id="INC-CURRENT",
+        similar_incidents=[
+            SimilarIncidentContext(
+                incident_id="INC-BY-ALERT", similarity=0.99, title="Alert-only match"
+            )
+        ],
+    )
+    state = SimpleNamespace(
+        observed="container stress terminated OOMKilled exit code 137 memory limit 100Mi",
+        root_cause_candidates=[
+            RankedCause(family="workload_runtime_error", confidence="high", score=9.0)
+        ],
+    )
+    settings = replace(make_settings(), backend_url="http://backend.local")
+
+    await pipeline._refresh_similar_incidents_from_evidence(settings, request, state)
+
+    assert sent["url"] == "http://backend.local/api/v1/embeddings/search"
+    # The query carries the ranked family and the observed evidence, not the alert.
+    assert sent["body"]["query"].startswith("workload_runtime_error")
+    assert "OOMKilled" in sent["body"]["query"]
+    # An incident must never match its own stored memory row.
+    assert sent["body"]["exclude_incident_id"] == "INC-CURRENT"
+    assert [item.incident_id for item in request.similar_incidents] == ["INC-BY-CONTENT"]
+
+
+@pytest.mark.asyncio
+async def test_similar_incident_research_failure_keeps_the_run_creation_set(monkeypatch):
+    """Context, never evidence: a broken backend must not change the analysis."""
+    from app.services import pipeline
+
+    async def boom(**_kwargs):
+        raise RuntimeError("backend unreachable")
+
+    monkeypatch.setattr(pipeline, "post_json", boom)
+
+    original = [SimilarIncidentContext(incident_id="INC-BY-ALERT", similarity=0.99)]
+    request = AlertAnalysisRequest(
+        alert=Alert(status="firing", labels={"alertname": "X"}, annotations={}, fingerprint="fp"),
+        incident_id="INC-CURRENT",
+        similar_incidents=list(original),
+    )
+    state = SimpleNamespace(observed="some evidence text", root_cause_candidates=[])
+
+    await pipeline._refresh_similar_incidents_from_evidence(
+        replace(make_settings(), backend_url="http://backend.local"), request, state
+    )
+
+    assert [i.incident_id for i in request.similar_incidents] == ["INC-BY-ALERT"]
+
+    # No backend configured, or no evidence yet: the call is never made at all.
+    monkeypatch.setattr(pipeline, "post_json", boom)
+    await pipeline._refresh_similar_incidents_from_evidence(
+        replace(make_settings(), backend_url=""), request, state
+    )
+    await pipeline._refresh_similar_incidents_from_evidence(
+        replace(make_settings(), backend_url="http://backend.local"),
+        request,
+        SimpleNamespace(observed="", root_cause_candidates=[]),
+    )
+    assert [i.incident_id for i in request.similar_incidents] == ["INC-BY-ALERT"]

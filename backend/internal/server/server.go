@@ -144,6 +144,9 @@ type CommentRequest struct {
 type EmbeddingSearchRequest struct {
 	Query string `json:"query"`
 	Limit int    `json:"limit,omitempty"`
+	// The incident asking. Held out of the results so a mid-analysis re-search
+	// cannot match the incident against its own stored memory row.
+	ExcludeIncidentID string `json:"exclude_incident_id,omitempty"`
 }
 
 type EmbeddingSearchResponse struct {

@@ -3814,3 +3814,33 @@ func TestIncidentWireActivityDoesNotMoveTheFlapAnchor(t *testing.T) {
 		t.Fatalf("wire activity %v should be the analysis start %v", items[0].LatestActivityAt, stored.AnalysisActivityAt)
 	}
 }
+
+// The analysing incident must never match its own stored memory row: the agent
+// re-runs this search mid-analysis with its own collected evidence as the query,
+// and that text is by construction the closest thing in the corpus to itself.
+func TestSearchIncidentMemoryExcludesTheAskingIncident(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIWorkloadPending", "queue": "gpu-a"},
+		Annotations: map[string]string{"summary": "Workload pending waiting for GPU quota"},
+		Fingerprint: "fp-self",
+	}
+	incident, record := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "self"}, alert)
+	store.ApplyAnalysis(record.AlertID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Run:AI queue gpu-a was saturated.",
+		AnalysisDetail:  "GPU quota blocked scheduling.",
+	})
+	approveIncidentForTest(t, store, incident.IncidentID)
+
+	query := "Run:AI queue gpu-a was saturated. GPU quota blocked scheduling."
+	if got := store.SearchIncidentMemory(query, 5); len(got) == 0 || got[0].IncidentID != incident.IncidentID {
+		t.Fatalf("without an exclusion the incident should match itself, got %+v", got)
+	}
+	for _, item := range store.SearchIncidentMemoryExcluding(query, incident.IncidentID, 5) {
+		if item.IncidentID == incident.IncidentID {
+			t.Fatalf("excluded incident came back: %+v", item)
+		}
+	}
+}

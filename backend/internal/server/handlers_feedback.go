@@ -140,7 +140,9 @@ func (s *Server) handleEmbeddingSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "query is too long")
 		return
 	}
-	results := s.store.SearchIncidentMemory(query, req.Limit)
+	results := s.store.SearchIncidentMemoryExcluding(
+		query, strings.TrimSpace(req.ExcludeIncidentID), req.Limit,
+	)
 	writeJSON(w, http.StatusOK, envelope(EmbeddingSearchResponse{
 		Model:   "local-term-frequency",
 		Results: results,

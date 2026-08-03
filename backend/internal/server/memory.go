@@ -319,6 +319,18 @@ func capSimilarIncidentLimit(limit int) int {
 }
 
 func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident {
+	return s.SearchIncidentMemoryExcluding(query, "", limit)
+}
+
+// SearchIncidentMemoryExcluding is the same search with one incident held out.
+// The analysing incident must never match itself: the agent re-runs this search
+// mid-analysis with its own collected evidence as the query, and its own memory
+// row (if it has one from an earlier run) is by construction the closest text in
+// the corpus. Chat and the operator search pass "" and are unaffected.
+func (s *Store) SearchIncidentMemoryExcluding(
+	query, excludedIncidentID string,
+	limit int,
+) []SimilarIncident {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil
@@ -329,7 +341,7 @@ func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident 
 	if limit > 20 {
 		limit = 20
 	}
-	if results, ok := s.dbSearchMemory(query, limit); ok && len(results) > 0 {
+	if results, ok := s.dbSearchMemoryExcluding(query, excludedIncidentID, limit); ok && len(results) > 0 {
 		return results
 	}
 	queryVector := textVector(query)
@@ -339,6 +351,9 @@ func (s *Store) SearchIncidentMemory(query string, limit int) []SimilarIncident 
 	results := make([]SimilarIncident, 0, len(s.memories))
 	for _, memory := range s.memories {
 		if memory == nil || !incidentUserApproved(s.incidents[memory.IncidentID]) || incidentDeleted(s.incidents[memory.IncidentID]) {
+			continue
+		}
+		if excludedIncidentID != "" && memory.IncidentID == excludedIncidentID {
 			continue
 		}
 		score := idfCosineSimilarity(queryVector, memory.Vector, df, corpusSize)

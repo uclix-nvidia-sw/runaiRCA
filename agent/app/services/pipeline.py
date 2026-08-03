@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.collectors.base import (
     NO_EVIDENCE,
@@ -26,6 +26,7 @@ from app.collectors.base import (
     resolve_target,
 )
 from app.collectors.base import artifact as make_artifact
+from app.collectors.http_json import post_json
 from app.collectors.registry import build_collectors, unknown_collector_names
 from app.config import Settings
 from app.knowledge import (
@@ -51,6 +52,7 @@ from app.knowledge import (
     runtime_shadow_hints,
 )
 from app.llm import (
+    _analysis_time_remaining,
     complete_json,
     complete_with_error,
     llm_configured,
@@ -60,7 +62,7 @@ from app.masking import Masker, build_masker
 from app.plan import InvestigationPlan
 from app.progress import ProgressReporter
 from app.prompts import load_agent_souls
-from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse
+from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse, SimilarIncidentContext
 from app.services.decision_tree import resolve_tree, walk_tree
 from app.services.evidence_projection import EXECUTION_METADATA_KEYS, observed_payload
 from app.services.general_guidance import general_guidance_lines
@@ -2620,6 +2622,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                         state.graph_fixes.xid_triggers.pop(code, None)
                         state.graph_fixes.root_xids.pop(code, None)
     await _self_check_if_top_changed(state, verified_top_before)
+    await _refresh_similar_incidents_from_evidence(settings, request, state)
     state.summary = _summary_from(
         request,
         state.results,
@@ -7082,6 +7085,81 @@ def _runai_allocation_parts(allocation: object, labels: dict[str, str]) -> list[
             parts.append(f"{labels[label]} {value}")
     return parts
 
+
+
+# The backend caps an embedding query at 4000 bytes; stay under it with room for
+# the family prefix rather than having the search rejected outright.
+_SIMILAR_RESEARCH_QUERY_CHARS = 3500
+# One short call. The analysis deadline is shared with evidence gathering and
+# synthesis, so a slow backend must cost a few seconds of context, never a run.
+_SIMILAR_RESEARCH_TIMEOUT_SECONDS = 5.0
+
+
+async def _refresh_similar_incidents_from_evidence(
+    settings: Settings, request: AlertAnalysisRequest, state: PipelineState
+) -> None:
+    """Re-run similar-incident retrieval on the evidence THIS run collected.
+
+    Similar incidents are attached to the request at run CREATION, before any
+    evidence exists, so a first analysis matched on the alert alone -- labels and
+    the Alertmanager boilerplate every incident of that alertname shares. The
+    backend re-resolves again once the RCA lands, but that is too late for this
+    report: the "Similar past incident ..." line is written below.
+
+    By this point the run has its observed evidence and a ranked family, which is
+    what "what broke" actually looks like. Searching on that is a closer question
+    than the alert, and a weaker one than the finished RCA -- symptom-alike
+    incidents can still surface (two OOMKills with different causes), so the
+    ranked family goes into the query to pull toward mechanism over symptom.
+
+    Best-effort CONTEXT, never evidence: no backend, no evidence, an exhausted
+    deadline or any transport failure keeps the run-creation set untouched.
+    """
+    backend_url = str(getattr(settings, "backend_url", "") or "").strip().rstrip("/")
+    observed = (state.observed or "").strip()
+    if not backend_url or not observed:
+        return
+    remaining = _analysis_time_remaining()
+    if remaining is not None and remaining <= _SIMILAR_RESEARCH_TIMEOUT_SECONDS:
+        return
+    family = state.root_cause_candidates[0].family if state.root_cause_candidates else ""
+    query = f"{family} {observed}".strip()[:_SIMILAR_RESEARCH_QUERY_CHARS]
+    try:
+        response = await post_json(
+            url=f"{backend_url}/api/v1/embeddings/search",
+            timeout_seconds=_SIMILAR_RESEARCH_TIMEOUT_SECONDS,
+            json_body={
+                "query": query,
+                "limit": len(request.similar_incidents) or 3,
+                # Never match this incident against its own stored memory row.
+                "exclude_incident_id": request.incident_id or "",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - context, never worth failing a run
+        _log.warning("similar-incident re-search failed: %s: %s", type(exc).__name__, exc)
+        return
+    if not response.ok or not isinstance(response.data, dict):
+        _log.warning(
+            "similar-incident re-search returned no usable result (status=%s)",
+            response.status_code,
+        )
+        return
+    payload = response.data.get("data")
+    rows = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return
+    refreshed: list[SimilarIncidentContext] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            refreshed.append(SimilarIncidentContext(**row))
+        except ValidationError:
+            continue
+    if refreshed:
+        # The request field IS "the similar incidents for this analysis"; the
+        # report line and its trust floor both read it from here.
+        request.similar_incidents = refreshed
 
 def _observed_configuration_lines(
     results: list[CollectorResult],
