@@ -2345,6 +2345,97 @@ def test_runai_cluster_physical_inventory_returns_success_and_error_artifacts(mo
     assert "could not resolve Run:ai cluster ID" in unresolved["error"]
 
 
+def test_runai_cluster_gpu_model_extracts_the_single_distinct_model() -> None:
+    """get_cluster_physical_inventory's byGpuModel groups every GPU-bearing
+    node by its raw product string (2.26.13, empirically captured via
+    tools/list outputSchema). One distinct model is exactly what the XID
+    per-model gate needs."""
+    payload = {
+        "clusterId": "c1",
+        "byGpuModel": [
+            {"gpuModel": "NVIDIA-H100-80GB-HBM3", "nodes": 4, "gpusTotal": 32},
+        ],
+    }
+    assert drilldown._runai_cluster_gpu_model(payload) == "NVIDIA-H100-80GB-HBM3"
+
+
+def test_runai_cluster_gpu_model_leaves_mixed_cluster_unresolved() -> None:
+    """A wrong model gates away real knowledge, which is worse than not
+    gating: two distinct models must NOT collapse to a guess."""
+    mixed = {
+        "byGpuModel": [
+            {"gpuModel": "NVIDIA-A100-SXM4-80GB", "nodes": 2, "gpusTotal": 16},
+            {"gpuModel": "NVIDIA-H100-80GB-HBM3", "nodes": 4, "gpusTotal": 32},
+        ]
+    }
+    assert drilldown._runai_cluster_gpu_model(mixed) == ""
+    assert drilldown._runai_cluster_gpu_model({"byGpuModel": []}) == ""
+    assert drilldown._runai_cluster_gpu_model({"byGpuModel": None}) == ""
+    assert drilldown._runai_cluster_gpu_model({}) == ""
+    assert drilldown._runai_cluster_gpu_model("not-a-dict") == ""
+
+
+@pytest.mark.asyncio
+async def test_cluster_physical_inventory_sets_runai_gpu_model_with_no_node() -> None:
+    """The alert names no node (_target().node == ""), so the Kubernetes node
+    label can never populate gpu_model. Cluster-wide inventory is the only
+    reachable source; this is where _gpu_model_from's contract is met."""
+
+    async def fake_inventory(settings, target, args):
+        return {
+            "error": None,
+            "result": {
+                "clusterId": "c1",
+                "byGpuModel": [
+                    {"gpuModel": "NVIDIA-H100-80GB-HBM3", "nodes": 4, "gpusTotal": 32}
+                ],
+            },
+        }
+
+    assert _target().node == ""
+    result = CollectorResult(agent="runai", status="ok", summary="Run:ai queried")
+    await drilldown._run_query(
+        drill_settings(),
+        result,
+        {"get_cluster_physical_inventory": {"call": fake_inventory}},
+        _target(),
+        None,
+        {"tool": "get_cluster_physical_inventory", "args": {}},
+        [],
+        drilldown._drilldown_masker(drill_settings()),
+    )
+
+    assert result.details["gpu_model"] == "NVIDIA-H100-80GB-HBM3"
+
+
+@pytest.mark.asyncio
+async def test_cluster_physical_inventory_mixed_cluster_does_not_set_gpu_model() -> None:
+    async def fake_inventory(settings, target, args):
+        return {
+            "error": None,
+            "result": {
+                "byGpuModel": [
+                    {"gpuModel": "NVIDIA-A100-SXM4-80GB", "nodes": 2, "gpusTotal": 16},
+                    {"gpuModel": "NVIDIA-H100-80GB-HBM3", "nodes": 4, "gpusTotal": 32},
+                ],
+            },
+        }
+
+    result = CollectorResult(agent="runai", status="ok", summary="Run:ai queried")
+    await drilldown._run_query(
+        drill_settings(),
+        result,
+        {"get_cluster_physical_inventory": {"call": fake_inventory}},
+        _target(),
+        None,
+        {"tool": "get_cluster_physical_inventory", "args": {}},
+        [],
+        drilldown._drilldown_masker(drill_settings()),
+    )
+
+    assert "gpu_model" not in result.details
+
+
 def test_runai_cluster_infrastructure_health_returns_success_and_error_artifacts(
     monkeypatch,
 ) -> None:

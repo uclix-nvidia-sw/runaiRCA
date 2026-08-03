@@ -55,7 +55,14 @@ type recurrenceStatsCacheEntry struct {
 }
 
 type Store struct {
-	mu                   sync.RWMutex
+	mu sync.RWMutex
+	// Dense-score calibration state. Guarded by its own mutex: the centroid is
+	// read on the search path, which must never contend with the store lock.
+	centroidMu           sync.Mutex
+	centroid             []float32
+	centroidComputedAt   uint64
+	centroidGeneration   uint64
+	embeddingGeneration  atomic.Uint64
 	incidentSeq          atomic.Int64
 	alertSeq             atomic.Int64
 	feedbackSeq          atomic.Int64

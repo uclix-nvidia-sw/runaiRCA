@@ -1104,3 +1104,60 @@ func labelSimilarityBonus(alertLabels, memoryLabels map[string]string) float64 {
 	}
 	return score
 }
+
+// --- dense-score calibration -------------------------------------------------
+//
+// Embedding models are anisotropic: every document lands near the corpus
+// centroid, so raw cosine sits in a narrow band and a MEANINGLESS query -- which
+// is itself near that centroid -- is close to everything. Measured against the
+// live deployment, top-1 score per query on one corpus:
+//
+//	"XID 48 double bit ECC error GPU fell off the bus"  0.549
+//	"고양이가 피아노를 치고 있습니다 오늘 날씨는 맑음"       0.626
+//	"zzzz qqqq wwww unrelated gibberish tokens"          0.672  <- highest
+//
+// and an XID-48 incident's own panel showed 0.933 / 0.932 / 0.931 for an
+// OOMKilled, a missing ConfigMap and a missing Secret. Absolute cosine from this
+// embedder is therefore not a similarity anything can threshold on.
+//
+// calibrateDenseScore removes the shared component as a scalar: it re-expresses
+// a raw score as the fraction of the distance from "as similar as an arbitrary
+// document" (the query's own cosine to the centroid) to "identical". A query
+// sitting on the centroid has every candidate at ~0; a query pointing somewhere
+// specific keeps a genuine match high. It is monotone in raw for a fixed query,
+// so WITHIN-query ranking is untouched -- only cross-query comparability, which
+// is exactly what the thresholds need.
+func calibrateDenseScore(raw, queryToCentroid float64) float64 {
+	// No usable centroid (empty corpus, unsupported aggregate, degenerate
+	// query): leave the score exactly as the index reported it.
+	if queryToCentroid <= 0 || queryToCentroid >= 1 {
+		return raw
+	}
+	calibrated := (raw - queryToCentroid) / (1 - queryToCentroid)
+	if calibrated < 0 {
+		return 0
+	}
+	if calibrated > 1 {
+		return 1
+	}
+	return calibrated
+}
+
+// cosineFloat32 is cosineSimilarity for the dense vectors, which are slices
+// rather than the sparse token maps.
+func cosineFloat32(a, b []float32) float64 {
+	if len(a) == 0 || len(a) != len(b) {
+		return 0
+	}
+	var dot, na, nb float64
+	for i := range a {
+		x, y := float64(a[i]), float64(b[i])
+		dot += x * y
+		na += x * x
+		nb += y * y
+	}
+	if na == 0 || nb == 0 {
+		return 0
+	}
+	return dot / (math.Sqrt(na) * math.Sqrt(nb))
+}

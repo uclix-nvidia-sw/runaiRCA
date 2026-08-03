@@ -6,13 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5/pgconn"
 	"log"
 	"math"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -870,6 +871,70 @@ func (s *Store) dbSearchSimilarIncidents(query, incidentID string, limit int) ([
 	return s.dbSearchMemoryExcluding(query, incidentID, limit)
 }
 
+// embeddingCentroid is the mean of every embedding a search can return, i.e.
+// the direction the whole corpus shares. Nil when it cannot be computed, which
+// makes calibrateDenseScore a no-op rather than a guess.
+//
+// Cached against a generation counter that persistMemory bumps, because the
+// value only moves when an embedding is written and a search must not pay for
+// an aggregate over the corpus on every call. avg(vector) needs pgvector >=
+// 0.5; on an older server the query errors, the centroid stays nil, and scores
+// are reported exactly as the index produced them.
+func (s *Store) embeddingCentroid() []float32 {
+	if s.db == nil || !s.dbReady || !s.pgvectorReady {
+		return nil
+	}
+	generation := s.embeddingGeneration.Load()
+	s.centroidMu.Lock()
+	defer s.centroidMu.Unlock()
+	if s.centroidComputedAt == generation && s.centroidGeneration != 0 {
+		return s.centroid
+	}
+	ctx, cancel := postgresOperationContext()
+	defer cancel()
+	var literal sql.NullString
+	err := s.db.QueryRowContext(
+		ctx,
+		`SELECT avg(e.embedding)::text
+		   FROM incident_embeddings AS e
+		   JOIN incidents AS i ON i.incident_id = e.incident_id
+		  WHERE e.embedding IS NOT NULL
+		    AND i.user_approved_at IS NOT NULL
+		    AND i.deleted_at IS NULL`,
+	).Scan(&literal)
+	// Remember the attempt either way: a server without avg(vector) must not
+	// re-run this query on every single search.
+	s.centroidComputedAt = generation
+	s.centroidGeneration = 1
+	if err != nil {
+		log.Printf("embedding centroid unavailable, dense scores left uncalibrated: %v", err)
+		s.centroid = nil
+		return nil
+	}
+	s.centroid = parseEmbeddingLiteral(literal.String)
+	return s.centroid
+}
+
+// parseEmbeddingLiteral reads pgvector's own "[a,b,c]" text rendering.
+func parseEmbeddingLiteral(literal string) []float32 {
+	literal = strings.TrimSpace(literal)
+	literal = strings.TrimPrefix(literal, "[")
+	literal = strings.TrimSuffix(literal, "]")
+	if literal == "" {
+		return nil
+	}
+	parts := strings.Split(literal, ",")
+	out := make([]float32, 0, len(parts))
+	for _, part := range parts {
+		value, err := strconv.ParseFloat(strings.TrimSpace(part), 32)
+		if err != nil {
+			return nil
+		}
+		out = append(out, float32(value))
+	}
+	return out
+}
+
 func (s *Store) dbSearchMemoryExcluding(query, excludedIncidentID string, limit int) ([]SimilarIncident, bool) {
 	if s.db == nil || !s.dbReady || !s.pgvectorReady {
 		return nil, false
@@ -884,6 +949,10 @@ func (s *Store) dbSearchMemoryExcluding(query, excludedIncidentID string, limit 
 		retrievalKind = retrievalKindDenseSemantic
 	}
 	literal := embeddingLiteral(queryEmbedding.vector)
+	// How similar this query is to an ARBITRARY document in the corpus. Every
+	// returned score is re-expressed against it so a query that means nothing
+	// cannot come back looking like a match -- see calibrateDenseScore.
+	queryToCentroid := cosineFloat32(queryEmbedding.vector, s.embeddingCentroid())
 	queryLimit := limit * 3
 	ctx, cancel := postgresOperationContext()
 	defer cancel()
@@ -927,7 +996,7 @@ func (s *Store) dbSearchMemoryExcluding(query, excludedIncidentID string, limit 
 			log.Printf("Failed to scan pgvector search row: %v", err)
 			return nil, false
 		}
-		similarity := 1 - distance
+		similarity := calibrateDenseScore(1-distance, queryToCentroid)
 		if similarity <= 0.05 {
 			continue
 		}
@@ -1495,6 +1564,8 @@ func (s *Store) persistMemory(memory *IncidentMemory) {
 			memory.CreatedAt,
 		)
 		if err == nil {
+			// The corpus direction moved; the cached centroid is now stale.
+			s.embeddingGeneration.Add(1)
 			return
 		}
 		log.Printf("Failed to persist incident memory %s with pgvector, falling back to jsonb: %v", memory.IncidentID, err)

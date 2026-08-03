@@ -199,3 +199,76 @@ def test_node_label_reaches_the_model_gate_as_a_catalog_name() -> None:
     assert _node_gpu_product([{"name": "node", "data": bare}]) == ""
     assert _gpu_model_candidates("") == []
     assert _gpu_model_candidates("some-accelerator") == ["some-accelerator"]
+
+
+def test_no_node_cluster_inventory_reaches_the_model_gate() -> None:
+    """A real operator question ("XID48 에러가 발생했는데 어떤 걸 해야할까요?")
+    names no node, so the Kubernetes node label (the other test above) can
+    never populate ``gpu_model``. The Run:ai cluster-wide inventory
+    (``get_cluster_physical_inventory``'s ``byGpuModel``, surfaced by the
+    runai drill-down into its own CollectorResult.details -- see
+    test_drilldown.py's ``test_cluster_physical_inventory_sets_runai_gpu_model_with_no_node``)
+    is the only reachable source. This closes the full chain: no-node target
+    -> runai collector result -> ``_gpu_model_from`` -> ``_query_remediation``
+    dropping XID 48's B100/GB200-only ancestors while keeping 48's own fix.
+    """
+    from app.collectors.base import AnalysisTarget, CollectorResult
+    from app.services.pipeline import _gpu_model_from
+
+    target = AnalysisTarget(
+        cluster="prod-cluster",
+        project="",
+        queue="",
+        namespace="runai-vision",
+        workload_name="",
+        workload_type="",
+        runai_workload_id="",
+        node="",  # the operator's question named no node
+        pod="",
+        severity="warning",
+        alert_name="Xid48",
+    )
+    # What drilldown._run_query writes into the runai CollectorResult once
+    # get_cluster_physical_inventory succeeds.
+    runai_result = CollectorResult(
+        agent="runai",
+        status="ok",
+        summary="Run:ai queried",
+        details={"gpu_model": "NVIDIA-H100-80GB-HBM3"},
+    )
+    kubernetes_result = CollectorResult(
+        agent="kubernetes", status="unavailable", summary="no node in the alert"
+    )
+
+    detected_model = _gpu_model_from(target, [kubernetes_result, runai_result])
+    assert detected_model == "NVIDIA-H100-80GB-HBM3"
+
+    def extra(query: str) -> list[dict]:
+        if "fixes_for_xid(48)" in query:
+            return [{"x": "Power-cycle or reset the GPU."}]
+        if "fixes_for_xid(144)" in query:
+            return [{"x": "Reseat or replace the NVLink cable."}]
+        if "fixes_for_xid(145)" in query:
+            return [{"x": "Reset the NVLink fabric."}]
+        if "fixes_for_xid(146)" in query:
+            return [{"x": "Replace the NVSwitch tray."}]
+        if "trigger_for_xid(48)" in query:
+            return [{"x": "Check ECC counters before reset."}]
+        if "xids_for_gpu_model" in query:
+            return [{"x": code} for code in (8, 11, 48, 79)]  # no 144/145/146
+        return []
+
+    out = _query_remediation(
+        _FakeClient(_root_chain_run(extra)), "", [48], detected_model
+    )  # type: ignore[arg-type]
+
+    # The B100/GB200-only upstream ancestors are gone from every map the
+    # recommended-actions renderer reads...
+    assert 48 not in out.root_xids
+    assert 144 not in out.xid_fixes and 145 not in out.xid_fixes and 146 not in out.xid_fixes
+    # ...but the OBSERVED xid keeps its own fix and trigger.
+    assert out.xid_fixes == {48: ["Power-cycle or reset the GPU."]}
+    assert out.xid_triggers == {48: "Check ECC counters before reset."}
+    assert len(out.warnings) == 1
+    for code in ("144", "145", "146"):
+        assert code in out.warnings[0]

@@ -658,6 +658,27 @@ def _query_failure_category(outcome: dict[str, Any], diagnostic: str) -> str:
     return "execution"
 
 
+def _runai_cluster_gpu_model(payload: Any) -> str:
+    """The cluster's one GPU model, from get_cluster_physical_inventory.
+
+    ``byGpuModel`` groups every GPU-bearing node by its raw product string
+    (the same GFD label kubernetes.py reads off a single node) -- a
+    cluster-wide source that needs no alert node. A mixed cluster (more than
+    one distinct model) is deliberately left unresolved: guessing either one
+    would gate away the other model's own upstream-XID knowledge, which is
+    worse than not gating at all.
+    """
+    by_model = payload.get("byGpuModel") if isinstance(payload, dict) else None
+    if not isinstance(by_model, list):
+        return ""
+    models = {
+        str(entry.get("gpuModel")).strip()
+        for entry in by_model
+        if isinstance(entry, dict) and str(entry.get("gpuModel") or "").strip()
+    }
+    return next(iter(models)) if len(models) == 1 else ""
+
+
 async def _run_query(
     settings: Settings,
     result: CollectorResult,
@@ -697,6 +718,14 @@ async def _run_query(
     if not isinstance(outcome, dict):
         outcome = {"error": "tool returned no result"}
     error = outcome.get("error")
+    if (
+        not error
+        and result.agent == "runai"
+        and name == "get_cluster_physical_inventory"
+        and "gpu_model" not in result.details
+    ):
+        if model := _runai_cluster_gpu_model(outcome.get("result")):
+            result.details["gpu_model"] = model
     artifact_result = _typed_artifact_result(
         outcome, error=error, tool=name, artifact_type=artifact_type
     )
