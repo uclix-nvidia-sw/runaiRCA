@@ -271,6 +271,11 @@ async def _drill_one(
         memory = query_memory if query_memory is not None else QueryMemory()
         memory.seed_result(result, target)
         probe_attempts: dict[str, int] = {}
+        # One fold ledger per agent run, spanning every round below: repeat
+        # calls to change_query/promql_query that add no new information get
+        # merged into their first row instead of stacking (see
+        # _fold_into_prior_row).
+        fold_state: dict[tuple[str, str], dict[str, Any]] = {}
         system_no_node_query_attempted = False
         # A TypeDB/YAML probe is executable only through this agent's existing
         # read-only registry.  Run it before asking the LLM to improvise a
@@ -312,6 +317,7 @@ async def _drill_one(
                 execution_key=execution_key,
                 artifact_type="ontology_probe",
                 probe_attempts=probe_attempts,
+                fold_state=fold_state,
             )
         assessments = result.details.get("ontology_probe_assessments", [])
         declared_probes_settled = not assessments or all(
@@ -459,6 +465,7 @@ async def _drill_one(
                         blackboard=blackboard,
                         query_memory=memory,
                         execution_key=execution_key,
+                        fold_state=fold_state,
                     )
                     for q, execution_key in queries
                 )
@@ -666,6 +673,7 @@ async def _run_query(
     execution_key: str = "",
     artifact_type: str = "drilldown_query",
     probe_attempts: dict[str, int] | None = None,
+    fold_state: dict[tuple[str, str], dict[str, Any]] | None = None,
 ) -> bool:
     """Execute one registry-validated query and preserve its observation."""
     name = str(query.get("tool") or "")
@@ -768,20 +776,20 @@ async def _run_query(
             "질의 구문이 잘못되어 실행되지 않았습니다.",
             "The query was malformed and did not run.",
         )
-    result.artifacts.append(
-        artifact(
-            agent=result.agent,
-            source=result.agent,
-            type=artifact_type,
-            status="unavailable" if error else "ok",
-            confidence="medium",
-            query=str(outcome.get("query") or name),
-            title=outcome.get("title"),
-            highlights=markers or None,
-            summary=summary,
-            result=artifact_result,
-        )
+    new_artifact = artifact(
+        agent=result.agent,
+        source=result.agent,
+        type=artifact_type,
+        status="unavailable" if error else "ok",
+        confidence="medium",
+        query=str(outcome.get("query") or name),
+        title=outcome.get("title"),
+        highlights=markers or None,
+        summary=summary,
+        result=artifact_result,
     )
+    if not _fold_into_prior_row(fold_state, artifact_type, name, new_artifact):
+        result.artifacts.append(new_artifact)
     if artifact_type == "ontology_probe" and isinstance(probe, dict):
         assessments = result.details.get("ontology_probe_assessments")
         if isinstance(assessments, list) and assessments:
@@ -800,6 +808,59 @@ async def _run_query(
         and name in {"logql_query", "promql_query"}
         and _query_failure_category(outcome, str(error)) == "invalid_request"
     )
+
+
+# Tools whose repeated failure/no-finding sentence carries zero NEW information
+# per call — change_query/k8s_change_timeline's "no changes found" and
+# promql_query's raw MCP transport-failure passthrough are the two a real
+# export showed stacking one byte-identical "ok"/"unavailable" row per
+# follow-up call. Fold those repeats into the first row instead. Every other
+# tool (k8s_read, logql_query, ...) keeps one row per call: an identical
+# "HTTP 200" from two DIFFERENT reads is still two distinct observations.
+_FOLDABLE_QUERY_TOOLS = frozenset({"change_query", "k8s_change_timeline", "promql_query"})
+_FOLD_LABEL_DISPLAY_MAX = 6
+
+
+def _fold_into_prior_row(
+    fold_state: dict[tuple[str, str], dict[str, Any]] | None,
+    artifact_type: str,
+    tool: str,
+    new_artifact: Any,
+) -> bool:
+    """Merge a query result that repeats an earlier call's exact sentence.
+
+    Returns True when ``new_artifact`` was folded into an already-appended row
+    (the caller must then NOT append it). ``fold_state`` is one dict per
+    ``_drill_one`` invocation, keyed by (tool, summary text); a caller that
+    does not pass one (direct ``_run_query`` callers, e.g. unit tests) gets
+    the unfolded, one-row-per-call behavior unchanged. Declared probe rows
+    (artifact_type == "ontology_probe") are never folded: _run_query links
+    each one to its own probe execution id right after this call.
+    """
+    summary = new_artifact.summary or ""
+    if (
+        fold_state is None
+        or artifact_type != "drilldown_query"
+        or tool not in _FOLDABLE_QUERY_TOOLS
+        or not summary
+    ):
+        return False
+    key = (tool, summary)
+    label = str(new_artifact.query or tool)
+    existing = fold_state.get(key)
+    if existing is None:
+        fold_state[key] = {"artifact": new_artifact, "labels": [label]}
+        return False
+    labels = existing["labels"]
+    if label not in labels:
+        labels.append(label)
+    shown = labels[:_FOLD_LABEL_DISPLAY_MAX]
+    remainder = len(labels) - len(shown)
+    listed = ", ".join(shown) + (f", +{remainder} more" if remainder > 0 else "")
+    primary = existing["artifact"]
+    primary.query = "; ".join(labels)
+    primary.summary = f"{summary} ({len(labels)}x): {listed}"
+    return True
 
 
 def _drilldown_salient_markers(

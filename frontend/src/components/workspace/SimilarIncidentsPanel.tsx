@@ -5,6 +5,20 @@ import type { SimilarIncident } from '../../types';
 import { Severity, Status } from '../../utils/formatters';
 import { hashForDetail } from '../../utils/routing';
 
+// Two retrieval paths score the same pair on different scales (dense pgvector
+// cosine over RCA content vs. the in-memory sparse-identity fallback) — a
+// percentage alone is not comparable across cards without knowing which one
+// produced it. Keep exhaustive; an unknown kind falls back to the raw slug.
+const RETRIEVAL_KIND_LABELS: Record<string, string> = {
+  'dense-semantic': 'semantic',
+  'dense-lexical': 'lexical',
+  'sparse-identity': 'identity',
+};
+
+function retrievalKindLabel(kind: string) {
+  return RETRIEVAL_KIND_LABELS[kind] || kind;
+}
+
 export function SimilarIncidentsPanel({
   items,
   recentCount,
@@ -49,7 +63,18 @@ export function SimilarIncidentsPanel({
             >
               <div className="similar-head">
                 <strong>{item.title || item.incident_id}</strong>
-                <span>{Math.round(item.similarity * 100)}%</span>
+                <span>
+                  {Math.round(item.similarity * 100)}%
+                  {item.retrieval_kind ? (
+                    <span
+                      className="retrieval-kind"
+                      title={`Similarity index: ${item.retrieval_kind}`}
+                    >
+                      {' · '}
+                      {retrievalKindLabel(item.retrieval_kind)}
+                    </span>
+                  ) : null}
+                </span>
               </div>
               <div className="meta-line">
                 <span>{item.incident_id}</span>

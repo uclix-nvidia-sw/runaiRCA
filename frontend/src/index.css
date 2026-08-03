@@ -4367,6 +4367,12 @@ code .evidence-mark {
   white-space: nowrap;
 }
 
+.similar-head .retrieval-kind {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 0.7rem;
+}
+
 .similar-item strong {
   font-size: 0.86rem;
   line-height: 1.25;

@@ -61,6 +61,30 @@ describe('markdownToBlocks', () => {
   });
 });
 
+// remark-gfm sets a list item's `checked` to `null` (not `undefined`) for an
+// ordinary `- ` bullet, and to `true`/`false` only for a real `- [ ]` / `- [x]`
+// GFM task-list item. renderList must tell these apart, not stamp every
+// bullet with a checkbox marker.
+describe('list checkbox markers', () => {
+  it('does not prefix ordinary bullet items with a checkbox marker', async () => {
+    const docx = await import('docx');
+    const elements = markdownToDocxElements(docx, '- one\n- two');
+    const serialized = JSON.stringify(elements);
+
+    expect(serialized).not.toContain('[ ] ');
+    expect(serialized).not.toContain('[x] ');
+  });
+
+  it('still prefixes real GFM task-list items with checkbox markers', async () => {
+    const docx = await import('docx');
+    const elements = markdownToDocxElements(docx, '- [ ] todo\n- [x] done');
+    const serialized = JSON.stringify(elements);
+
+    expect(serialized).toContain('[ ] ');
+    expect(serialized).toContain('[x] ');
+  });
+});
+
 // The exported Word document's own content is Korean by chart default; an
 // English "No summary captured." placeholder in the same slot as the report
 // content is what the product owner flagged reading the export (a

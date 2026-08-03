@@ -652,8 +652,7 @@ func (s *Store) similarIncidentsLocked(
 		if !incidentUserApproved(incident) || memory.IncidentID == currentIncidentID || incidentDeleted(incident) {
 			continue
 		}
-		score := cosineSimilarity(queryVector, memory.Vector)
-		score += labelSimilarityBonus(alert.Labels, memory.Labels)
+		score := blendedSimilarity(queryVector, memory.Vector, alert.Labels, memory.Labels)
 		if score <= 0.05 {
 			continue
 		}
@@ -712,9 +711,12 @@ func (s *Store) similarRecentCountLocked(
 		if before != nil && !incident.FiredAt.Before(*before) {
 			continue
 		}
+		// Recurrence COUNTING, not ranking: the question is "did this same thing
+		// fire again", so exact identity on the controlled label keys is the
+		// signal, not a thumb on a relevance score. The bonus stays here.
 		score := cosineSimilarity(queryVector, memory.Vector)
 		score += labelSimilarityBonus(alert.Labels, memory.Labels)
-		if score >= minFeedbackHintSimilarity {
+		if score >= minRecurrenceSimilarity {
 			seen[memory.IncidentID] = struct{}{}
 		}
 	}
@@ -931,12 +933,59 @@ func cosineSimilarity(a, b map[string]float64) float64 {
 	return dot / (math.Sqrt(normA) * math.Sqrt(normB))
 }
 
+// The controlled label keys that identify a recurrence. No "pod": an ephemeral
+// name never repeats across occurrences, so it can only ever withhold identity
+// credit from a genuine recurrence.
+var identityLabelKeys = []string{
+	"alertname", "cluster", "project", "queue", "namespace", "workload",
+}
+
+// blendedSimilarity ranks a candidate by content AND identity on ONE scale.
+//
+// A flat additive bonus could not do that. Every label value is also a token in
+// alertSearchText and memoryText, so labels already move the cosine -- but the
+// stored document is a full RCA while the query is a short alert, so those few
+// tokens are diluted to nearly nothing. (Drop the correction outright and a
+// genuine recurrence falls under the 0.05 floor; a test pins that.) The old
+// correction was +0.035 per matching key -- up to +0.21 added to a [0,1] cosine,
+// wider than the gap between a same-alertname match and a same-root-cause one.
+// That is how a kube-scheduler predicate failure outranked a GPU-shortage
+// incident for a Run:ai fractional-GPU alert.
+//
+// Blending two NORMALIZED signals keeps identity load-bearing without letting it
+// outvote content: labelWeight of the score is the share of the alert's OWN
+// controlled label keys that matched, and the rest is cosine. Keys the alert
+// does not carry are not counted against a candidate.
+//
+// ponytail: the dilution is the deeper defect -- IDF weighting in textVector
+// would let content carry identity by itself. Until then this bounds the damage
+// rather than hiding it.
+const labelWeight = 0.25
+
+func blendedSimilarity(
+	queryVector, memoryVector map[string]float64,
+	alertLabels, memoryLabels map[string]string,
+) float64 {
+	content := cosineSimilarity(queryVector, memoryVector)
+	present, matched := 0, 0
+	for _, key := range identityLabelKeys {
+		if alertLabels[key] == "" {
+			continue
+		}
+		present++
+		if alertLabels[key] == memoryLabels[key] {
+			matched++
+		}
+	}
+	if present == 0 {
+		return content
+	}
+	return (1-labelWeight)*content + labelWeight*(float64(matched)/float64(present))
+}
+
 func labelSimilarityBonus(alertLabels, memoryLabels map[string]string) float64 {
-	// No "pod" — an ephemeral name never repeats across occurrences, so it can
-	// only ever withhold the bonus from a genuine recurrence.
-	keys := []string{"alertname", "cluster", "project", "queue", "namespace", "workload"}
 	score := 0.0
-	for _, key := range keys {
+	for _, key := range identityLabelKeys {
 		if alertLabels[key] != "" && alertLabels[key] == memoryLabels[key] {
 			score += 0.035
 		}

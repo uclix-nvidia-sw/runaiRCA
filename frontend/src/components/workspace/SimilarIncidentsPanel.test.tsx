@@ -53,4 +53,38 @@ describe('SimilarIncidentsPanel', () => {
     expect(markup).toContain('이전 요약이 없습니다.');
     expect(markup).not.toContain('No prior summary captured.');
   });
+
+  it('shows the retrieval index next to the percentage when the backend stamps one', () => {
+    const item = { ...similarIncident('INC-dense', 0.97), retrieval_kind: 'dense-semantic' };
+    const markup = renderToStaticMarkup(
+      <SimilarIncidentsPanel items={[item]} recentCount={1} onOpenIncident={vi.fn()} />,
+    );
+
+    expect(markup).toContain('97%');
+    expect(markup).toContain('semantic');
+    expect(markup).toContain('class="retrieval-kind"');
+  });
+
+  it('renders only the percentage when retrieval_kind is absent, with no leftover separator', () => {
+    const markup = renderToStaticMarkup(
+      <SimilarIncidentsPanel
+        items={[similarIncident('INC-plain', 0.78)]}
+        recentCount={1}
+        onOpenIncident={vi.fn()}
+      />,
+    );
+
+    expect(markup).toContain('78%');
+    expect(markup).not.toContain('retrieval-kind');
+    expect(markup).not.toContain('·');
+  });
+
+  it('falls back to the raw slug for an unrecognized retrieval_kind instead of dropping it', () => {
+    const item = { ...similarIncident('INC-future', 0.6), retrieval_kind: 'future-index-v2' };
+    const markup = renderToStaticMarkup(
+      <SimilarIncidentsPanel items={[item]} recentCount={1} onOpenIncident={vi.fn()} />,
+    );
+
+    expect(markup).toContain('future-index-v2');
+  });
 });

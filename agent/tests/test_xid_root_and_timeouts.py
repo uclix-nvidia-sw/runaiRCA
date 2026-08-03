@@ -105,11 +105,53 @@ def test_causal_chain_line_single_root_keeps_the_arrow_chain() -> None:
     assert "XID 74 → XID 45" in _causal_chain_line(gr, "en")
 
 
-def _xid_actions(gr: GraphRemediation, language: str = "") -> list[str]:
+def test_causal_chain_line_unobserved_upstream_renders_as_candidate() -> None:
+    # INC-1785733867702420739-000001: 144/145/146 are NVLink faults the
+    # catalog says CAN escalate into 48 (leads_to), but this run only ever
+    # observed 48 itself (the alert payload). They must read as candidates to
+    # rule out, never as a root cause the operator is told to act on.
+    gr = GraphRemediation(
+        xid_fixes={48: ["fix 48"], 144: ["fix 144"], 145: ["fix 145"], 146: ["fix 146"]},
+        root_xids={48: [144, 145, 146]},
+        root_xid_status={48: "ordered"},
+    )
+    en = _causal_chain_line(gr, "en", observed_codes={48})
+    ko = _causal_chain_line(gr, "ko", observed_codes={48})
+    for line in (en, ko):
+        for code in (48, 144, 145, 146):
+            assert str(code) in line
+    assert "Fix the origin first" not in en and "Fix the root XID first" not in en
+    assert "rule these out" in en
+    assert "근본 원인을 먼저 조치하세요" not in ko and "뿌리 XID를 먼저 조치하세요" not in ko
+    assert "배제 대상" in ko
+
+
+def test_causal_chain_line_observed_upstream_keeps_the_instruction() -> None:
+    # The sibling case: when this run's OWN evidence also names the upstream
+    # code, the "fix the origin first" instruction is still warranted.
+    gr = GraphRemediation(
+        xid_fixes={45: ["fix 45"], 74: ["fix 74"]},
+        root_xids={45: [74]},
+        root_xid_status={45: "ordered"},
+    )
+    en = _causal_chain_line(gr, "en", observed_codes={45, 74})
+    ko = _causal_chain_line(gr, "ko", observed_codes={45, 74})
+    assert "XID 74 → XID 45" in en
+    assert "Fix the root XID first." in en
+    assert "candidate" not in en.lower()
+    assert "뿌리 XID를 먼저 조치하세요." in ko
+    assert "배제" not in ko
+
+
+def _xid_actions(
+    gr: GraphRemediation, language: str = "", observed_codes: set[int] | None = None
+) -> list[str]:
     request = AlertAnalysisRequest(
         alert=Alert(status="firing", labels={"alertname": "X"}, annotations={}, fingerprint="fp")
     )
     kwargs = {"language": language} if language else {}
+    if observed_codes is not None:
+        kwargs["observed_codes"] = observed_codes
     return _numbered_actions(
         None,
         gr,
@@ -120,6 +162,40 @@ def _xid_actions(gr: GraphRemediation, language: str = "") -> list[str]:
         request,
         **kwargs,
     )
+
+
+def test_numbered_actions_keeps_the_observed_xid_fix_ahead_of_unconfirmed_roots() -> None:
+    # 144/145/146 are catalog-only candidates for 48 in this run (never
+    # observed); the code this run actually saw must not sort behind them
+    # (the "root first" key used to do exactly that) and risk losing its own
+    # fix -- WORKFLOW_XID_48 here -- to the numbered-action cap.
+    gr = GraphRemediation(
+        xid_fixes={
+            48: ["Data Center Recovery Action Solo: RESET_GPU ... RUN_FIELDDIAG"],
+            144: ["fix 144"],
+            145: ["fix 145"],
+            146: ["fix 146"],
+        },
+        root_xids={48: [144, 145, 146]},
+        root_xid_status={48: "ordered"},
+    )
+    actions = _xid_actions(gr, observed_codes={48})
+    joined = "\n".join(actions)
+    assert "RUN_FIELDDIAG" in joined
+    assert "root XID" not in joined  # none of 144/145/146 is a confirmed root here
+    assert joined.index("XID 48") < joined.index("XID 144")
+
+
+def test_numbered_actions_confirmed_root_still_sorts_and_labels_first() -> None:
+    gr = GraphRemediation(
+        xid_fixes={45: ["fix 45"], 74: ["fix 74"]},
+        root_xids={45: [74]},
+        root_xid_status={45: "ordered"},
+    )
+    actions = _xid_actions(gr, observed_codes={45, 74})
+    joined = "\n".join(actions)
+    assert "root XID 74" in joined
+    assert joined.index("root XID 74") < joined.index("XID 45")
 
 
 def test_numbered_actions_xid_fix_names_the_fault() -> None:

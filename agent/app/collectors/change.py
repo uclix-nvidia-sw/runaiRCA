@@ -240,10 +240,7 @@ async def change_query(settings: Settings, target: AnalysisTarget, args: dict) -
             f"end={observation_window['end']} results<={limit}"
         ),
         "title": "Kubernetes change timeline",
-        "summary": (
-            f"{len(observation['changes'])} change observation(s) (metadata only)"
-            + (f"; {'; '.join(warnings)}" if warnings else "")
-        ),
+        "summary": _change_query_summary(observation["changes"], warnings),
         "error": None,
         "source_group": _CHANGE_SOURCE_GROUP,
         "independence_group": _CHANGE_SOURCE_GROUP,
@@ -430,6 +427,45 @@ def _safe_change_metadata(change: dict, namespace: str) -> dict:
     if "namespace" not in safe and change.get("kind") != "NodeCondition":
         safe["namespace"] = namespace
     return safe
+
+
+_CHANGE_SUMMARY_MAX_ROWS = 5
+
+
+def _change_row_label(change: dict) -> str:
+    """One-line, body-free description of a single whitelisted change record.
+
+    Built only from ``_safe_change_metadata``'s own fields (never the raw
+    Event message or Secret body), so this stays safe to surface verbatim.
+    """
+    kind = str(change.get("kind") or "change")
+    name = str(change.get("name") or "")
+    label = f"{kind} {name}".strip()
+    if change.get("condition"):
+        label += f" {change['condition']}={change.get('condition_status', '?')}"
+    if change.get("reason"):
+        label += f" ({change['reason']})"
+    elif change.get("rollout"):
+        label += " (rollout)"
+    if change.get("helm_status"):
+        label += f" [{change['helm_status']}]"
+    when = str(change.get("timestamp") or "")
+    return f"{label} at {when}" if when else label
+
+
+def _change_query_summary(changes: list[dict], warnings: list[str]) -> str:
+    """State what was actually observed, or say plainly that nothing was."""
+    if changes:
+        shown = [_change_row_label(c) for c in changes[:_CHANGE_SUMMARY_MAX_ROWS]]
+        text = "; ".join(shown)
+        remainder = len(changes) - len(shown)
+        if remainder > 0:
+            text += f"; +{remainder} more"
+    else:
+        text = "No changes were observed for this query."
+    if warnings:
+        text += f"; {'; '.join(warnings)}"
+    return text
 
 
 def _observation_window(

@@ -1055,7 +1055,9 @@ async def test_unknown_operator_seed_family_is_ignored_with_plan_warning() -> No
             [
                 SimilarIncidentContext(
                     incident_id="INC-low-similarity",
-                    similarity=0.79,
+                    # Below the similarity floor, which moved 0.80 -> 0.70 with
+                    # the backend's blended (no flat label bonus) scale.
+                    similarity=0.65,
                     approved=True,
                     root_cause_family="gpu_hardware_error",
                 )

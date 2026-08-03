@@ -2647,6 +2647,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         eligible_support_ids=eligible_support_ids,
         self_check_next=state.self_check_next,
         runtime_knowledge_hints=state.runtime_knowledge_hints,
+        xid_codes=state.xid_codes,
     )
     # Restore the explicitly non-diagnostic guide when the RCA had no supported
     # action and the report builder did not already carry one.
@@ -4457,6 +4458,7 @@ def _detail_from(
     eligible_support_ids: set[str] | None = None,
     self_check_next: str = "",
     runtime_knowledge_hints: list[tuple[str, dict[str, Any]]] | None = None,
+    xid_codes: list[int] | None = None,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
     appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
@@ -4542,7 +4544,17 @@ def _detail_from(
     # otherwise an all-context run could withhold graph fixes yet still tell an
     # operator to execute a documented-alert fix or repeat a historical remedy.
     allow_cause_specific_actions = eligible_support_ids is None or bool(eligible_support_ids)
-    causal = _causal_chain_line(graph_fixes, language) if allow_cause_specific_actions else ""
+    # The run's own observed XID codes (alert text + evidence), distinct from
+    # graph_fixes.root_xids -- a pure catalog "what can escalate into this"
+    # lookup that never checked whether this run actually saw its upstream
+    # codes. Passing this through lets _causal_chain_line/_numbered_actions
+    # tell a confirmed upstream cause from a catalog-only candidate.
+    observed_xid_codes = set(xid_codes) if xid_codes is not None else None
+    causal = (
+        _causal_chain_line(graph_fixes, language, observed_xid_codes)
+        if allow_cause_specific_actions
+        else ""
+    )
     if causal:
         lines.extend(["", causal])
     if allow_cause_specific_actions:
@@ -4564,6 +4576,7 @@ def _detail_from(
         language=language,
         self_check_next=self_check_next,
         facts=_remediation_facts(results, eligible_support_ids, target),
+        observed_codes=observed_xid_codes,
     )
     if numbered:
         lines.extend(numbered)
@@ -4796,12 +4809,29 @@ def _supporting_evidence(
     return picked
 
 
-def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> str:
+def _causal_chain_line(
+    graph_fixes: GraphRemediation | None,
+    language: str,
+    observed_codes: set[int] | None = None,
+) -> str:
     """One line naming the XID causal picture when the graph produced one.
 
     When the ontology's leads_to chain resolves a ROOT fault for an observed XID
     (e.g. NVLink Xid 74 -> app-crash Xid 45), name the chain so the operator fixes
-    the origin, not the downstream symptom — the drill-down precision win."""
+    the origin, not the downstream symptom — the drill-down precision win.
+
+    ``root_xids`` is a pure catalog reachability lookup (leads_to, reversed):
+    for an observed XID it lists every upstream fault the CATALOG says CAN
+    escalate into it, whether or not this run's own evidence ever saw that
+    upstream code. ``observed_codes`` (this run's own XID codes — alert text +
+    evidence, see ``_xid_codes_from_results``) tells this function which of
+    those upstream codes were actually witnessed here. A root list with at
+    least one witnessed member keeps the "fix the origin" instruction; a root
+    list with NONE witnessed renders as candidates to rule out, never as a
+    cause to act on. ``observed_codes=None`` (no caller opinion) keeps every
+    root at face value, matching this function's behavior before the
+    distinction existed.
+    """
     if graph_fixes is None:
         return ""
     codes = sorted(set(graph_fixes.xid_fixes) | set(graph_fixes.xid_triggers))
@@ -4810,6 +4840,10 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
     rendered_codes = ", ".join(str(code) for code in codes)
     roots = getattr(graph_fixes, "root_xids", None) or {}
     root_status = getattr(graph_fixes, "root_xid_status", {}) or {}
+
+    def _witnessed(root_list: list[int]) -> bool:
+        return observed_codes is None or any(root in observed_codes for root in root_list)
+
     # A flat root list carries no edge structure, so an arrow chain is provable
     # only for a single ancestor. Two or more roots can be independent faults
     # that each lead to the observed XID (a fan-in) rather than a sequence —
@@ -4819,13 +4853,31 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
     ordered_chains = [
         " → ".join(f"XID {node}" for node in [*root_list, observed])
         for observed, root_list in sorted(roots.items())
-        if root_status.get(observed, "ordered") == "ordered" and len(root_list) == 1
+        if root_status.get(observed, "ordered") == "ordered"
+        and len(root_list) == 1
+        and _witnessed(root_list)
     ]
     unordered = [
         (observed, root_list)
         for observed, root_list in sorted(roots.items())
-        if root_status.get(observed) == "complete-but-unordered"
-        or (root_status.get(observed, "ordered") == "ordered" and len(root_list) > 1)
+        if (
+            root_status.get(observed) == "complete-but-unordered"
+            or (root_status.get(observed, "ordered") == "ordered" and len(root_list) > 1)
+        )
+        and _witnessed(root_list)
+    ]
+    # Roots this run never witnessed at all: catalog possibilities only. Never
+    # folded into the two confirmed buckets above, and never given their "fix
+    # it" instruction — rendered separately below as candidates to rule out.
+    candidates = [
+        (observed, root_list)
+        for observed, root_list in sorted(roots.items())
+        if (
+            root_status.get(observed, "ordered") == "ordered"
+            or root_status.get(observed) == "complete-but-unordered"
+        )
+        and root_list
+        and not _witnessed(root_list)
     ]
     # xid_catalog.yaml's linkage_note documents the driver/CUDA version an
     # escalating XID's leads_to edge was actually CONFIRMED under. This line can
@@ -4860,6 +4912,32 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
     else:
         qualification = ""
         qualification_ko = ""
+    # Candidates get their own clause, appended to whichever branch fires below
+    # (or their own branch, when nothing was confirmed at all) — named exactly
+    # like a confirmed upstream-fault list, but framed as unconfirmed and never
+    # carrying the "fix it" instruction.
+    candidate_details = "; ".join(
+        f"upstream candidates of {observed} (not observed in this run): "
+        + ", ".join(str(root) for root in root_list)
+        for observed, root_list in candidates
+    )
+    candidate_details_ko = "; ".join(
+        f"XID {observed}의 상류 후보(이번 실행에서 미관측): "
+        + ", ".join(str(root) for root in root_list)
+        for observed, root_list in candidates
+    )
+    candidate_tail = (
+        f" {candidate_details}. Not confirmed for this incident — rule these out, "
+        "do not act on them as a root cause."
+        if candidate_details
+        else ""
+    )
+    candidate_tail_ko = (
+        f" {candidate_details_ko}. 이번 사건에서는 확인되지 않았습니다 — 조치 대상이 아니라 "
+        "배제 대상입니다."
+        if candidate_details_ko
+        else ""
+    )
     if language == "ko":
         if ordered_chains:
             if unordered:
@@ -4871,7 +4949,7 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
                 return (
                     f"- 관련 GPU 오류(XID): {rendered_codes} — "
                     f"인과 사슬(뿌리→관측): {'; '.join(ordered_chains)}; {details}. "
-                    "근본 원인을 먼저 조치하세요." + note_suffix_ko
+                    "근본 원인을 먼저 조치하세요." + note_suffix_ko + candidate_tail_ko
                 )
             return (
                 f"- 관련 GPU 오류(XID): {rendered_codes} — "
@@ -4882,6 +4960,7 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
                     else qualification_ko.strip()
                 )
                 + note_suffix_ko
+                + candidate_tail_ko
             )
         if unordered:
             details = "; ".join(
@@ -4889,7 +4968,12 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
                 + ", ".join(str(root) for root in root_list)
                 for observed, root_list in unordered
             )
-            return f"- 관련 GPU 오류(XID): {rendered_codes} — {details}. 근본 원인을 먼저 조치하세요."
+            return (
+                f"- 관련 GPU 오류(XID): {rendered_codes} — {details}. "
+                "근본 원인을 먼저 조치하세요." + candidate_tail_ko
+            )
+        if candidates:
+            return f"- 관련 GPU 오류(XID): {rendered_codes} —{candidate_tail_ko}"
         return (
             f"- 관련 GPU 오류(XID): {rendered_codes} — "
             "세부 조치는 아래 권장 조치를 참고."
@@ -4905,13 +4989,14 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
             return (
                 f"- Related GPU errors (XID): {rendered_codes} — causal chain "
                 f"(root → observed): {'; '.join(ordered_chains)}; {details}. "
-                "Fix the origin first." + note_suffix
+                "Fix the origin first." + note_suffix + candidate_tail
             )
         return (
             f"- Related GPU errors (XID): {rendered_codes} — causal chain (root → observed): "
             f"{'; '.join(ordered_chains)}."
             + (" Fix the root XID first." if not qualification else qualification)
             + note_suffix
+            + candidate_tail
         )
     if unordered:
         details = "; ".join(
@@ -4919,7 +5004,12 @@ def _causal_chain_line(graph_fixes: GraphRemediation | None, language: str) -> s
             + ", ".join(str(root) for root in root_list)
             for observed, root_list in unordered
         )
-        return f"- Related GPU errors (XID): {rendered_codes} — {details}. Fix the origin first."
+        return (
+            f"- Related GPU errors (XID): {rendered_codes} — {details}. "
+            "Fix the origin first." + candidate_tail
+        )
+    if candidates:
+        return f"- Related GPU errors (XID): {rendered_codes} —{candidate_tail}"
     return (
         f"- Related GPU errors (XID): {rendered_codes} — "
         "see the recommended actions below."
@@ -5822,6 +5912,7 @@ def _numbered_actions(
     language: str = "en",
     self_check_next: str = "",
     facts: dict[str, str] | None = None,
+    observed_codes: set[int] | None = None,
 ) -> list[str]:
     """One deduped priority list: self-check and matched symptom first, then
     alert/component/known-issue and signature-specific graph guidance."""
@@ -5924,11 +6015,18 @@ def _numbered_actions(
         # to crowd the exact symptom actions out of the eight-item report cap.
         # Keep only signature-specific graph fixes (XIDs) in executable actions;
         # symptom remediation below is selected from the observed evidence.
+        # root_xids is a catalog "what can escalate into this" lookup, not
+        # proof this run saw the ancestor fire — an unconfirmed one must not
+        # outrank (sort before, in the "root first" key below) the code this
+        # run actually observed, or its own fix can miss the 8-item cap
+        # entirely behind several catalog-only candidates. observed_codes=None
+        # (no caller opinion) keeps every root, matching prior behavior.
         root_codes = {
             root
             for observed, roots in graph_fixes.root_xids.items()
             if graph_fixes.root_xid_status.get(observed, "ordered") == "ordered"
             for root in roots
+            if observed_codes is None or root in observed_codes
         }
         masker = build_masker(())
         # Fix the ROOT of the causal chain before its downstream symptoms.
@@ -8198,7 +8296,10 @@ def _runai_highlights(details: dict[str, object]) -> list[str]:
     return lines
 
 
-_SIMILARITY_FLOOR = 0.80
+# Backend blended scale: identity contributes at most labelWeight, so scores no
+# longer saturate near 1.0 the way the old additive label bonus made them. Same
+# bar in meaning, different units — see minFeedbackHintSimilarity in the backend.
+_SIMILARITY_FLOOR = 0.70
 
 
 def approved_similar_seed(similar_incidents: list[object], families_catalog: object) -> str:

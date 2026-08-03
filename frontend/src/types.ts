@@ -28,6 +28,10 @@ export type SimilarIncident = {
   comment_count: number;
   labels?: Record<string, string>;
   created_at: string;
+  // Which index produced this score: dense-semantic / dense-lexical (pgvector)
+  // or sparse-identity (the in-memory fallback). Two retrievals score the same
+  // pair differently, so a percentage without its source is not comparable.
+  retrieval_kind?: string;
 };
 
 export type FeedbackHint = {

@@ -10,7 +10,7 @@ type MdNode = {
   depth?: number;
   ordered?: boolean;
   start?: number;
-  checked?: boolean;
+  checked?: boolean | null;
   lang?: string;
   url?: string;
   title?: string;
@@ -172,7 +172,7 @@ function renderList(
     let paragraphRendered = false;
     for (const child of itemChildren) {
       if (child.type === 'paragraph') {
-        const paragraphChildren = item.checked !== undefined && !paragraphRendered
+        const paragraphChildren = typeof item.checked === 'boolean' && !paragraphRendered
           ? [{ type: 'text', value: item.checked ? '[x] ' : '[ ] ' } as MdNode, ...(child.children ?? [])]
           : child.children ?? [];
         result.push(new Paragraph({

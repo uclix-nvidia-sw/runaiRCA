@@ -729,6 +729,64 @@ async def test_change_query_is_bounded_scoped_and_never_returns_bodies(
 
 
 @pytest.mark.asyncio
+async def test_change_query_zero_finding_says_so_in_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A genuinely empty sweep must say so in words, not "0 ... observation(s)"."""
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(**kwargs):
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    query = await change_query(_Settings(), _target(), {"kind": "event"})
+
+    assert query["observation"]["changes"] == []
+    assert query["summary"] == "No changes were observed for this query."
+    assert "observation(s)" not in query["summary"]
+
+
+@pytest.mark.asyncio
+async def test_change_query_multi_finding_names_the_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-empty sweep must name which objects changed, what kind, and when
+    -- not just report a bare count."""
+    monkeypatch.setattr(change_mod, "_read_file", lambda _p: "tok")
+
+    async def fake_get_json(*, path, **kwargs):
+        if path.endswith("/events"):
+            return JsonResponse(url="u", status_code=200, data={"items": [
+                {
+                    "type": "Warning",
+                    "reason": "BackOff",
+                    "lastTimestamp": "2026-07-13T21:44:00Z",
+                    "involvedObject": {"name": "trainer", "kind": "Pod"},
+                },
+                {
+                    "type": "Warning",
+                    "reason": "OOMKilling",
+                    "lastTimestamp": "2026-07-13T21:44:30Z",
+                    "involvedObject": {"name": "trainer", "kind": "Pod"},
+                },
+            ]})
+        return JsonResponse(url="u", status_code=200, data={"items": []})
+
+    monkeypatch.setattr(change_mod, "get_json", fake_get_json)
+    target = replace(
+        _target(),
+        fired_at="2026-07-13T21:43:47Z",
+        resolved_at="2026-07-13T21:45:47Z",
+    )
+    query = await change_query(_Settings(), target, {"kind": "event", "lookback_seconds": 60})
+
+    assert len(query["observation"]["changes"]) == 2
+    assert "observation(s)" not in query["summary"]
+    assert "Event/Warning trainer (BackOff) at 2026-07-13T21:44:00Z" in query["summary"]
+    assert "Event/Warning trainer (OOMKilling) at 2026-07-13T21:44:30Z" in query["summary"]
+
+
+@pytest.mark.asyncio
 async def test_change_query_uses_the_historical_incident_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

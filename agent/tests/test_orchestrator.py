@@ -788,7 +788,11 @@ async def test_analyze_excludes_low_similarity_incidents() -> None:
                 SimilarIncidentContext(
                     incident_id="INC-LOW",
                     title="Weak match",
-                    similarity=0.70,
+                    # Below _SIMILARITY_FLOOR. The floor moved from 0.80 to 0.70
+                    # when the backend stopped adding a flat label bonus on top
+                    # of cosine, so this fixture had to move with it -- 0.70 is
+                    # now an admitted match, not a weak one.
+                    similarity=0.55,
                     analysis_summary="Not really related.",
                 )
             ],

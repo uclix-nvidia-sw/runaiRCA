@@ -898,6 +898,98 @@ def test_drilldown_allows_only_one_llm_repair_after_query_parser_rejection(monke
     assert any("one query-syntax repair attempt" in w for w in result.warnings)
 
 
+def test_drilldown_collapses_repeated_identical_prometheus_failures(monkeypatch) -> None:
+    # A real export carried the identical "missing a recognized metric result"
+    # sentence 14 times, one row per failed query. Three distinct queries that
+    # all hit the same MCP failure must collapse to one row naming the queries
+    # instead of stacking the identical sentence.
+    queries = [
+        "container_memory_working_set_bytes",
+        "container_cpu_usage_seconds_total",
+        "kube_pod_container_status_restarts_total",
+    ]
+    decisions = iter(
+        [
+            {"action": "query", "queries": [{"tool": "promql_query", "args": {"query": q}}]}
+            for q in queries
+        ]
+        + [{"action": "done"}]
+    )
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        return next(decisions)
+
+    async def fake_prom_mcp(settings, name, query, *, time_range=None):
+        return {"error": "Prometheus MCP response missing a recognized metric result"}
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "prom_mcp_query", fake_prom_mcp)
+    result = CollectorResult(agent="prometheus", status="ok", summary="base metrics")
+
+    asyncio.run(
+        run_drilldowns(
+            drill_settings(prometheus_mcp_url="http://prom-mcp", max_investigation_steps=3),
+            [result],
+            _target(),
+            None,
+        )
+    )
+
+    assert len(result.artifacts) == 1
+    art = result.artifacts[0]
+    assert art.summary.startswith("Prometheus MCP response missing a recognized metric result")
+    assert "3x" in art.summary
+    for q in queries:
+        assert q in art.summary
+        assert q in art.query
+
+
+def test_drilldown_collapses_repeated_zero_finding_change_rows(monkeypatch) -> None:
+    # Same defect, the "change" agent: three change_query calls that each
+    # genuinely found nothing must not stack three byte-identical "ok" rows.
+    kinds = ["pod", "event", "node_condition"]
+    decisions = iter(
+        [
+            {"action": "query", "queries": [{"tool": "change_query", "args": {"kind": kind}}]}
+            for kind in kinds
+        ]
+        + [{"action": "done"}]
+    )
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        return next(decisions)
+
+    async def fake_change_query(settings, target, args):
+        return {
+            "query": f"kubernetes changes kind={args.get('kind')}",
+            "title": "Change timeline",
+            "summary": "No changes were observed for this query.",
+            "error": None,
+            "result": {"changes": []},
+        }
+
+    monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
+    monkeypatch.setattr(drilldown, "change_query", fake_change_query)
+    result = CollectorResult(agent="change", status="ok", summary="base change sweep")
+
+    asyncio.run(
+        run_drilldowns(
+            drill_settings(max_investigation_steps=3),
+            [result],
+            _target(),
+            None,
+        )
+    )
+
+    assert len(result.artifacts) == 1
+    art = result.artifacts[0]
+    assert art.status == "ok"
+    assert art.summary.startswith("No changes were observed for this query.")
+    assert "3x" in art.summary
+    for kind in kinds:
+        assert f"kind={kind}" in art.query
+
+
 @pytest.mark.asyncio
 async def test_kubernetes_log_and_describe_drilldowns_use_incident_scope(monkeypatch) -> None:
     target = replace(

@@ -364,7 +364,16 @@ const (
 	// Cross-incident feedback/comments are only imported as learning hints above
 	// this similarity — matches the agent planner's "trustworthy" bar. Below it,
 	// another incident's comments are noise, not guidance.
-	minFeedbackHintSimilarity = 0.80
+	// Blended scale (see blendedSimilarity): identity contributes at most
+	// labelWeight, so a score no longer saturates near 1.0 the way the old
+	// additive bonus made it. The bar is unchanged in MEANING -- under the old
+	// formula an all-labels-match candidate cleared 0.80 with content ~0.59,
+	// and 0.75*0.59 + 0.25 = 0.69 -- only in units.
+	minFeedbackHintSimilarity = 0.70
+	// Recurrence counting still runs the additive identity formula, so it keeps
+	// the original bar. Sharing one constant across two scales would silently
+	// loosen "did this fire again in 7d".
+	minRecurrenceSimilarity = 0.80
 	flappingGroupWindow       = 30 * time.Minute
 	maxListLimit              = 200
 	maxJSONBodyBytes          = 1 << 20
