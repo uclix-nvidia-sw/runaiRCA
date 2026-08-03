@@ -394,6 +394,39 @@ async def _complete_with_nat_client(
         SystemMessage(content=f"{PROMPT_INJECTION_GUARD}\n\n{system}"),
         HumanMessage(content=user),
     ]
+    # finish_reason=length means the cap cut the reply, and a reasoning model
+    # spends the cap on its chain-of-thought BEFORE the answer -- so the content
+    # arrives empty or truncated and the caller degrades. The direct-HTTP path
+    # has doubled once for exactly this since 2026-07-15; NAT could not, because
+    # it relied on falling through to HTTP, and that fallthrough was removed by
+    # the 2026-07-30 owner decision above. Double inside NAT instead: same
+    # transport, same rule. A Korean report lost three whole action lines to
+    # this (requested_max_tokens=3072, completion_tokens=3072, content empty).
+    budget = int(max_tokens) if max_tokens else 0
+    for budget_round in range(2):
+        text, error, finish = await _nat_generation(
+            settings, client, messages, temperature, budget, model
+        )
+        if finish != "length" or budget_round or not budget:
+            return text, error
+        budget *= 2
+        _log.warning(
+            "NAT LLM reply truncated at max_tokens (model=%s); retrying with max_tokens=%s",
+            model,
+            budget,
+        )
+    return text, error
+
+
+async def _nat_generation(
+    settings: Settings,
+    client: Any,
+    messages: list[Any],
+    temperature: float,
+    max_tokens: int,
+    model: str,
+) -> tuple[str | None, str | None, Any]:
+    """One NAT generation. Returns (text, error, finish_reason)."""
     kwargs: dict[str, Any] = {"temperature": temperature}
     if max_tokens:
         kwargs["max_tokens"] = max_tokens
@@ -404,7 +437,7 @@ async def _complete_with_nat_client(
             if timeout is None:
                 response = await call_client.ainvoke(messages)
             elif timeout <= 0:
-                return None, "analysis deadline exhausted before NAT LLM call"
+                return None, "analysis deadline exhausted before NAT LLM call", None
             else:
                 response = await asyncio.wait_for(call_client.ainvoke(messages), timeout=timeout)
             break
@@ -413,21 +446,21 @@ async def _complete_with_nat_client(
             # budget. Retrying it inside NAT can spend the entire analysis
             # deadline before the direct HTTP fallback or final harness runs.
             _record_failed_call(model)
-            return None, f"NAT LLM request timed out after {timeout:.1f}s"
+            return None, f"NAT LLM request timed out after {timeout:.1f}s", None
         except Exception as exc:  # noqa: BLE001 - preserve graceful LLM degradation
             if attempt == 2:
                 _record_failed_call(model)
-                return None, f"{type(exc).__name__}: {exc}"
+                return None, f"{type(exc).__name__}: {exc}", None
             delay = (0.25 * (2**attempt)) + random.uniform(0, 0.1)
             remaining = _analysis_time_remaining()
             if remaining is not None:
                 if remaining <= 0:
-                    return None, "analysis deadline exhausted during NAT LLM retries"
+                    return None, "analysis deadline exhausted during NAT LLM retries", None
                 delay = min(delay, remaining)
             await asyncio.sleep(delay)
     else:
         _record_failed_call(model)
-        return None, "NAT LLM client failed"
+        return None, "NAT LLM client failed", None
     usage = _langchain_usage(response)
     _record_usage(model, {"usage": usage} if usage else {})
     meta = getattr(response, "response_metadata", None)
@@ -435,21 +468,21 @@ async def _complete_with_nat_client(
     completion = (usage or {}).get("completion_tokens")
     text = _langchain_text(response)
     if text and finish != "length":
-        return text, None
+        return text, None, finish
     if text:
-        # Truncated mid-answer by the completion cap. Report it as unusable so
-        # the direct HTTP fallback runs — that path retries with a doubled cap.
+        # Truncated mid-answer by the completion cap. Unusable as an answer; the
+        # caller above retries once with a doubled cap before giving up.
         return None, (
             f"reply truncated at max_tokens "
             f"(finish_reason=length, completion_tokens={completion})"
-        )
+        ), finish
     # Empty content with usage recorded = the model DID reply. The classic cause
     # is a reasoning model spending the whole completion budget on reasoning
     # tokens (finish_reason=length, content=""), so name it in the error.
     return None, (
         f"empty content from the NAT LLM client "
         f"(finish_reason={finish}, completion_tokens={completion})"
-    )
+    ), finish
 
 
 def _langchain_text(response: Any) -> str:

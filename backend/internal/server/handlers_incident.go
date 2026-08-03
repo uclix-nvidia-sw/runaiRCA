@@ -183,6 +183,19 @@ func (s *Server) handleIncident(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if detail, ok := s.store.IncidentDetail(id); ok {
+		// Rank the panel by the SAME retrieval the analysis cited. Embedding and
+		// pgvector are network I/O that must never run under the store lock, so
+		// the locked IncidentDetail build can only ever reach the sparse-identity
+		// fallback -- which is how one report quoted "similarity 0.97" from the
+		// dense index while the card beside it showed 78% from sparse, for the
+		// same pair. Re-resolve out here, where dense can be tried first; it
+		// enforces the same approved/not-deleted/not-self gates as the fallback,
+		// and returns the fallback verbatim when pgvector is unavailable.
+		if len(detail.Alerts) > 0 {
+			detail.SimilarIncidents = s.store.SimilarIncidentsForAlert(
+				alertFromRecord(detail.Alerts[0]), id, similarIncidentLimit,
+			)
+		}
 		if actor := r.URL.Query().Get("feedback_author"); actor != "" {
 			s.store.mu.RLock()
 			detail.Feedback = s.store.feedbackSummaryForActorLocked("incident", id, actor)

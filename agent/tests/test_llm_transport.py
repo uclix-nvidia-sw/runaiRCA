@@ -433,3 +433,86 @@ async def test_unusable_nat_reply_logs_why(monkeypatch, caplog) -> None:
     assert text is None and error is not None
     assert "purpose=collector_insight" in caplog.text
     assert "requested_max_tokens=512" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_nat_length_truncation_retries_once_with_a_doubled_cap(monkeypatch) -> None:
+    """A reasoning model that spends the whole cap on thinking gets one bigger try.
+
+    The direct-HTTP path has doubled once on finish_reason=length for a long
+    time; NAT could not, because it relied on falling through to HTTP and that
+    fallthrough was removed by the 2026-07-30 owner decision. A real Korean
+    report lost three action lines to this (requested 3072, completion 3072,
+    content empty), so the doubling now lives inside NAT -- same transport.
+    """
+    caps: list[int] = []
+
+    class ThinksTooLongClient:
+        def bind(self, **kwargs):
+            caps.append(kwargs.get("max_tokens"))
+            return self
+
+        async def ainvoke(self, messages):
+            # Empty content, whole budget burned on reasoning tokens.
+            if len(caps) == 1:
+                return SimpleNamespace(
+                    content="",
+                    usage_metadata={"input_tokens": 100, "output_tokens": caps[-1]},
+                    response_metadata={"finish_reason": "length"},
+                )
+            return SimpleNamespace(
+                content='{"ok": true}',
+                usage_metadata={"input_tokens": 100, "output_tokens": 40},
+                response_metadata={"finish_reason": "stop"},
+            )
+
+    http_calls = []
+
+    async def fake_post_json(*, url, timeout_seconds, json_body, headers=None, verify=True):
+        http_calls.append(dict(json_body))
+        return SimpleNamespace(ok=True, data={"choices": [], "usage": {}})
+
+    monkeypatch.setattr("app.llm.post_json", fake_post_json)
+    token = llm.set_nat_client(ThinksTooLongClient())
+    try:
+        text, error = await llm.complete_with_error(
+            _settings(), system="system", user="user", max_tokens=3072
+        )
+    finally:
+        llm.reset_nat_client(token)
+
+    assert caps == [3072, 6144], caps
+    assert text == '{"ok": true}'
+    assert error is None
+    # The owner decision stands: doubling happens on NAT, never by switching.
+    assert http_calls == []
+
+
+@pytest.mark.asyncio
+async def test_nat_length_truncation_doubles_only_once(monkeypatch) -> None:
+    """Two rounds, then the error surfaces -- never an unbounded escalation."""
+    caps: list[int] = []
+
+    class AlwaysTruncatesClient:
+        def bind(self, **kwargs):
+            caps.append(kwargs.get("max_tokens"))
+            return self
+
+        async def ainvoke(self, messages):
+            return SimpleNamespace(
+                content="",
+                usage_metadata={"input_tokens": 100, "output_tokens": caps[-1]},
+                response_metadata={"finish_reason": "length"},
+            )
+
+    token = llm.set_nat_client(AlwaysTruncatesClient())
+    try:
+        text, error = await llm.complete_with_error(
+            _settings(), system="system", user="user", max_tokens=1024
+        )
+    finally:
+        llm.reset_nat_client(token)
+
+    assert caps == [1024, 2048], caps
+    assert text is None
+    assert error is not None and "finish_reason=length" in error

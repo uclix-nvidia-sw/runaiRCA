@@ -1,8 +1,10 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -327,5 +329,51 @@ func assertLoadedPostgresMemory(t *testing.T, store *Store) {
 	chats, total := store.ListChatConversationsPage(0, 0)
 	if total != 1 || len(chats) != 1 || chats[0].ID != "chat-db" || len(chats[0].Messages) != 2 {
 		t.Fatalf("expected chat conversation to reload, total=%d chats=%+v", total, chats)
+	}
+}
+
+// The panel must rank by the SAME retrieval the analysis cites. IncidentDetail
+// builds under the store lock, and embedding/pgvector are network I/O that must
+// never run there, so the locked build can only reach the sparse-identity
+// fallback -- which is how one report quoted "similarity 0.97" from the dense
+// index while the card beside it showed 78% from sparse, for the same pair.
+// The GET handler re-resolves outside the lock, where dense is tried first.
+func TestIncidentDetailHandlerServesDenseSimilarity(t *testing.T) {
+	state := testsupport.NewPostgresState(false)
+	server := NewServer()
+	server.store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
+	defer server.store.db.Close()
+
+	locked, ok := server.store.IncidentDetail("INC-db")
+	if !ok {
+		t.Fatalf("expected the postgres-loaded incident to exist")
+	}
+	for _, item := range locked.SimilarIncidents {
+		if strings.HasPrefix(item.RetrievalKind, "dense") {
+			t.Fatalf("the locked build cannot reach dense (network I/O under the lock), got %q", item.RetrievalKind)
+		}
+	}
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/incidents/INC-db", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Data struct {
+			SimilarIncidents []SimilarIncident `json:"similar_incidents"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode incident detail: %v", err)
+	}
+	if len(body.Data.SimilarIncidents) == 0 {
+		t.Fatalf("expected the handler to return similar incidents")
+	}
+	// The fake driver answers the <=> query, so this is the pgvector path the
+	// panel could never take before. (It ignores bind parameters, so the
+	// self-exclusion the real SQL applies is not exercised here.)
+	if kind := body.Data.SimilarIncidents[0].RetrievalKind; !strings.HasPrefix(kind, "dense") {
+		t.Fatalf("panel must use the dense index, got kind=%q", kind)
 	}
 }
