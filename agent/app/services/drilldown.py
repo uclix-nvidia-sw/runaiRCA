@@ -75,7 +75,12 @@ from app.collectors.prometheus import (
     prom_mcp_query,
     prom_query,
 )
-from app.collectors.runai_mcp import _tool_json, valid_official_workload_id
+from app.collectors.runai_mcp import (
+    _tool_json,
+    resolve_runai_cluster_id,
+    runai_cluster_gpu_model,
+    valid_official_workload_id,
+)
 from app.collectors.system import system_log_query
 from app.config import Settings
 from app.llm import complete_json, complete_with_error, llm_configured, parse_json_object
@@ -103,7 +108,6 @@ _RESULT_CHARS = 1500  # per-query result excerpt fed back into the loop
 # control-plane misdiagnosis on a run that observed nothing.
 _KNOWLEDGE_TOOL = "knowledge_lookup"
 _KNOWLEDGE_MATCH_CAP = 5
-_RUNAI_CLUSTER_ID_CACHE: dict[tuple[str, str], str] = {}
 _RUNAI_PROJECT_ID_CACHE: dict[tuple[str, str], str] = {}
 _USER_PROMPT_CHARS = 6000
 # An adapter-owned sentinel cannot be supplied by a JSON/MCP response.  It
@@ -658,27 +662,6 @@ def _query_failure_category(outcome: dict[str, Any], diagnostic: str) -> str:
     return "execution"
 
 
-def _runai_cluster_gpu_model(payload: Any) -> str:
-    """The cluster's one GPU model, from get_cluster_physical_inventory.
-
-    ``byGpuModel`` groups every GPU-bearing node by its raw product string
-    (the same GFD label kubernetes.py reads off a single node) -- a
-    cluster-wide source that needs no alert node. A mixed cluster (more than
-    one distinct model) is deliberately left unresolved: guessing either one
-    would gate away the other model's own upstream-XID knowledge, which is
-    worse than not gating at all.
-    """
-    by_model = payload.get("byGpuModel") if isinstance(payload, dict) else None
-    if not isinstance(by_model, list):
-        return ""
-    models = {
-        str(entry.get("gpuModel")).strip()
-        for entry in by_model
-        if isinstance(entry, dict) and str(entry.get("gpuModel") or "").strip()
-    }
-    return next(iter(models)) if len(models) == 1 else ""
-
-
 async def _run_query(
     settings: Settings,
     result: CollectorResult,
@@ -724,7 +707,7 @@ async def _run_query(
         and name == "get_cluster_physical_inventory"
         and "gpu_model" not in result.details
     ):
-        if model := _runai_cluster_gpu_model(outcome.get("result")):
+        if model := runai_cluster_gpu_model(outcome.get("result")):
             result.details["gpu_model"] = model
     artifact_result = _typed_artifact_result(
         outcome, error=error, tool=name, artifact_type=artifact_type
@@ -2870,53 +2853,6 @@ async def _mcp_call(
     return await mcp_call(url or settings.runai_mcp_url, tool, arguments, headers=headers)
 
 
-async def _resolve_runai_cluster_id(settings: Settings, target: AnalysisTarget) -> str:
-    """Resolve an alert's cluster name to the UUID required by official MCP tools."""
-    if valid_official_workload_id(target.cluster):
-        return target.cluster
-    if not settings.runai_base_url:
-        raise RuntimeError("Run:ai base URL is not configured; cannot resolve cluster ID")
-    cache_key = (settings.runai_base_url, target.cluster)
-    if cached := _RUNAI_CLUSTER_ID_CACHE.get(cache_key):
-        return cached
-    from app.collectors.runai import _runai_headers
-
-    headers, _warnings = await _runai_headers(settings)
-    if not headers.get("Authorization"):
-        raise RuntimeError("Run:ai API authentication is unavailable; cannot resolve cluster ID")
-    response = await get_json(
-        base_url=settings.runai_base_url,
-        path="/api/v1/clusters",
-        timeout_seconds=settings.runai_timeout_seconds,
-        headers=headers,
-        verify=mcp_tls_verify(),
-    )
-    if not response.ok:
-        raise RuntimeError(response.error or f"HTTP {response.status_code} resolving cluster ID")
-    data = response.data
-    rows = (
-        data
-        if isinstance(data, list)
-        else data.get("clusters")
-        if isinstance(data, dict)
-        else None
-    )
-    clusters = [row for row in (rows or []) if isinstance(row, dict)]
-    matches = [row for row in clusters if str(row.get("name") or "") == target.cluster]
-    candidates = matches or (clusters if len(clusters) == 1 else [])
-    if not candidates:
-        raise RuntimeError(
-            f"could not resolve Run:ai cluster ID for alert cluster {target.cluster!r}"
-        )
-    cluster_id = str(candidates[0].get("uuid") or candidates[0].get("id") or "")
-    if not cluster_id:
-        raise RuntimeError(
-            f"Run:ai cluster {str(candidates[0].get('name') or target.cluster)!r} has no UUID"
-        )
-    _RUNAI_CLUSTER_ID_CACHE[cache_key] = cluster_id
-    return cluster_id
-
-
 async def _resolve_runai_project_id(settings: Settings, target: AnalysisTarget) -> str:
     """Resolve an alert's project name to the ID required by policy lookup."""
     if not target.project:
@@ -3225,7 +3161,7 @@ async def _tool_runai_cluster_physical_inventory(
     title_ko = "Run:ai 클러스터 물리 인벤토리"
     title_en = "Run:ai cluster physical inventory"
     try:
-        cluster_id = await _resolve_runai_cluster_id(settings, target)
+        cluster_id = await resolve_runai_cluster_id(settings, target)
     except Exception as exc:  # noqa: BLE001 - drill-down failure stays an artifact
         error = _safe_text(str(exc), limit=_RESULT_CHARS)
         return {
@@ -3249,7 +3185,7 @@ async def _tool_runai_cluster_infrastructure_health(
     title_ko = "Run:ai 클러스터 인프라 상태"
     title_en = "Run:ai cluster infrastructure health"
     try:
-        cluster_id = await _resolve_runai_cluster_id(settings, target)
+        cluster_id = await resolve_runai_cluster_id(settings, target)
     except Exception as exc:  # noqa: BLE001 - drill-down failure stays an artifact
         error = _safe_text(str(exc), limit=_RESULT_CHARS)
         return {
@@ -3273,7 +3209,7 @@ async def _tool_runai_cluster_metrics(
     title_ko = "Run:ai 클러스터 메트릭"
     title_en = "Run:ai cluster metrics"
     try:
-        cluster_id = await _resolve_runai_cluster_id(settings, target)
+        cluster_id = await resolve_runai_cluster_id(settings, target)
     except Exception as exc:  # noqa: BLE001 - drill-down failure stays an artifact
         error = _safe_text(str(exc), limit=_RESULT_CHARS)
         return {

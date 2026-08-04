@@ -21,6 +21,7 @@ from app.collectors.http_json import _safe_text, compact, get_json, post_oauth_t
 from app.collectors.loki import _llm_insight
 from app.collectors.runai_mcp import (
     gather_runai_via_mcp,
+    runai_cluster_gpu_model,
     valid_official_workload_id,
 )
 from app.config import Settings
@@ -84,6 +85,22 @@ async def _fetch_runai_version(settings: Settings, headers: dict[str, str]) -> s
         verify=mcp_tls_verify(),
     )
     return _extract_version(resp.data) if resp.ok else ""
+
+
+
+def _mcp_cluster_gpu_model(query_results: list[dict[str, object]]) -> str:
+    """The single GPU model the cluster inventory reported, if it reported one.
+
+    A mixed-model cluster resolves to nothing on purpose: guessing one would gate
+    away the other model's own upstream-XID knowledge, which is worse than not
+    gating at all.
+    """
+    for item in query_results:
+        if str(item.get("name") or "") != "cluster_inventory" or item.get("error"):
+            continue
+        if model := runai_cluster_gpu_model(item.get("data")):
+            return model
+    return ""
 
 
 class RunAICollector:
@@ -345,6 +362,12 @@ class RunAICollector:
                 "runai_version": runai_version,
                 "queries": query_results,
             }
+            # The XID catalog gates upstream faults by GPU model, and an operator
+            # question names no node -- so the node label the Kubernetes collector
+            # reads is unavailable. This is the cluster-scoped source, gathered
+            # unconditionally above; _gpu_model_from reads exactly this key.
+            if gpu_model := _mcp_cluster_gpu_model(query_results):
+                details["gpu_model"] = gpu_model
             warnings = auth_warnings + [
                 f"Run:ai {item['name']} query failed: {item['error']}"
                 for item in query_results

@@ -272,3 +272,93 @@ def test_no_node_cluster_inventory_reaches_the_model_gate() -> None:
     assert len(out.warnings) == 1
     for code in ("144", "145", "146"):
         assert code in out.warnings[0]
+
+
+def test_cluster_inventory_is_gathered_without_the_llm_choosing_it() -> None:
+    """The model gate must not depend on which tools the LLM happened to pick.
+
+    GPU model is an invariant property of the cluster and the input to a
+    correctness gate, so it is gathered like list_node_pools -- unconditionally
+    -- not as a drill-down. Before this, the same XID question answered
+    differently on the same cluster depending on the model's tool choice.
+    """
+    import asyncio
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from app.collectors import runai_mcp
+    from app.collectors.runai import _mcp_cluster_gpu_model
+    from tests.test_orchestrator import make_settings, make_target
+
+    called: list[tuple[str, dict]] = []
+
+    async def fake_mcp_call(url, tool, arguments, headers=None):  # noqa: ANN001
+        called.append((tool, dict(arguments)))
+        # The official server returns structuredContent per its outputSchema.
+        payload = (
+            {"byGpuModel": [{"gpuModel": "NVIDIA-H100-80GB-HBM3", "nodes": 4}]}
+            if tool == "get_cluster_physical_inventory"
+            else {}
+        )
+        return SimpleNamespace(isError=False, structuredContent=payload)
+
+    async def fake_resolve(_settings, _target):  # noqa: ANN001
+        return "11111111-2222-3333-4444-555555555555"
+
+    original_call, original_resolve = runai_mcp.mcp_call, runai_mcp.resolve_runai_cluster_id
+    runai_mcp.mcp_call = fake_mcp_call
+    runai_mcp.resolve_runai_cluster_id = fake_resolve
+    try:
+        # No node, no workload id, no project: an operator question's shape.
+        target = replace(make_target(), node="", pod="", runai_workload_id="", project="")
+        settings = replace(make_settings(), runai_mcp_url="http://runai-mcp.local")
+        results = asyncio.run(
+            runai_mcp.gather_runai_via_mcp(
+                settings, target, headers={"Authorization": "Bearer t"}
+            )
+        )
+    finally:
+        runai_mcp.mcp_call = original_call
+        runai_mcp.resolve_runai_cluster_id = original_resolve
+
+    tools = [tool for tool, _args in called]
+    assert "get_cluster_physical_inventory" in tools, tools
+    assert _mcp_cluster_gpu_model(results) == "NVIDIA-H100-80GB-HBM3"
+
+
+def test_cluster_inventory_failure_never_breaks_the_gather() -> None:
+    """Resolution failure is one evidence row, not a lost Run:ai snapshot."""
+    import asyncio
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    from app.collectors import runai_mcp
+    from app.collectors.runai import _mcp_cluster_gpu_model
+    from tests.test_orchestrator import make_settings, make_target
+
+    async def fake_mcp_call(url, tool, arguments, headers=None):  # noqa: ANN001
+        return SimpleNamespace(isError=False, structuredContent={"ok": True})
+
+    async def boom(_settings, _target):  # noqa: ANN001
+        raise RuntimeError("Run:ai base URL is not configured")
+
+    original_call, original_resolve = runai_mcp.mcp_call, runai_mcp.resolve_runai_cluster_id
+    runai_mcp.mcp_call = fake_mcp_call
+    runai_mcp.resolve_runai_cluster_id = boom
+    try:
+        results = asyncio.run(
+            runai_mcp.gather_runai_via_mcp(
+                replace(make_settings(), runai_mcp_url="http://runai-mcp.local"),
+                replace(make_target(), node=""),
+                headers={"Authorization": "Bearer t"},
+            )
+        )
+    finally:
+        runai_mcp.mcp_call = original_call
+        runai_mcp.resolve_runai_cluster_id = original_resolve
+
+    assert any(not item.get("error") for item in results), "other tools must survive"
+    inventory = [item for item in results if item.get("name") == "cluster_inventory"]
+    assert len(inventory) == 1 and inventory[0]["error"]
+    # Unknown model => gate stays off rather than guessing.
+    assert _mcp_cluster_gpu_model(results) == ""

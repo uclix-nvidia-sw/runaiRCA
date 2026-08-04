@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.collectors import runai_mcp
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact
 from app.llm import begin_usage_tracking
 from app.plan import InvestigationPlan
@@ -2329,7 +2330,7 @@ def test_runai_cluster_physical_inventory_returns_success_and_error_artifacts(mo
         return "cluster-id"
 
     monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
-    monkeypatch.setattr(drilldown, "_resolve_runai_cluster_id", fake_cluster_id)
+    monkeypatch.setattr(drilldown, "resolve_runai_cluster_id", fake_cluster_id)
     settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
 
     success = asyncio.run(_tool_runai_cluster_physical_inventory(settings, _target(), {}))
@@ -2340,7 +2341,7 @@ def test_runai_cluster_physical_inventory_returns_success_and_error_artifacts(mo
     async def missing_cluster_id(settings, target):
         raise RuntimeError("could not resolve Run:ai cluster ID")
 
-    monkeypatch.setattr(drilldown, "_resolve_runai_cluster_id", missing_cluster_id)
+    monkeypatch.setattr(drilldown, "resolve_runai_cluster_id", missing_cluster_id)
     unresolved = asyncio.run(_tool_runai_cluster_physical_inventory(settings, _target(), {}))
     assert "could not resolve Run:ai cluster ID" in unresolved["error"]
 
@@ -2356,7 +2357,7 @@ def test_runai_cluster_gpu_model_extracts_the_single_distinct_model() -> None:
             {"gpuModel": "NVIDIA-H100-80GB-HBM3", "nodes": 4, "gpusTotal": 32},
         ],
     }
-    assert drilldown._runai_cluster_gpu_model(payload) == "NVIDIA-H100-80GB-HBM3"
+    assert drilldown.runai_cluster_gpu_model(payload) == "NVIDIA-H100-80GB-HBM3"
 
 
 def test_runai_cluster_gpu_model_leaves_mixed_cluster_unresolved() -> None:
@@ -2368,11 +2369,11 @@ def test_runai_cluster_gpu_model_leaves_mixed_cluster_unresolved() -> None:
             {"gpuModel": "NVIDIA-H100-80GB-HBM3", "nodes": 4, "gpusTotal": 32},
         ]
     }
-    assert drilldown._runai_cluster_gpu_model(mixed) == ""
-    assert drilldown._runai_cluster_gpu_model({"byGpuModel": []}) == ""
-    assert drilldown._runai_cluster_gpu_model({"byGpuModel": None}) == ""
-    assert drilldown._runai_cluster_gpu_model({}) == ""
-    assert drilldown._runai_cluster_gpu_model("not-a-dict") == ""
+    assert drilldown.runai_cluster_gpu_model(mixed) == ""
+    assert drilldown.runai_cluster_gpu_model({"byGpuModel": []}) == ""
+    assert drilldown.runai_cluster_gpu_model({"byGpuModel": None}) == ""
+    assert drilldown.runai_cluster_gpu_model({}) == ""
+    assert drilldown.runai_cluster_gpu_model("not-a-dict") == ""
 
 
 @pytest.mark.asyncio
@@ -2457,7 +2458,7 @@ def test_runai_cluster_infrastructure_health_returns_success_and_error_artifacts
         return "cluster-id"
 
     monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
-    monkeypatch.setattr(drilldown, "_resolve_runai_cluster_id", fake_cluster_id)
+    monkeypatch.setattr(drilldown, "resolve_runai_cluster_id", fake_cluster_id)
     settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
 
     success = asyncio.run(
@@ -2487,7 +2488,7 @@ def test_runai_cluster_metrics_uses_incident_window_and_returns_error_artifact(m
         return "cluster-id"
 
     monkeypatch.setattr(drilldown, "_mcp_call", fake_mcp_call)
-    monkeypatch.setattr(drilldown, "_resolve_runai_cluster_id", fake_cluster_id)
+    monkeypatch.setattr(drilldown, "resolve_runai_cluster_id", fake_cluster_id)
     settings = drill_settings(runai_mcp_url="http://localhost:8080/mcp")
     target = replace(
         _target(), fired_at="2025-01-01T00:00:00Z", resolved_at="2025-01-01T00:10:00Z"
@@ -2604,7 +2605,9 @@ def test_runai_workload_effective_policy_requires_project_kind_and_returns_succe
 def test_runai_cluster_id_discovery_matches_name_uses_single_cluster_and_errors(
     monkeypatch,
 ) -> None:
-    drilldown._RUNAI_CLUSTER_ID_CACHE.clear()
+    # The resolver now lives in the collector layer so the Run:ai collector can
+    # reach it too; drilldown imports it from there.
+    runai_mcp._CLUSTER_ID_CACHE.clear()
     responses = iter(
         [
             {"clusters": [{"name": "uclick-runai", "uuid": "named-cluster-id"}]},
@@ -2618,20 +2621,21 @@ def test_runai_cluster_id_discovery_matches_name_uses_single_cluster_and_errors(
         calls.append(kwargs)
         return SimpleNamespace(ok=True, data=next(responses))
 
-    monkeypatch.setattr(drilldown, "get_json", fake_get_json)
+    # The resolver reads through the collector module's get_json now.
+    monkeypatch.setattr(runai_mcp, "get_json", fake_get_json)
     settings = drill_settings(
         runai_base_url="https://runai.example", runai_bearer_token="test-token"
     )
 
     named = replace(_target(), cluster="uclick-runai")
-    assert asyncio.run(drilldown._resolve_runai_cluster_id(settings, named)) == "named-cluster-id"
-    assert asyncio.run(drilldown._resolve_runai_cluster_id(settings, named)) == "named-cluster-id"
+    assert asyncio.run(drilldown.resolve_runai_cluster_id(settings, named)) == "named-cluster-id"
+    assert asyncio.run(drilldown.resolve_runai_cluster_id(settings, named)) == "named-cluster-id"
     assert asyncio.run(
-        drilldown._resolve_runai_cluster_id(settings, replace(_target(), cluster="alert-name"))
+        drilldown.resolve_runai_cluster_id(settings, replace(_target(), cluster="alert-name"))
     ) == "single-cluster-id"
     with pytest.raises(RuntimeError, match="could not resolve Run:ai cluster ID"):
         asyncio.run(
-            drilldown._resolve_runai_cluster_id(settings, replace(_target(), cluster="missing"))
+            drilldown.resolve_runai_cluster_id(settings, replace(_target(), cluster="missing"))
         )
     assert [call["path"] for call in calls] == [
         "/api/v1/clusters",
