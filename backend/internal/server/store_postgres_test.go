@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -427,5 +429,41 @@ func TestIncidentDetailHandlerServesDenseSimilarity(t *testing.T) {
 	// self-exclusion the real SQL applies is not exercised here.)
 	if kind := body.Data.SimilarIncidents[0].RetrievalKind; kind != retrievalKindDenseSemantic {
 		t.Fatalf("panel must use the dense-semantic index when a real embedder is configured, got kind=%q", kind)
+	}
+}
+
+// The two early returns in withTransaction differ, and their order is the whole
+// contract: a store that could not have written reports success even when the
+// caller's own precondition failed, so an in-memory-only deployment never fails
+// an analysis on a persistence check. Only a ready database rejects bad
+// arguments — and neither case may open a transaction.
+func TestWithTransactionOrdersReadinessBeforeArgumentValidity(t *testing.T) {
+	store := NewStore()
+	ran := false
+	work := func(context.Context, *sql.Tx) bool { ran = true; return true }
+
+	if !store.withTransaction("no database", false, work) {
+		t.Fatal("expected success without a database even when args are invalid")
+	}
+	if ran {
+		t.Fatal("expected no transaction body without a database")
+	}
+
+	state := testsupport.NewPostgresState(false)
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
+	defer store.db.Close()
+	beginsBefore, _, _ := state.TxCounts()
+
+	if store.withTransaction("ready database", false, work) {
+		t.Fatal("expected failure for invalid args once the database is ready")
+	}
+	if ran {
+		t.Fatal("expected no transaction body for invalid args")
+	}
+	if begins, _, _ := state.TxCounts(); begins != beginsBefore {
+		t.Fatalf("expected no transaction to open, got %d -> %d", beginsBefore, begins)
+	}
+	if !store.withTransaction("ready database", true, work) || !ran {
+		t.Fatal("expected valid args to run inside a committed transaction")
 	}
 }

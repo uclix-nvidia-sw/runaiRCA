@@ -1384,15 +1384,29 @@ func (s *Store) persistIncidentLocked(incident *Incident) bool {
 	return true
 }
 
-func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []string, episodes map[string]deletedEpisode) bool {
-	if s.db == nil || !s.dbReady || incidentID == "" {
+// withTransaction runs work inside one transaction, committing only when it
+// returns true and rolling back otherwise. what names the operation in both log
+// lines; argsValid carries the caller's own precondition.
+//
+// The two early returns differ on purpose and their ORDER is the contract: a
+// store with no ready database reports success, because Postgres persistence is
+// optional there and the caller's in-memory state is already updated — even when
+// the caller's own precondition failed. Only a store that could have written
+// reports failure for bad arguments.
+func (s *Store) withTransaction(
+	what string, argsValid bool, work func(context.Context, *sql.Tx) bool,
+) bool {
+	if s.db == nil || !s.dbReady {
 		return true
+	}
+	if !argsValid {
+		return false
 	}
 	ctx, cancel := postgresOperationContext()
 	defer cancel()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		log.Printf("Failed to start hard delete transaction for incident %s: %v", incidentID, err)
+		log.Printf("Failed to start %s transaction: %v", what, err)
 		return false
 	}
 	committed := false
@@ -1401,45 +1415,57 @@ func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []st
 			_ = tx.Rollback()
 		}
 	}()
-	// Each query gets EXACTLY the args it references. The last two use only $1 —
-	// passing $2 too made pgx/Postgres reject the bind ("2 parameters, statement
-	// requires 1"), failing the whole tx so hard delete silently 404'd. (The unit
-	// test's fake driver doesn't enforce bind-param counts, so it never caught this.)
-	ops := []struct {
-		query string
-		args  []any
-	}{
-		{`DELETE FROM rca_eval_reviews WHERE run_id IN (SELECT run_id FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2))`, []any{incidentID, alertIDs}},
-		{`DELETE FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
-		{`DELETE FROM chat_conversations WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
-		{`DELETE FROM rca_feedback WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`, []any{incidentID, alertIDs}},
-		{`DELETE FROM incident_embeddings WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
-		{`DELETE FROM alerts WHERE incident_id = $1`, []any{incidentID}},
-		{`DELETE FROM incidents WHERE incident_id = $1`, []any{incidentID}},
-	}
-	for _, op := range ops {
-		if _, err := tx.ExecContext(ctx, op.query, op.args...); err != nil {
-			log.Printf("Failed to hard delete incident %s: %v", incidentID, err)
-			return false
-		}
-	}
-	for fingerprint, episode := range episodes {
-		if _, err := tx.ExecContext(
-			ctx,
-			`INSERT INTO deleted_alert_episodes (fingerprint, fired_at, deleted_at) VALUES ($1, $2, $3)
-			 ON CONFLICT (fingerprint) DO UPDATE SET fired_at = EXCLUDED.fired_at, deleted_at = EXCLUDED.deleted_at`,
-			fingerprint, episode.FiredAt, episode.DeletedAt,
-		); err != nil {
-			log.Printf("Failed to record deleted episode for incident %s: %v", incidentID, err)
-			return false
-		}
+	if !work(ctx, tx) {
+		return false
 	}
 	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit hard delete incident %s: %v", incidentID, err)
+		log.Printf("Failed to commit %s transaction: %v", what, err)
 		return false
 	}
 	committed = true
 	return true
+}
+
+func (s *Store) persistHardDeleteIncidentLocked(incidentID string, alertIDs []string, episodes map[string]deletedEpisode) bool {
+	if incidentID == "" {
+		return true
+	}
+	return s.withTransaction(fmt.Sprintf("hard delete for incident %s", incidentID), true, func(ctx context.Context, tx *sql.Tx) bool {
+		// Each query gets EXACTLY the args it references. The last two use only $1 —
+		// passing $2 too made pgx/Postgres reject the bind ("2 parameters, statement
+		// requires 1"), failing the whole tx so hard delete silently 404'd. (The unit
+		// test's fake driver doesn't enforce bind-param counts, so it never caught this.)
+		ops := []struct {
+			query string
+			args  []any
+		}{
+			{`DELETE FROM rca_eval_reviews WHERE run_id IN (SELECT run_id FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2))`, []any{incidentID, alertIDs}},
+			{`DELETE FROM analysis_runs WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
+			{`DELETE FROM chat_conversations WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
+			{`DELETE FROM rca_feedback WHERE incident_id = $1 OR target_id = $1 OR alert_id = ANY($2) OR target_id = ANY($2)`, []any{incidentID, alertIDs}},
+			{`DELETE FROM incident_embeddings WHERE incident_id = $1 OR alert_id = ANY($2)`, []any{incidentID, alertIDs}},
+			{`DELETE FROM alerts WHERE incident_id = $1`, []any{incidentID}},
+			{`DELETE FROM incidents WHERE incident_id = $1`, []any{incidentID}},
+		}
+		for _, op := range ops {
+			if _, err := tx.ExecContext(ctx, op.query, op.args...); err != nil {
+				log.Printf("Failed to hard delete incident %s: %v", incidentID, err)
+				return false
+			}
+		}
+		for fingerprint, episode := range episodes {
+			if _, err := tx.ExecContext(
+				ctx,
+				`INSERT INTO deleted_alert_episodes (fingerprint, fired_at, deleted_at) VALUES ($1, $2, $3)
+				 ON CONFLICT (fingerprint) DO UPDATE SET fired_at = EXCLUDED.fired_at, deleted_at = EXCLUDED.deleted_at`,
+				fingerprint, episode.FiredAt, episode.DeletedAt,
+			); err != nil {
+				log.Printf("Failed to record deleted episode for incident %s: %v", incidentID, err)
+				return false
+			}
+		}
+		return true
+	})
 }
 
 func (s *Store) persistClearEpisodeTombstoneLocked(fingerprint string) {
@@ -1724,447 +1750,255 @@ func (s *Store) persistNewCaseSnapshotLocked(snapshot *CaseSnapshot) bool {
 // are updated only after this succeeds, so database failures never expose a
 // half-created candidate or a candidate without its immutable source.
 func (s *Store) persistCaseSnapshotAndKnowledgeCandidateLocked(snapshot *CaseSnapshot, candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
-		return true
-	}
-	if snapshot == nil || candidate == nil || event == nil {
-		return false
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start case snapshot knowledge transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.withTransaction("case snapshot knowledge", snapshot != nil && candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO rca_case_snapshots (case_id, incident_id, alert_id, run_id, analysis_hash, approval_state, root_cause_family, mechanism, mechanism_fingerprint, snapshot, approved_at, revoked_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (case_id) DO NOTHING`, snapshot.CaseID, snapshot.IncidentID, snapshot.AlertID, snapshot.RunID, snapshot.AnalysisHash, snapshot.ApprovalState, snapshot.RootCauseFamily, snapshot.Mechanism, snapshot.MechanismFingerprint, mustJSON(snapshot.Snapshot), snapshot.ApprovedAt, snapshot.RevokedAt); err != nil {
+			log.Printf("Failed to persist RCA case snapshot %s: %v", snapshot.CaseID, err)
+			return false
 		}
-	}()
-	if _, err := tx.ExecContext(ctx, `INSERT INTO rca_case_snapshots (case_id, incident_id, alert_id, run_id, analysis_hash, approval_state, root_cause_family, mechanism, mechanism_fingerprint, snapshot, approved_at, revoked_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (case_id) DO NOTHING`, snapshot.CaseID, snapshot.IncidentID, snapshot.AlertID, snapshot.RunID, snapshot.AnalysisHash, snapshot.ApprovalState, snapshot.RootCauseFamily, snapshot.Mechanism, snapshot.MechanismFingerprint, mustJSON(snapshot.Snapshot), snapshot.ApprovedAt, snapshot.RevokedAt); err != nil {
-		log.Printf("Failed to persist RCA case snapshot %s: %v", snapshot.CaseID, err)
-		return false
-	}
-	if !persistKnowledgeCandidateTx(ctx, tx, candidate) || !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit case snapshot knowledge transaction: %v", err)
-		return false
-	}
-	committed = true
-	return true
+		if !persistKnowledgeCandidateTx(ctx, tx, candidate) || !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
+		}
+		return true
+	})
 }
 
 func (s *Store) persistNewKnowledgeCandidateLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
-		return true
-	}
-	if candidate == nil || event == nil {
-		return false
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge candidate transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.withTransaction("knowledge candidate", candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
+		if !persistKnowledgeCandidateTx(ctx, tx, candidate) || !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
 		}
-	}()
-	if !persistKnowledgeCandidateTx(ctx, tx, candidate) || !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge candidate transaction: %v", err)
-		return false
-	}
-	committed = true
-	return true
+		return true
+	})
 }
 
 func (s *Store) persistKnowledgeApprovalLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, prior *KnowledgePackage, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
+	return s.withTransaction("knowledge approval", candidate != nil && pkg != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
+		// Both statuses Approve/Shadow admit in memory: ready_for_review, and the
+		// validator-retry row (validation_failed) whose rejection the operator fixed.
+		// Gating on ready_for_review alone made "Revalidate and activate" fail with
+		// "could not persist knowledge candidate approval" every single time, since
+		// the row is validation_failed by definition on that path.
+		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, package_id = $2, payload = $3, validation_error = '', decided_at = $4, decided_by = $5, decision_note = $6, updated_at = $7 WHERE candidate_id = $8 AND status IN ('ready_for_review', 'validation_failed')`, candidate.Status, candidate.PackageID, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
+		if err != nil {
+			log.Printf("Failed to approve knowledge candidate %s: %v", candidate.CandidateID, err)
+			return false
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			log.Printf("Knowledge candidate %s was not ready for approval", candidate.CandidateID)
+			return false
+		}
+		if prior != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = 'retired', retired_at = $1, retired_by = $2, retirement_note = $3 WHERE package_id = $4 AND status = 'active'`, candidate.UpdatedAt, candidate.DecidedBy, "superseded by "+candidate.CandidateID, prior.PackageID); err != nil {
+				log.Printf("Failed to retire superseded knowledge package %s: %v", prior.PackageID, err)
+				return false
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = 'superseded', updated_at = $1 WHERE candidate_id = $2 AND status = 'active'`, candidate.UpdatedAt, prior.CandidateID); err != nil {
+				log.Printf("Failed to supersede knowledge candidate %s: %v", prior.CandidateID, err)
+				return false
+			}
+		}
+		// The package id is derived from the CASE, so a re-evaluated case mints a new
+		// (content-derived) candidate that must be able to publish over its own
+		// retired predecessor. Requiring the same candidate_id there stranded the
+		// operator on "could not persist knowledge candidate approval" with no way
+		// out. A LIVE package still may not be silently replaced: only its own
+		// candidate can overwrite an active/shadow row, and a superseding candidate
+		// retires it earlier in this same transaction.
+		result, err = tx.ExecContext(ctx, `INSERT INTO knowledge_packages (package_id, candidate_id, case_id, status, payload, published_at, retired_at, retired_by, retirement_note, mirror_status, mirror_last_error, mirror_updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			ON CONFLICT (package_id) DO UPDATE SET
+				candidate_id = EXCLUDED.candidate_id,
+				case_id = EXCLUDED.case_id,
+				status = EXCLUDED.status,
+				payload = EXCLUDED.payload,
+				published_at = EXCLUDED.published_at,
+				retired_at = EXCLUDED.retired_at,
+				retired_by = EXCLUDED.retired_by,
+				retirement_note = EXCLUDED.retirement_note,
+				mirror_status = EXCLUDED.mirror_status,
+				mirror_last_error = EXCLUDED.mirror_last_error,
+				mirror_updated_at = EXCLUDED.mirror_updated_at
+			WHERE knowledge_packages.status = 'retired'
+				OR knowledge_packages.candidate_id = EXCLUDED.candidate_id`,
+			pkg.PackageID, pkg.CandidateID, pkg.CaseID, pkg.Status, mustJSON(pkg.Payload),
+			pkg.PublishedAt, pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote,
+			pkg.MirrorStatus, pkg.MirrorLastError, pkg.MirrorUpdatedAt)
+		if err != nil {
+			log.Printf("Failed to publish knowledge package %s: %v", pkg.PackageID, err)
+			return false
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			log.Printf("Knowledge package %s could not be published from its current state", pkg.PackageID)
+			return false
+		}
+		if !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
+		}
 		return true
-	}
-	if candidate == nil || pkg == nil || event == nil {
-		return false
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge approval transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	// Both statuses Approve/Shadow admit in memory: ready_for_review, and the
-	// validator-retry row (validation_failed) whose rejection the operator fixed.
-	// Gating on ready_for_review alone made "Revalidate and activate" fail with
-	// "could not persist knowledge candidate approval" every single time, since
-	// the row is validation_failed by definition on that path.
-	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, package_id = $2, payload = $3, validation_error = '', decided_at = $4, decided_by = $5, decision_note = $6, updated_at = $7 WHERE candidate_id = $8 AND status IN ('ready_for_review', 'validation_failed')`, candidate.Status, candidate.PackageID, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
-	if err != nil {
-		log.Printf("Failed to approve knowledge candidate %s: %v", candidate.CandidateID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		log.Printf("Knowledge candidate %s was not ready for approval", candidate.CandidateID)
-		return false
-	}
-	if prior != nil {
-		if _, err := tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = 'retired', retired_at = $1, retired_by = $2, retirement_note = $3 WHERE package_id = $4 AND status = 'active'`, candidate.UpdatedAt, candidate.DecidedBy, "superseded by "+candidate.CandidateID, prior.PackageID); err != nil {
-			log.Printf("Failed to retire superseded knowledge package %s: %v", prior.PackageID, err)
-			return false
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = 'superseded', updated_at = $1 WHERE candidate_id = $2 AND status = 'active'`, candidate.UpdatedAt, prior.CandidateID); err != nil {
-			log.Printf("Failed to supersede knowledge candidate %s: %v", prior.CandidateID, err)
-			return false
-		}
-	}
-	// The package id is derived from the CASE, so a re-evaluated case mints a new
-	// (content-derived) candidate that must be able to publish over its own
-	// retired predecessor. Requiring the same candidate_id there stranded the
-	// operator on "could not persist knowledge candidate approval" with no way
-	// out. A LIVE package still may not be silently replaced: only its own
-	// candidate can overwrite an active/shadow row, and a superseding candidate
-	// retires it earlier in this same transaction.
-	result, err = tx.ExecContext(ctx, `INSERT INTO knowledge_packages (package_id, candidate_id, case_id, status, payload, published_at, retired_at, retired_by, retirement_note, mirror_status, mirror_last_error, mirror_updated_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-		ON CONFLICT (package_id) DO UPDATE SET
-			candidate_id = EXCLUDED.candidate_id,
-			case_id = EXCLUDED.case_id,
-			status = EXCLUDED.status,
-			payload = EXCLUDED.payload,
-			published_at = EXCLUDED.published_at,
-			retired_at = EXCLUDED.retired_at,
-			retired_by = EXCLUDED.retired_by,
-			retirement_note = EXCLUDED.retirement_note,
-			mirror_status = EXCLUDED.mirror_status,
-			mirror_last_error = EXCLUDED.mirror_last_error,
-			mirror_updated_at = EXCLUDED.mirror_updated_at
-		WHERE knowledge_packages.status = 'retired'
-			OR knowledge_packages.candidate_id = EXCLUDED.candidate_id`,
-		pkg.PackageID, pkg.CandidateID, pkg.CaseID, pkg.Status, mustJSON(pkg.Payload),
-		pkg.PublishedAt, pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote,
-		pkg.MirrorStatus, pkg.MirrorLastError, pkg.MirrorUpdatedAt)
-	if err != nil {
-		log.Printf("Failed to publish knowledge package %s: %v", pkg.PackageID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		log.Printf("Knowledge package %s could not be published from its current state", pkg.PackageID)
-		return false
-	}
-	if !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge approval transaction: %v", err)
-		return false
-	}
-	committed = true
-	return true
+	})
 }
 
 func (s *Store) persistKnowledgeActivationLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, prior *KnowledgePackage, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
-		return true
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge shadow activation transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, payload = $2, decided_at = $3, decided_by = $4, decision_note = $5, updated_at = $6 WHERE candidate_id = $7 AND status = 'shadow'`, candidate.Status, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
-	if err != nil {
-		log.Printf("Failed to activate knowledge candidate %s: %v", candidate.CandidateID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		return false
-	}
-	result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = $1, payload = $2 WHERE package_id = $3 AND status = 'shadow'`, pkg.Status, mustJSON(pkg.Payload), pkg.PackageID)
-	if err != nil {
-		log.Printf("Failed to activate knowledge package %s: %v", pkg.PackageID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		return false
-	}
-	if prior != nil {
-		if _, err := tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = 'retired', retired_at = $1, retired_by = $2, retirement_note = $3 WHERE package_id = $4 AND status = 'active'`, candidate.UpdatedAt, candidate.DecidedBy, "superseded by "+candidate.CandidateID, prior.PackageID); err != nil {
-			log.Printf("Failed to retire superseded knowledge package %s: %v", prior.PackageID, err)
-			return false
-		}
-		if _, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = 'superseded', updated_at = $1 WHERE candidate_id = $2 AND status = 'active'`, candidate.UpdatedAt, prior.CandidateID); err != nil {
-			log.Printf("Failed to supersede knowledge candidate %s: %v", prior.CandidateID, err)
-			return false
-		}
-	}
-	if !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge shadow activation transaction: %v", err)
-		return false
-	}
-	committed = true
-	return true
-}
-
-func (s *Store) persistKnowledgeShadowRejectionLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
-		return true
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge shadow rejection transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, payload = $2, decided_at = $3, decided_by = $4, decision_note = $5, updated_at = $6 WHERE candidate_id = $7 AND status = 'shadow'`, candidate.Status, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
-	if err != nil {
-		log.Printf("Failed to reject shadow knowledge candidate %s: %v", candidate.CandidateID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		return false
-	}
-	result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = $1, payload = $2, retired_at = $3, retired_by = $4, retirement_note = $5 WHERE package_id = $6 AND status = 'shadow'`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID)
-	if err != nil {
-		log.Printf("Failed to retire shadow knowledge package %s: %v", pkg.PackageID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		return false
-	}
-	if !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge shadow rejection transaction: %v", err)
-		return false
-	}
-	committed = true
-	return true
-}
-
-func (s *Store) persistKnowledgeReviewInvalidationLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
-		return true
-	}
-	if candidate == nil || event == nil {
-		return false
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge review invalidation transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
-		SET status = $1, validation_error = $2, payload = $3, decided_at = $4,
-		    decided_by = $5, decision_note = $6, updated_at = $7
-		WHERE candidate_id = $8`, candidate.Status, candidate.ValidationError,
-		mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy,
-		candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
-	if err != nil {
-		log.Printf("Failed to invalidate knowledge candidate %s: %v", candidate.CandidateID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		return false
-	}
-	if pkg != nil {
-		result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages
-			SET status = $1, payload = $2, retired_at = $3, retired_by = $4,
-			    retirement_note = $5
-			WHERE package_id = $6`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt,
-			pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID)
+	return s.withTransaction("knowledge shadow activation", true, func(ctx context.Context, tx *sql.Tx) bool {
+		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, payload = $2, decided_at = $3, decided_by = $4, decision_note = $5, updated_at = $6 WHERE candidate_id = $7 AND status = 'shadow'`, candidate.Status, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
 		if err != nil {
-			log.Printf("Failed to retire invalidated knowledge package %s: %v", pkg.PackageID, err)
+			log.Printf("Failed to activate knowledge candidate %s: %v", candidate.CandidateID, err)
 			return false
 		}
 		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
 			return false
 		}
-	}
-	if !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge review invalidation: %v", err)
-		return false
-	}
-	committed = true
-	return true
+		result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = $1, payload = $2 WHERE package_id = $3 AND status = 'shadow'`, pkg.Status, mustJSON(pkg.Payload), pkg.PackageID)
+		if err != nil {
+			log.Printf("Failed to activate knowledge package %s: %v", pkg.PackageID, err)
+			return false
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return false
+		}
+		if prior != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = 'retired', retired_at = $1, retired_by = $2, retirement_note = $3 WHERE package_id = $4 AND status = 'active'`, candidate.UpdatedAt, candidate.DecidedBy, "superseded by "+candidate.CandidateID, prior.PackageID); err != nil {
+				log.Printf("Failed to retire superseded knowledge package %s: %v", prior.PackageID, err)
+				return false
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = 'superseded', updated_at = $1 WHERE candidate_id = $2 AND status = 'active'`, candidate.UpdatedAt, prior.CandidateID); err != nil {
+				log.Printf("Failed to supersede knowledge candidate %s: %v", prior.CandidateID, err)
+				return false
+			}
+		}
+		if !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
+		}
+		return true
+	})
+}
+
+func (s *Store) persistKnowledgeShadowRejectionLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, event *KnowledgeEvent) bool {
+	return s.withTransaction("knowledge shadow rejection", true, func(ctx context.Context, tx *sql.Tx) bool {
+		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, payload = $2, decided_at = $3, decided_by = $4, decision_note = $5, updated_at = $6 WHERE candidate_id = $7 AND status = 'shadow'`, candidate.Status, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
+		if err != nil {
+			log.Printf("Failed to reject shadow knowledge candidate %s: %v", candidate.CandidateID, err)
+			return false
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return false
+		}
+		result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = $1, payload = $2, retired_at = $3, retired_by = $4, retirement_note = $5 WHERE package_id = $6 AND status = 'shadow'`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID)
+		if err != nil {
+			log.Printf("Failed to retire shadow knowledge package %s: %v", pkg.PackageID, err)
+			return false
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return false
+		}
+		if !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
+		}
+		return true
+	})
+}
+
+func (s *Store) persistKnowledgeReviewInvalidationLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, event *KnowledgeEvent) bool {
+	return s.withTransaction("knowledge review invalidation", candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
+		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+			SET status = $1, validation_error = $2, payload = $3, decided_at = $4,
+			    decided_by = $5, decision_note = $6, updated_at = $7
+			WHERE candidate_id = $8`, candidate.Status, candidate.ValidationError,
+			mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy,
+			candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
+		if err != nil {
+			log.Printf("Failed to invalidate knowledge candidate %s: %v", candidate.CandidateID, err)
+			return false
+		}
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return false
+		}
+		if pkg != nil {
+			result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages
+				SET status = $1, payload = $2, retired_at = $3, retired_by = $4,
+				    retirement_note = $5
+				WHERE package_id = $6`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt,
+				pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID)
+			if err != nil {
+				log.Printf("Failed to retire invalidated knowledge package %s: %v", pkg.PackageID, err)
+				return false
+			}
+			if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+				return false
+			}
+		}
+		if !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
+		}
+		return true
+	})
 }
 
 func (s *Store) persistKnowledgeReviewRevalidationLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
-		return true
-	}
-	if candidate == nil || event == nil {
-		return false
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge review revalidation transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.withTransaction("knowledge review revalidation", candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
+		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+			SET status = $1, package_id = '', validation_error = '', trace = $2,
+			    payload = $3, decided_at = NULL, decided_by = '', decision_note = '',
+			    updated_at = $4
+			WHERE candidate_id = $5 AND status = 'validation_failed'`,
+			candidate.Status, mustJSON(candidate.Trace), mustJSON(candidate.Payload),
+			candidate.UpdatedAt, candidate.CandidateID)
+		if err != nil {
+			log.Printf("Failed to revalidate knowledge candidate %s: %v", candidate.CandidateID, err)
+			return false
 		}
-	}()
-	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
-		SET status = $1, package_id = '', validation_error = '', trace = $2,
-		    payload = $3, decided_at = NULL, decided_by = '', decision_note = '',
-		    updated_at = $4
-		WHERE candidate_id = $5 AND status = 'validation_failed'`,
-		candidate.Status, mustJSON(candidate.Trace), mustJSON(candidate.Payload),
-		candidate.UpdatedAt, candidate.CandidateID)
-	if err != nil {
-		log.Printf("Failed to revalidate knowledge candidate %s: %v", candidate.CandidateID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		return false
-	}
-	if !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge review revalidation transaction: %v", err)
-		return false
-	}
-	committed = true
-	return true
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return false
+		}
+		if !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
+		}
+		return true
+	})
 }
 
 func (s *Store) persistKnowledgeCandidateValidationRefreshLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
-		return true
-	}
-	if candidate == nil || event == nil {
-		return false
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge candidate validation refresh transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.withTransaction("knowledge candidate validation refresh", candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
+		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+			SET validation_error = $1, trace = $2, payload = $3, updated_at = $4
+			WHERE candidate_id = $5 AND status = 'validation_failed'`,
+			candidate.ValidationError, mustJSON(candidate.Trace), mustJSON(candidate.Payload),
+			candidate.UpdatedAt, candidate.CandidateID)
+		if err != nil {
+			log.Printf("Failed to refresh knowledge candidate validation %s: %v", candidate.CandidateID, err)
+			return false
 		}
-	}()
-	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
-		SET validation_error = $1, trace = $2, payload = $3, updated_at = $4
-		WHERE candidate_id = $5 AND status = 'validation_failed'`,
-		candidate.ValidationError, mustJSON(candidate.Trace), mustJSON(candidate.Payload),
-		candidate.UpdatedAt, candidate.CandidateID)
-	if err != nil {
-		log.Printf("Failed to refresh knowledge candidate validation %s: %v", candidate.CandidateID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		return false
-	}
-	if !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge candidate validation refresh: %v", err)
-		return false
-	}
-	committed = true
-	return true
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return false
+		}
+		if !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
+		}
+		return true
+	})
 }
 
 // persistKnowledgeCandidateActionsLocked stores a curated (LLM-refined or
 // reviewer-edited) action list. The status guard keeps the write from racing a
 // concurrent decision: once a candidate leaves review, curation is closed.
 func (s *Store) persistKnowledgeCandidateActionsLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
-		return true
-	}
-	if candidate == nil || event == nil {
-		return false
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge candidate action curation transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.withTransaction("knowledge candidate action curation", candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
+		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+			SET payload = $1, updated_at = $2
+			WHERE candidate_id = $3 AND status = $4`,
+			mustJSON(candidate.Payload), candidate.UpdatedAt, candidate.CandidateID, knowledgeCandidateReady)
+		if err != nil {
+			log.Printf("Failed to persist knowledge candidate action curation %s: %v", candidate.CandidateID, err)
+			return false
 		}
-	}()
-	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
-		SET payload = $1, updated_at = $2
-		WHERE candidate_id = $3 AND status = $4`,
-		mustJSON(candidate.Payload), candidate.UpdatedAt, candidate.CandidateID, knowledgeCandidateReady)
-	if err != nil {
-		log.Printf("Failed to persist knowledge candidate action curation %s: %v", candidate.CandidateID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		return false
-	}
-	if !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge candidate action curation: %v", err)
-		return false
-	}
-	committed = true
-	return true
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			return false
+		}
+		if !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
+		}
+		return true
+	})
 }
 
 func (s *Store) persistKnowledgeMirrorLocked(pkg *KnowledgePackage) bool {
@@ -2187,165 +2021,80 @@ func (s *Store) persistKnowledgeMirrorLocked(pkg *KnowledgePackage) bool {
 }
 
 func (s *Store) persistKnowledgeCandidateTransitionLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
-		return true
-	}
-	if candidate == nil || event == nil {
-		return false
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge rejection transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.withTransaction("knowledge rejection", candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
+		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, decided_at = $2, decided_by = $3, decision_note = $4, updated_at = $5 WHERE candidate_id = $6 AND status = 'ready_for_review'`, candidate.Status, candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
+		if err != nil {
+			log.Printf("Failed to reject knowledge candidate %s: %v", candidate.CandidateID, err)
+			return false
 		}
-	}()
-	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, decided_at = $2, decided_by = $3, decision_note = $4, updated_at = $5 WHERE candidate_id = $6 AND status = 'ready_for_review'`, candidate.Status, candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
-	if err != nil {
-		log.Printf("Failed to reject knowledge candidate %s: %v", candidate.CandidateID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		log.Printf("Knowledge candidate %s was not ready for rejection", candidate.CandidateID)
-		return false
-	}
-	if !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge rejection transaction: %v", err)
-		return false
-	}
-	committed = true
-	return true
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			log.Printf("Knowledge candidate %s was not ready for rejection", candidate.CandidateID)
+			return false
+		}
+		if !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
+		}
+		return true
+	})
 }
 
 func (s *Store) persistKnowledgeValidationFailureLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
-		return true
-	}
-	if candidate == nil || event == nil {
-		return false
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge validation failure transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.withTransaction("knowledge validation failure", candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
+		// A validation failure is a safety demotion: record it wherever the row
+		// currently is. Gating on status = 'ready_for_review' turned any memory/DB
+		// drift into "could not persist knowledge validation failure" for the
+		// operator, with the candidate stuck Ready.
+		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, validation_error = $2, updated_at = $3 WHERE candidate_id = $4`, candidate.Status, candidate.ValidationError, candidate.UpdatedAt, candidate.CandidateID)
+		if err != nil {
+			log.Printf("Failed to mark knowledge candidate validation failure %s: %v", candidate.CandidateID, err)
+			return false
 		}
-	}()
-	// A validation failure is a safety demotion: record it wherever the row
-	// currently is. Gating on status = 'ready_for_review' turned any memory/DB
-	// drift into "could not persist knowledge validation failure" for the
-	// operator, with the candidate stuck Ready.
-	result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, validation_error = $2, updated_at = $3 WHERE candidate_id = $4`, candidate.Status, candidate.ValidationError, candidate.UpdatedAt, candidate.CandidateID)
-	if err != nil {
-		log.Printf("Failed to mark knowledge candidate validation failure %s: %v", candidate.CandidateID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		log.Printf("Knowledge candidate %s row missing for validation failure", candidate.CandidateID)
-		return false
-	}
-	if !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge validation failure transaction: %v", err)
-		return false
-	}
-	committed = true
-	return true
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			log.Printf("Knowledge candidate %s row missing for validation failure", candidate.CandidateID)
+			return false
+		}
+		if !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
+		}
+		return true
+	})
 }
 
 func (s *Store) persistKnowledgePackageRetirementLocked(pkg *KnowledgePackage, event *KnowledgeEvent) bool {
-	if s.db == nil || !s.dbReady {
-		return true
-	}
-	if pkg == nil || event == nil {
-		return false
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge retirement transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
+	return s.withTransaction("knowledge retirement", pkg != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
+		result, err := tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = $1, payload = $2, retired_at = $3, retired_by = $4, retirement_note = $5 WHERE package_id = $6 AND status = 'active'`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID)
+		if err != nil {
+			log.Printf("Failed to retire knowledge package %s: %v", pkg.PackageID, err)
+			return false
 		}
-	}()
-	result, err := tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = $1, payload = $2, retired_at = $3, retired_by = $4, retirement_note = $5 WHERE package_id = $6 AND status = 'active'`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID)
-	if err != nil {
-		log.Printf("Failed to retire knowledge package %s: %v", pkg.PackageID, err)
-		return false
-	}
-	if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-		log.Printf("Knowledge package %s was not active for retirement", pkg.PackageID)
-		return false
-	}
-	if !persistKnowledgeEventTx(ctx, tx, event) {
-		return false
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge retirement transaction: %v", err)
-		return false
-	}
-	committed = true
-	return true
+		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			log.Printf("Knowledge package %s was not active for retirement", pkg.PackageID)
+			return false
+		}
+		if !persistKnowledgeEventTx(ctx, tx, event) {
+			return false
+		}
+		return true
+	})
 }
 
 // deleteKnowledgeCandidateLocked drops one dead candidate with its case links
 // and events. There are no foreign keys in this schema, so the child rows are
 // removed explicitly in the same transaction.
 func (s *Store) deleteKnowledgeCandidateLocked(id string) bool {
-	if s.db == nil || !s.dbReady {
+	return s.withTransaction(fmt.Sprintf("knowledge candidate %s delete", id), true, func(ctx context.Context, tx *sql.Tx) bool {
+		for _, statement := range []string{
+			`DELETE FROM knowledge_candidate_cases WHERE candidate_id = $1`,
+			`DELETE FROM knowledge_events WHERE candidate_id = $1`,
+			`DELETE FROM knowledge_candidates WHERE candidate_id = $1`,
+		} {
+			if _, err := tx.ExecContext(ctx, statement, id); err != nil {
+				log.Printf("Failed to delete knowledge candidate %s: %v", id, err)
+				return false
+			}
+		}
 		return true
-	}
-	ctx, cancel := postgresOperationContext()
-	defer cancel()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		log.Printf("Failed to start knowledge candidate delete transaction: %v", err)
-		return false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	for _, statement := range []string{
-		`DELETE FROM knowledge_candidate_cases WHERE candidate_id = $1`,
-		`DELETE FROM knowledge_events WHERE candidate_id = $1`,
-		`DELETE FROM knowledge_candidates WHERE candidate_id = $1`,
-	} {
-		if _, err := tx.ExecContext(ctx, statement, id); err != nil {
-			log.Printf("Failed to delete knowledge candidate %s: %v", id, err)
-			return false
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit knowledge candidate deletion %s: %v", id, err)
-		return false
-	}
-	committed = true
-	return true
+	})
 }
 
 func persistKnowledgeCandidateTx(ctx context.Context, tx *sql.Tx, candidate *KnowledgeCandidate) bool {
