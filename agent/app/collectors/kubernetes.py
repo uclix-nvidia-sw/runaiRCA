@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import shlex
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import quote
@@ -1591,13 +1591,63 @@ def _exec_probe_artifacts(
     ]
 
 
+@dataclass
+class _K8sReads:
+    """Everything one Kubernetes pass fetched, before any interpretation.
+
+    The collector reads through MCP or the direct API, resolves a live Pod for a
+    stale alert, and describes it; every later phase reads only this.
+    """
+
+    target: AnalysisTarget
+    time_range: dict[str, str] | None
+    causal_time_range: dict[str, str] | None
+    event_time_range: dict[str, str] | None
+    since_time: str
+    control_plane_in_scope: bool
+    used_mcp: bool
+    responses: list[dict[str, object]]
+    logs: list[dict[str, object]]
+    exec_probes: list[dict[str, object]]
+    pod_summary_data: dict[str, object] | None
+    workload_resolution: dict[str, object]
+    resolved_pod_anchor: AnalysisTarget | None
+    target_pod_describe: dict[str, object]
+    resolved_pod_describe: dict[str, object]
+    missing: list[str]
+    warnings: list[str]
+
+
+@dataclass
+class _K8sSignals:
+    """What those reads mean: the typed observations the report is built from."""
+
+    successful: object
+    required_failures: object
+    required_completed: object
+    pod_statuses: object
+    warning_events: object
+    causal_warning_events: object
+    causal_target_warning_events: object
+    node_conditions: object
+    runai_control_plane_pods: object
+    runai_control_plane_events: object
+    runai_crds: object
+    crd_findings: object
+    container_diagnostics: object
+    scheduling_artifact: object
+    gpu_node_resource_observations: object
+
+
 class KubernetesCollector:
     name = "kubernetes"
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:  # noqa: ANN001
+    async def _read_cluster(self, target: AnalysisTarget, plan=None) -> _K8sReads | CollectorResult:
+        """Fetch through MCP or the direct API. Returns a finished result only
+        when the cluster cannot be read at all (no service account token)."""
         target = _scope_target(target, plan)
         time_range = incident_time_range(target)
         causal_time_range = causal_evidence_time_range(target)
@@ -1796,6 +1846,40 @@ class KubernetesCollector:
                     previous_containers=_restarted_container_names(pod_summary_data),
                     since_time=since_time,
                 )
+        return _K8sReads(
+            target=target,
+            time_range=time_range,
+            causal_time_range=causal_time_range,
+            event_time_range=event_time_range,
+            since_time=since_time,
+            control_plane_in_scope=control_plane_in_scope,
+            used_mcp=used_mcp,
+            responses=responses,
+            logs=logs,
+            exec_probes=exec_probes,
+            pod_summary_data=pod_summary_data,
+            workload_resolution=workload_resolution,
+            resolved_pod_anchor=resolved_pod_anchor,
+            target_pod_describe=target_pod_describe,
+            resolved_pod_describe=resolved_pod_describe,
+            missing=missing,
+            warnings=warnings,
+        )
+
+    async def _interpret_reads(self, reads: _K8sReads, plan=None) -> _K8sSignals:
+        """Derive the typed signals: pod states, causal warning events, node
+        conditions, Run:ai CRD health."""
+        target = reads.target
+        responses = reads.responses
+        missing = reads.missing
+        warnings = reads.warnings
+        causal_time_range = reads.causal_time_range
+        pod_summary_data = reads.pod_summary_data
+        workload_resolution = reads.workload_resolution
+        resolved_pod_anchor = reads.resolved_pod_anchor
+        target_pod_describe = reads.target_pod_describe
+        resolved_pod_describe = reads.resolved_pod_describe
+        control_plane_in_scope = reads.control_plane_in_scope
         container_diagnostics = _container_diagnostics(pod_summary_data)
         scheduling_describe = (
             target_pod_describe if target.pod else resolved_pod_describe
@@ -1903,7 +1987,33 @@ class KubernetesCollector:
                 + ", ".join(map(str, runai_crds["truncated"]))
                 + "."
             )
+        return _K8sSignals(
+            successful=successful,
+            required_failures=required_failures,
+            required_completed=required_completed,
+            pod_statuses=pod_statuses,
+            warning_events=warning_events,
+            causal_warning_events=causal_warning_events,
+            causal_target_warning_events=causal_target_warning_events,
+            node_conditions=node_conditions,
+            runai_control_plane_pods=runai_control_plane_pods,
+            runai_control_plane_events=runai_control_plane_events,
+            runai_crds=runai_crds,
+            crd_findings=crd_findings,
+            container_diagnostics=container_diagnostics,
+            scheduling_artifact=scheduling_artifact,
+            gpu_node_resource_observations=gpu_node_resource_observations,
+        )
 
+    def _verdict(self, reads: _K8sReads, signals: _K8sSignals) -> tuple[str, str, str, bool]:
+        """Collector status/summary/confidence, plus the notes that outrank it."""
+        target = reads.target
+        responses = reads.responses
+        missing = reads.missing
+        successful = signals.successful
+        required_completed = signals.required_completed
+        required_failures = signals.required_failures
+        crd_findings = signals.crd_findings
         status, summary, confidence = _collection_status(
             self._settings,
             target,
@@ -1950,18 +2060,30 @@ class KubernetesCollector:
                 "No pods or events were observed for the queried scope.",
             )
             confidence = "low"
+        return status, summary, confidence, target_pod_missing
 
-        insight = await _senior_insight(
-            self._settings,
-            summary=summary,
-            container_diagnostics=container_diagnostics,
-            warning_events=causal_target_warning_events,
-            logs=_verified_logs_in_time_range(logs, causal_time_range),
-            # A denied/unavailable exec capability is collection metadata, not
-            # a workload observation for the insight model to explain.
-            exec_probes=[probe for probe in exec_probes if not probe.get("error")],
-        )
-
+    def _collection_details(
+        self, reads: _K8sReads, signals: _K8sSignals, *, target_pod_missing: bool, insight: str
+    ) -> dict[str, object]:
+        target = reads.target
+        responses = reads.responses
+        logs = reads.logs
+        exec_probes = reads.exec_probes
+        time_range = reads.time_range
+        causal_time_range = reads.causal_time_range
+        used_mcp = reads.used_mcp
+        workload_resolution = reads.workload_resolution
+        target_pod_describe = reads.target_pod_describe
+        resolved_pod_describe = reads.resolved_pod_describe
+        pod_statuses = signals.pod_statuses
+        warning_events = signals.warning_events
+        node_conditions = signals.node_conditions
+        container_diagnostics = signals.container_diagnostics
+        gpu_node_resource_observations = signals.gpu_node_resource_observations
+        runai_control_plane_pods = signals.runai_control_plane_pods
+        runai_control_plane_events = signals.runai_control_plane_events
+        runai_crds = signals.runai_crds
+        crd_findings = signals.crd_findings
         details = {
             "kubernetes_api_url": self._settings.kubernetes_api_url,
             "kubernetes_mcp_url": self._settings.kubernetes_mcp_url,
@@ -1997,9 +2119,34 @@ class KubernetesCollector:
             "insight": insight,
             "queries": responses,
         }
-        if insight:
-            summary = f"{summary} {insight}"
+        return details
 
+    async def _collection_artifacts(
+        self,
+        reads: _K8sReads,
+        signals: _K8sSignals,
+        *,
+        details: dict[str, object],
+        status: str,
+        summary: str,
+        confidence: str,
+    ) -> list:
+        target = reads.target
+        responses = reads.responses
+        logs = reads.logs
+        exec_probes = reads.exec_probes
+        time_range = reads.time_range
+        causal_time_range = reads.causal_time_range
+        event_time_range = reads.event_time_range
+        used_mcp = reads.used_mcp
+        pod_summary_data = reads.pod_summary_data
+        resolved_pod_anchor = reads.resolved_pod_anchor
+        target_pod_describe = reads.target_pod_describe
+        causal_target_warning_events = signals.causal_target_warning_events
+        container_diagnostics = signals.container_diagnostics
+        crd_findings = signals.crd_findings
+        gpu_node_resource_observations = signals.gpu_node_resource_observations
+        scheduling_artifact = signals.scheduling_artifact
         artifacts = [
             artifact(
                 agent=self.name,
@@ -2154,18 +2301,42 @@ class KubernetesCollector:
             for item in artifacts:
                 if item.query and item.query.startswith("kubectl"):
                     item.query = f"MCP · {item.query}"
+        return artifacts
 
+    async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
+        reads = await self._read_cluster(target, plan)
+        if isinstance(reads, CollectorResult):
+            return reads
+        signals = await self._interpret_reads(reads, plan)
+        status, summary, confidence, target_pod_missing = self._verdict(reads, signals)
+        insight = await _senior_insight(
+            self._settings,
+            summary=summary,
+            container_diagnostics=signals.container_diagnostics,
+            warning_events=signals.causal_target_warning_events,
+            logs=_verified_logs_in_time_range(reads.logs, reads.causal_time_range),
+            # A denied/unavailable exec capability is collection metadata, not
+            # a workload observation for the insight model to explain.
+            exec_probes=[probe for probe in reads.exec_probes if not probe.get("error")],
+        )
+        details = self._collection_details(
+            reads, signals, target_pod_missing=target_pod_missing, insight=insight
+        )
+        if insight:
+            summary = f"{summary} {insight}"
+        artifacts = await self._collection_artifacts(
+            reads, signals, details=details, status=status, summary=summary, confidence=confidence
+        )
         return CollectorResult(
             agent=self.name,
             status=status,
             summary=summary,
             confidence=confidence,
             details=details,
-            missing_data=missing,
-            warnings=warnings,
+            missing_data=reads.missing,
+            warnings=reads.warnings,
             artifacts=artifacts,
         )
-
 
 def _warning_event_observation(
     warning_events: list[dict[str, object]],
