@@ -123,19 +123,16 @@ def test_check_lines_render_path_and_commands() -> None:
 
 
 def test_playbook_appends_component_check_path() -> None:
-    from app.services.pipeline import _playbook_lines
+    from app.services.pipeline import ReportKnowledge, _playbook_lines
 
     components = load_architecture(ARCHITECTURE)
     failure_modes = load_failure_modes(FAILURE_MODES)
     lines = _playbook_lines(
-        None,
-        "workload status out of sync with the ui",
-        failure_modes,
-        "",
-        [],
-        "",
-        components,
-    )
+                None,
+                "workload status out of sync with the ui",
+                "",
+                knowledge=ReportKnowledge(failure_modes=failure_modes, cases="", known_issues=[], components=components),
+            )
     joined = "\n".join(lines)
     assert "Cluster-Sync Out Of Sync" in joined
     assert "Check order:" in joined

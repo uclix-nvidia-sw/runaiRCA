@@ -22,6 +22,7 @@ from app.plan import InvestigationPlan
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
 from app.services.general_guidance import general_guidance_lines
+from app.services.pipeline import ReportKnowledge
 from app.services.root_cause_ranking import RankedCause
 
 SCHEDULING_MODES = {
@@ -187,12 +188,11 @@ def _evidence_free_detail(**kwargs) -> str:
         ),
         [],
         [],
-        failure_modes=SCHEDULING_MODES,
         root_cause_candidates=[
             RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
         ],
         eligible_support_ids=set(),
-        **kwargs,
+        **{"knowledge": ReportKnowledge(failure_modes=SCHEDULING_MODES), **kwargs},
     )
 
 
@@ -262,17 +262,16 @@ def test_korean_question_reaches_scheduling_ontology_through_the_planner(monkeyp
     assert plan.hypotheses[0]["family"] == "runai_scheduling_quota"
 
     detail = pipeline._detail_from(
-        AlertAnalysisRequest(alert=alert),
-        [],
-        [],
-        failure_modes=load_failure_modes("knowledge/failure_modes.yaml"),
-        root_cause_candidates=[
+                 AlertAnalysisRequest(alert=alert),
+                 [],
+                 [],
+                 root_cause_candidates=[
             RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
         ],
-        eligible_support_ids=set(),
-        language="ko",
-        plan=plan,
-    )
+                 eligible_support_ids=set(),
+                 plan=plan,
+                 knowledge=ReportKnowledge(failure_modes=load_failure_modes("knowledge/failure_modes.yaml"), language="ko"),
+             )
     guide = detail.split("일반 점검 가이드", 1)[1]
     # language="ko" and the shipped catalog entry has a name_ko
     # ("상위 우선순위 워크로드에 의한 선점") -- the guide must show that, not the
@@ -314,7 +313,7 @@ def test_component_and_catalog_reach_the_rendered_report() -> None:
         plan=InvestigationPlan(
             component="runai-scheduler-default", matched_alert=CATALOG_ALERT
         ),
-        components=COMPONENTS,
+        knowledge=ReportKnowledge(failure_modes=SCHEDULING_MODES, components=COMPONENTS),
     )
     assert "COMPONENT-CHECK" in detail
     assert "CATALOG-ACTION" in detail
@@ -324,18 +323,18 @@ def test_component_and_catalog_reach_the_rendered_report() -> None:
 
 def test_supported_run_gets_no_general_guidance() -> None:
     detail = pipeline._detail_from(
-        AlertAnalysisRequest(
+                 AlertAnalysisRequest(
             alert=Alert(status="firing", labels={"alertname": "GenericAlert"}),
         ),
-        [],
-        [],
-        failure_modes=SCHEDULING_MODES,
-        root_cause_candidates=[
+                 [],
+                 [],
+                 root_cause_candidates=[
             RankedCause(family="runai_scheduling_quota", confidence="high", score=9.0)
         ],
-        eligible_support_ids={"kubernetes:1"},
-        plan=InvestigationPlan(hypotheses=[{"family": "runai_scheduling_quota"}]),
-    )
+                 eligible_support_ids={"kubernetes:1"},
+                 plan=InvestigationPlan(hypotheses=[{"family": "runai_scheduling_quota"}]),
+                 knowledge=ReportKnowledge(failure_modes=SCHEDULING_MODES),
+             )
     assert "General Troubleshooting Guidance" not in detail
     assert "일반 점검 가이드" not in detail
 

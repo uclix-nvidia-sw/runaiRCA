@@ -26,6 +26,7 @@ from app.schemas import Alert, AlertAnalysisRequest
 from app.services.kg_enrichment import GraphRemediation, graph_remediation
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import (
+    ReportKnowledge,
     _apply_line_translations,
     _detail_from,
     _gpu_model_from,
@@ -487,13 +488,12 @@ def test_jwks_discovery_failure_overrides_generic_crashloop_playbook_in_korean()
         request, results, candidates, failure_modes, language="ko"
     )
     detail = _detail_from(
-        request,
-        results,
-        [],
-        failure_modes=failure_modes,
-        root_cause_candidates=candidates,
-        language="ko",
-    )
+                 request,
+                 results,
+                 [],
+                 root_cause_candidates=candidates,
+                 knowledge=ReportKnowledge(failure_modes=failure_modes, language="ko"),
+             )
 
     assert "OIDC JSON 문서 대신 HTML" in summary
     assert "runaiMcp.oidcIssuerUrl" in detail
@@ -533,13 +533,12 @@ def test_oomkilled_overrides_generic_crashloop_actions_in_korean_fallback() -> N
         request, results, candidates, failure_modes, language="ko"
     )
     detail = _detail_from(
-        request,
-        results,
-        [],
-        failure_modes=failure_modes,
-        root_cause_candidates=candidates,
-        language="ko",
-    )
+                 request,
+                 results,
+                 [],
+                 root_cause_candidates=candidates,
+                 knowledge=ReportKnowledge(failure_modes=failure_modes, language="ko"),
+             )
 
     assert "메모리 제한을 초과해 OOMKilled" in summary
     assert "resources.limits.memory" in detail
@@ -579,13 +578,12 @@ def test_image_pull_deterministic_fallback_keeps_core_report_korean() -> None:
 
     summary = _summary_from(request, results, candidates, failure_modes, language="ko")
     detail = _detail_from(
-        request,
-        results,
-        [],
-        failure_modes=failure_modes,
-        root_cause_candidates=candidates,
-        language="ko",
-    )
+                 request,
+                 results,
+                 [],
+                 root_cause_candidates=candidates,
+                 knowledge=ReportKnowledge(failure_modes=failure_modes, language="ko"),
+             )
     core = detail.split("## 부록", 1)[0]
 
     assert "구분할 수 없습니다" in summary
@@ -626,18 +624,15 @@ def test_image_pull_actions_ignore_family_wide_graph_siblings() -> None:
     )
 
     detail = _detail_from(
-        request,
-        results,
-        [],
-        failure_modes=failure_modes,
-        root_cause_candidates=[RankedCause("image_pull_error", "high", 8.0)],
-        graph_fixes=graph,
-        language="ko",
-        self_check_next=(
-            "해당 이미지가 레지스트리에 존재하고 현재 ServiceAccount에 pull 권한이 있는지 "
-            "영향받은 노드에서 `crictl pull`로 확인하세요."
-        ),
-    )
+                 request,
+                 results,
+                 [],
+                 root_cause_candidates=[RankedCause("image_pull_error", "high", 8.0)],
+                 graph_fixes=graph,
+                 self_check_next="해당 이미지가 레지스트리에 존재하고 현재 ServiceAccount에 pull 권한이 있는지 "
+            "영향받은 노드에서 `crictl pull`로 확인하세요.",
+                 knowledge=ReportKnowledge(failure_modes=failure_modes, language="ko"),
+             )
     actions = detail.split("## 3. 권장 조치", 1)[1].split("## 부록", 1)[0]
     appendix = detail.split("### Troubleshooting Playbook", 1)[1]
 
@@ -895,8 +890,8 @@ async def test_translation_runs_after_every_section_is_appended(monkeypatch) -> 
     from app.masking import build_masker
     from app.plan import InvestigationPlan
     from app.progress import ProgressReporter
-    from app.services.kg_enrichment import KGContext
     from app.services import pipeline
+    from app.services.kg_enrichment import KGContext
     from app.services.pipeline import PipelineState, synthesize_stage
     from tests.test_orchestrator import make_target
 

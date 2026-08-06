@@ -11,7 +11,12 @@ from app.knowledge import (
     match_runai_known_issues,
 )
 from app.schemas import Alert, AlertAnalysisRequest
-from app.services.pipeline import _known_issue_cause_lines, _numbered_actions, _observed_text
+from app.services.pipeline import (
+    ReportKnowledge,
+    _known_issue_cause_lines,
+    _numbered_actions,
+    _observed_text,
+)
 from app.services.root_cause_ranking import RankedCause
 
 CATALOG = "knowledge/runai_known_issues.yaml"
@@ -220,15 +225,14 @@ def test_numbered_actions_surfaces_known_issue_regardless_of_ranked_family() -> 
         alert=Alert(status="firing", labels={"alertname": "X"}, annotations={}, fingerprint="fp")
     )
     actions = _numbered_actions(
-        None,
-        None,
-        [RankedCause(family="node_kubelet_pressure", confidence="low", score=1.0)],
-        "runai-scheduler reclaim/reclaim.go:91 attempting to reclaim ... runtime/panic.go:785",
-        {},
-        [],
-        request,
-        catalog,
-    )
+                  None,
+                  None,
+                  [RankedCause(family="node_kubelet_pressure", confidence="low", score=1.0)],
+                  "runai-scheduler reclaim/reclaim.go:91 attempting to reclaim ... runtime/panic.go:785",
+                  [],
+                  request,
+                  knowledge=ReportKnowledge(failure_modes={}, known_issues=catalog),
+              )
     joined = " ".join(actions)
     assert "2.23" in joined and "upgrade" in joined.lower()
 
@@ -242,12 +246,10 @@ def test_playbook_leads_with_known_issue_not_full_dump() -> None:
 
     catalog = load_runai_known_issues(CATALOG)
     lines = _playbook_lines(
-        [RankedCause(family="expected_known_behavior", confidence="medium", score=8.0)],
-        "pod runai-backend-workloads-manager-xyz memory usage 91%",
-        {},  # no failure-mode symptoms match
-        "FULL CASE LIBRARY DUMP",
-        catalog,
-    )
+                [RankedCause(family="expected_known_behavior", confidence="medium", score=8.0)],
+                "pod runai-backend-workloads-manager-xyz memory usage 91%",
+                knowledge=ReportKnowledge(failure_modes={}, cases="FULL CASE LIBRARY DUMP", known_issues=catalog),
+            )
     joined = "\n".join(lines)
     assert "Workloads Manager Memory Grows To Cache Cap" in joined
     assert "known issue" in joined

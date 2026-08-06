@@ -2634,17 +2634,19 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         request,
         state.results,
         state.missing,
-        state.failure_modes,
-        playbook_fallback,
         state.agent_souls,
         state.root_cause_candidates,
         state.kg_context.as_dict(),
         plan,
         state.graph_fixes,
-        language=getattr(settings, "language", "en"),
-        known_issues=state.known_issues,
-        components=load_architecture(settings.architecture_file),
-        masker=state.masker,
+        knowledge=ReportKnowledge(
+            failure_modes=state.failure_modes,
+            known_issues=state.known_issues,
+            components=load_architecture(settings.architecture_file),
+            cases=playbook_fallback,
+            language=getattr(settings, "language", "en"),
+            masker=state.masker,
+        ),
         eligible_support_ids=eligible_support_ids,
         self_check_next=state.self_check_next,
         runtime_knowledge_hints=state.runtime_knowledge_hints,
@@ -4223,30 +4225,45 @@ _HEADINGS = {
 }
 
 
+@dataclass(frozen=True)
+class ReportKnowledge:
+    """The curated catalogs a deterministic report is rendered against.
+
+    These six travelled together as separate parameters through every rendering
+    layer — the report body, the numbered actions, the playbook — so adding one
+    more knowledge source meant widening four signatures. They travel as one
+    value instead, and every field defaults: most callers care about one catalog
+    at a time.
+    """
+
+    failure_modes: dict[str, list[dict]] = field(default_factory=dict)
+    known_issues: list[dict] = field(default_factory=list)
+    components: dict[str, dict] = field(default_factory=dict)
+    cases: str = ""
+    language: str = "en"
+    masker: Masker | None = None
+
+
 def _detail_from(
     request: AlertAnalysisRequest,
     results: list[CollectorResult],
     missing: list[str],
-    failure_modes: dict[str, list[dict]] | None = None,
-    troubleshooting_cases: str = "",
     agent_souls: str = "",
     root_cause_candidates: list[RankedCause] | None = None,
     kg_context: dict | None = None,
     plan: InvestigationPlan | None = None,
     graph_fixes: GraphRemediation | None = None,
-    language: str = "en",
-    known_issues: list[dict] | None = None,
-    components: dict[str, dict] | None = None,
-    masker: Masker | None = None,
     eligible_support_ids: set[str] | None = None,
     self_check_next: str = "",
     runtime_knowledge_hints: list[tuple[str, dict[str, Any]]] | None = None,
     xid_codes: list[int] | None = None,
+    *,
+    knowledge: ReportKnowledge = ReportKnowledge(),
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
     appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
     actually reads; the harness-owned Evidence Trace carries citable evidence."""
-    h = _HEADINGS.get(language, _HEADINGS["en"])
+    h = _HEADINGS.get(knowledge.language, _HEADINGS["en"])
     labels = request.alert.labels
     annotations = request.alert.annotations
     alert_name = labels.get("alertname") or request.alert.labels.get("alert_name") or "alert"
@@ -4265,13 +4282,13 @@ def _detail_from(
 
     # --- 1. Problem -----------------------------------------------------------
     lines.extend([h["problem"], ""])
-    lines.append(f"- {h['what']}: {_root_cause_statement(request, language=language)}")
+    lines.append(f"- {h['what']}: {_root_cause_statement(request, language=knowledge.language)}")
     if where:
         lines.append(f"- {h['where']}: {where}")
     if request.occurrence_count > 1:
         impact = (
             f"같은 워크로드에서 {request.occurrence_count}회 반복 발생"
-            if language == "ko"
+            if knowledge.language == "ko"
             else f"recurred {request.occurrence_count} times on the same workload"
         )
         lines.append(f"- {h['impact']}: {impact}")
@@ -4286,8 +4303,8 @@ def _detail_from(
             root_cause_candidates or [],
             request,
             observed_text,
-            failure_modes or {},
-            language,
+            knowledge.failure_modes or {},
+            knowledge.language,
             results=results,
             eligible_evidence_ids=eligible_support_ids,
         )
@@ -4295,12 +4312,12 @@ def _detail_from(
     # Multi-axis facets (Locus / Nature / Trigger) for the top cause — names the
     # subsystem, the KIND of cause, and (when known) what set it off.
     if root_cause_candidates:
-        facets = _facets_line(root_cause_candidates[0], language)
+        facets = _facets_line(root_cause_candidates[0], knowledge.language)
         if facets:
             lines.append(facets)
     # What the failing entity was configured with — the limit that was exceeded,
     # the request no node could satisfy, the capacity a node ran out of.
-    lines.extend(_observed_configuration_lines(results, eligible_support_ids, language))
+    lines.extend(_observed_configuration_lines(results, eligible_support_ids, knowledge.language))
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
     lines.extend(
@@ -4309,7 +4326,7 @@ def _detail_from(
         # match_runai_known_issues ignores fuzzy_query today, but this call site
         # should not depend on that staying true to remain safe.
         _known_issue_cause_lines(
-            known_issues, observed_text, language, _alert_signature_text(request)
+            knowledge.known_issues, observed_text, knowledge.language, _alert_signature_text(request)
         )
     )
     supporting = _supporting_evidence(results, eligible_support_ids=eligible_support_ids)
@@ -4334,14 +4351,14 @@ def _detail_from(
     # tell a confirmed upstream cause from a catalog-only candidate.
     observed_xid_codes = set(xid_codes) if xid_codes is not None else None
     causal = (
-        _causal_chain_line(graph_fixes, language, observed_xid_codes)
+        _causal_chain_line(graph_fixes, knowledge.language, observed_xid_codes)
         if allow_cause_specific_actions
         else ""
     )
     if causal:
         lines.extend(["", causal])
     if allow_cause_specific_actions:
-        lines.extend(_xid_diagnostic_guidance_lines(graph_fixes, language))
+        lines.extend(_xid_diagnostic_guidance_lines(graph_fixes, knowledge.language))
 
     # --- 3. Recommended Actions ------------------------------------------------
     lines.extend(["", h["actions"], ""])
@@ -4350,13 +4367,10 @@ def _detail_from(
         graph_fixes,
         root_cause_candidates,
         observed_text,
-        failure_modes or {},
         missing,
         request,
-        known_issues or [],
-        components=components,
+        knowledge=knowledge,
         allow_cause_specific_actions=allow_cause_specific_actions,
-        language=language,
         self_check_next=self_check_next,
         facts=_remediation_facts(results, eligible_support_ids, target),
         observed_codes=observed_xid_codes,
@@ -4368,7 +4382,7 @@ def _detail_from(
         lines.append(
             "증거가 부족하여 구체적인 조치를 제시하기 어렵습니다. "
             "아래 확인 요청을 먼저 진행해 주세요."
-            if language == "ko"
+            if knowledge.language == "ko"
             else "Not enough evidence for concrete actions yet — please address the "
             "questions below first."
         )
@@ -4385,18 +4399,18 @@ def _detail_from(
             root_cause_candidates,
             observed_text,
             _alert_signature_text(request),
-            masker,
+            knowledge.masker,
             allow_remediation=allow_cause_specific_actions,
         )
     )
-    lines.extend(_runtime_knowledge_hint_lines(runtime_knowledge_hints or [], masker))
+    lines.extend(_runtime_knowledge_hint_lines(runtime_knowledge_hints or [], knowledge.masker))
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
-        active_masker = masker or build_masker(())
+        active_masker = knowledge.masker or build_masker(())
         lines.extend(
             [
                 "",
-                "### Operator Guidance" if language != "ko" else "### 운영자 요청",
+                "### Operator Guidance" if knowledge.language != "ko" else "### 운영자 요청",
                 "",
                 _short_sentence(active_masker.mask_text(str(operator_prompt)), limit=500),
             ]
@@ -4409,7 +4423,7 @@ def _detail_from(
             lines.extend(
                 [
                     "",
-                    "이미 시도한 조치 (효과 없음)" if language == "ko" else "Already attempted (did not resolve it)",
+                    "이미 시도한 조치 (효과 없음)" if knowledge.language == "ko" else "Already attempted (did not resolve it)",
                     "",
                 ]
             )
@@ -4421,7 +4435,7 @@ def _detail_from(
     # THIS incident. (Kept in prompts.py for the NAT workflow's system prompt.)
     if not agent_souls:
         lines.append("- Agent role contract file was not loaded; fallback guidance was used.")
-    lines.extend(_affected_pods_lines(request, language))
+    lines.extend(_affected_pods_lines(request, knowledge.language))
     lines.extend(["", "### Troubleshooting Playbook", ""])
     lines.extend(
         # Same reasoning as _knowledge_base_lines above: a fuzzy hit here can
@@ -4430,15 +4444,10 @@ def _detail_from(
         _playbook_lines(
             root_cause_candidates,
             observed_text,
-            failure_modes or {},
-            troubleshooting_cases,
-            known_issues or [],
             _alert_signature_text(request),
-            components,
-            masker,
+            knowledge=knowledge,
             component=getattr(plan, "component", "") if plan is not None else "",
             allow_remediation=allow_cause_specific_actions,
-            language=language,
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -4457,17 +4466,17 @@ def _detail_from(
         lines.extend(
             [
                 "",
-                _general_guidance_heading(language),
+                _general_guidance_heading(knowledge.language),
                 "",
                 *general_guidance_lines(
                     _alert_text(request),
-                    failure_modes or {},
-                    known_issues or [],
-                    language=language,
-                    masker=masker,
+                    knowledge.failure_modes or {},
+                    knowledge.known_issues or [],
+                    language=knowledge.language,
+                    masker=knowledge.masker,
                     component=getattr(plan, "component", "") if plan else "",
                     component_source=getattr(plan, "component_source", "") if plan else "",
-                    components=components,
+                    components=knowledge.components,
                     matched_alert=getattr(plan, "matched_alert", None) if plan else None,
                     families=_plan_families(plan),
                     case_cards=list((kg_context or {}).get("case_cards") or []),
@@ -5695,15 +5704,12 @@ def _numbered_actions(
     graph_fixes: GraphRemediation | None,
     candidates: list[RankedCause] | None,
     observed_text: str,
-    failure_modes: dict[str, list[dict]],
     missing: list[str],
     request: AlertAnalysisRequest,
-    known_issues: list[dict] | None = None,
-    components: dict[str, dict] | None = None,
     *,
+    knowledge: ReportKnowledge = ReportKnowledge(),
     allow_graph_remediation: bool = True,
     allow_cause_specific_actions: bool | None = None,
-    language: str = "en",
     self_check_next: str = "",
     facts: dict[str, str] | None = None,
     observed_codes: set[int] | None = None,
@@ -5726,7 +5732,7 @@ def _numbered_actions(
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
     symptom_matches = _actionable_failure_mode_matches(
-        failure_modes, observed_text, candidates, fuzzy_query=fuzzy
+        knowledge.failure_modes, observed_text, candidates, fuzzy_query=fuzzy
     )
     # Self-check is the final evidence-aware critic. Its concrete next probe is
     # more incident-specific than catalog/component/graph guidance and must not
@@ -5742,8 +5748,8 @@ def _numbered_actions(
         ordered.extend(
             line
             for line in (
-                memory_sizing_action(observed, language),
-                image_typo_hint(observed, language),
+                memory_sizing_action(observed, knowledge.language),
+                image_typo_hint(observed, knowledge.language),
             )
             if line
         )
@@ -5754,7 +5760,7 @@ def _numbered_actions(
     ):
         actions = [
             *ordered,
-            *_localized_failure_mode_actions(symptom_matches[0][1], language),
+            *_localized_failure_mode_actions(symptom_matches[0][1], knowledge.language),
         ]
         masker = build_masker(())
         rendered = list(
@@ -5774,7 +5780,7 @@ def _numbered_actions(
     # they must not crowd the observed mechanism out of the report cap.
     if allow_cause_specific_actions and top_family != "insufficient_evidence":
         for _family, symptom in symptom_matches[:1]:
-            actions = _localized_failure_mode_actions(symptom, language)
+            actions = _localized_failure_mode_actions(symptom, knowledge.language)
             specific_actions += len(actions)
             ordered.extend(actions)
     if allow_cause_specific_actions and plan is not None and plan.matched_alert:
@@ -5785,14 +5791,14 @@ def _numbered_actions(
     # own checks + dependency chain (e.g. runai-container-toolkit → the NVIDIA
     # GPU Operator stack) come before any keyword-matched guidance.
     if allow_cause_specific_actions and plan is not None and getattr(plan, "component", ""):
-        component_actions = component_action_lines(components or {}, plan.component)
+        component_actions = component_action_lines(knowledge.components or {}, plan.component)
         specific_actions += len(component_actions)
         ordered.extend(component_actions)
     # Known operator cases recognised by their signature keywords in the evidence
     # (ranking-independent): version-regression / observability / expected-behavior
     # fixes surface even when the coarse family ranking points elsewhere.
     if allow_cause_specific_actions and top_family != "insufficient_evidence":
-        for issue in match_runai_known_issues(known_issues or [], observed_text, fuzzy_query=fuzzy):
+        for issue in match_runai_known_issues(knowledge.known_issues or [], observed_text, fuzzy_query=fuzzy):
             if filter_to_top and str(issue.get("family") or "") != top_family:
                 continue
             actions = [str(a) for a in issue.get("actions", [])]
@@ -5868,7 +5874,7 @@ def _numbered_actions(
         # labelling it stops the report from reading as "do the thing you said
         # you already did".
         if _matches_attempted_action(action, attempted):
-            action = f"{action} {_already_attempted_note(language)}"
+            action = f"{action} {_already_attempted_note(knowledge.language)}"
         numbered.append(f"{len(numbered) + 1}. {action}")
         if len(numbered) >= 8:
             break
@@ -7787,16 +7793,11 @@ def _kb_remediation_lines(
 def _playbook_lines(
     candidates: list[RankedCause] | None,
     observed_text: str,
-    failure_modes: dict[str, list[dict]],
-    fallback_cases: str,
-    known_issues: list[dict] | None = None,
     fuzzy_query: str = "",
-    components: dict[str, dict] | None = None,
-    masker: Masker | None = None,
     component: str = "",
     *,
+    knowledge: ReportKnowledge = ReportKnowledge(),
     allow_remediation: bool = True,
-    language: str = "en",
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
@@ -7812,16 +7813,16 @@ def _playbook_lines(
             "target/window-scoped observation is available."
         ]
     lines: list[str] = []
-    active_masker = masker or build_masker(())
+    active_masker = knowledge.masker or build_masker(())
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
     if component:
-        comp_lines = component_check_lines(components or {}, component)
+        comp_lines = component_check_lines(knowledge.components or {}, component)
         if comp_lines:
             lines.append(f"- **{component}** (the alert target itself)")
             lines.extend(comp_lines)
     for issue in match_runai_known_issues(
-        known_issues or [], observed_text, fuzzy_query=fuzzy_query
+        knowledge.known_issues or [], observed_text, fuzzy_query=fuzzy_query
     )[:2]:
         if filter_to_top and str(issue.get("family") or "") != top_family:
             continue
@@ -7835,36 +7836,34 @@ def _playbook_lines(
             for action in issue.get("actions", [])[:4]
         )
     symptom_matches = _actionable_failure_mode_matches(
-        failure_modes, observed_text, candidates, fuzzy_query=fuzzy_query
+        knowledge.failure_modes, observed_text, candidates, fuzzy_query=fuzzy_query
     )
     if symptom_matches[0:1] and symptom_matches[0][1].get("exclusive_actions"):
         lines = []
     for family, symptom in symptom_matches[:1]:
         symptom_name = _safe_line(
-            _localized_failure_mode_name(symptom, language),
+            _localized_failure_mode_name(symptom, knowledge.language),
             limit=180,
             masker=active_masker,
         )
         learned = is_matcher_only_family(family)
-        lines.append(("- 이전 인시던트에서 학습된 지식(카탈로그 계열 아님): " if learned and language == "ko" else "- Learned from a previous incident (not a catalog family): " if learned else "- ") + f"**{symptom_name}** ({_family_label(family)})")
+        lines.append(("- 이전 인시던트에서 학습된 지식(카탈로그 계열 아님): " if learned and knowledge.language == "ko" else "- Learned from a previous incident (not a catalog family): " if learned else "- ") + f"**{symptom_name}** ({_family_label(family)})")
         lines.extend(
             f"  - {_safe_line(action, limit=360, masker=active_masker)}"
-            for action in _localized_failure_mode_actions(symptom, language)[:5]
+            for action in _localized_failure_mode_actions(symptom, knowledge.language)[:5]
         )
         # Architecture layer: the implicated platform component's failure effect,
         # dependency check order, and ready-to-run checks (runai_architecture.yaml).
         if symptom.get("component"):
-            lines.extend(component_check_lines(components or {}, str(symptom["component"])))
+            lines.extend(component_check_lines(knowledge.components or {}, str(symptom["component"])))
     if lines:
         # Preserve sibling symptom discriminators as explicitly unconfirmed
         # appendix context. The family has no independent executable remedy.
         if symptom_matches and not symptom_matches[0][1].get("exclusive_actions"):
             lines.extend(
                 _family_supplemental_playbook_lines(
-                    failure_modes,
                     top_family,
-                    language,
-                    active_masker,
+                    knowledge=replace(knowledge, masker=active_masker),
                     exclude_symptom=str(symptom_matches[0][1].get("symptom") or ""),
                 )
             )
@@ -7872,47 +7871,45 @@ def _playbook_lines(
     if top_family == "insufficient_evidence":
         return [
             "- 현재 증거와 정확히 일치하는 트러블슈팅 playbook이 없습니다."
-            if language == "ko"
+            if knowledge.language == "ko"
             else "- No troubleshooting playbook matched the available evidence yet."
         ]
     if top_family:
         family_context = [
             "- 원인 family는 추정됐지만 세부 증상은 확인되지 않았습니다. "
             "아래 항목은 확정 조치가 아니라 추가 증거 수집용 보조 점검입니다."
-            if language == "ko"
+            if knowledge.language == "ko"
             else "- The cause family is ranked, but no specific symptom is confirmed; "
             "the items below are supplemental checks for collecting evidence, not confirmed fixes."
         ]
         family_context.extend(
             _family_supplemental_playbook_lines(
-                failure_modes, top_family, language, active_masker
+                top_family, knowledge=replace(knowledge, masker=active_masker)
             )
         )
         return family_context
-    if fallback_cases:
-        return [fallback_cases]
+    if knowledge.cases:
+        return [knowledge.cases]
     return ["- No troubleshooting guidance is available for this cause yet."]
 
 
 def _family_supplemental_playbook_lines(
-    failure_modes: dict[str, list[dict]],
     family: str,
-    language: str,
-    masker: Masker,
     *,
+    knowledge: ReportKnowledge = ReportKnowledge(),
     exclude_symptom: str = "",
 ) -> list[str]:
     """Render sibling symptoms as discriminators, never as executable fixes."""
-    symptoms = failure_modes.get(family) or []
+    symptoms = knowledge.failure_modes.get(family) or []
     rendered: list[str] = []
     for symptom in symptoms:
         if str(symptom.get("symptom") or "") == exclude_symptom:
             continue
         name = _safe_line(
-            _localized_failure_mode_name(symptom, language), limit=160, masker=masker
+            _localized_failure_mode_name(symptom, knowledge.language), limit=160, masker=knowledge.masker
         )
         signals = [
-            _safe_line(keyword, limit=100, masker=masker)
+            _safe_line(keyword, limit=100, masker=knowledge.masker)
             for keyword in symptom.get("keywords", [])[:4]
         ]
         signals = [signal for signal in signals if signal]
@@ -7921,7 +7918,7 @@ def _family_supplemental_playbook_lines(
         signal_text = ", ".join(f"`{signal}`" for signal in signals)
         discriminator = (
             f"구분 신호: {signal_text}"
-            if language == "ko"
+            if knowledge.language == "ko"
             else f"Distinguishing signals: {signal_text}"
         )
         rendered.append(f"  - **{name}** — {discriminator}")
@@ -7931,7 +7928,7 @@ def _family_supplemental_playbook_lines(
         return []
     heading = (
         "- **같은 family의 대안 symptom (현재 증거로 확인되지 않음)**"
-        if language == "ko"
+        if knowledge.language == "ko"
         else "- **Alternative symptoms in the same family (not confirmed by current evidence)**"
     )
     return [heading, *rendered]

@@ -16,6 +16,7 @@ from app.schemas import Alert, AlertAnalysisRequest, SimilarIncidentContext
 from app.services import pipeline
 from app.services.evidence_blackboard import Blackboard
 from app.services.kg_enrichment import GraphRemediation
+from app.services.pipeline import ReportKnowledge
 from app.services.root_cause_ranking import RankedCause
 from tests.test_orchestrator import make_settings, make_target
 
@@ -84,16 +85,20 @@ def test_workload_prefix_node_resolution_rejects_multi_node_replicas() -> None:
 
 def test_insufficient_evidence_gets_a_separate_general_guidance_section() -> None:
     detail = pipeline._detail_from(
-        AlertAnalysisRequest(
+                 AlertAnalysisRequest(
             alert=Alert(
                 status="firing",
                 labels={"alertname": "GenericAlert"},
                 annotations={"summary": "OOMKilled was reported by an operator"},
             )
         ),
-        [],
-        [],
-        failure_modes={
+                 [],
+                 [],
+                 root_cause_candidates=[
+            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
+        ],
+                 eligible_support_ids=set(),
+                 knowledge=ReportKnowledge(failure_modes={
             "workload_startup_error": [
                 {
                     "symptom": "OOMKilled",
@@ -101,12 +106,8 @@ def test_insufficient_evidence_gets_a_separate_general_guidance_section() -> Non
                     "actions": ["GENERAL-GUIDANCE raise the memory limit after validation."],
                 }
             ]
-        },
-        root_cause_candidates=[
-            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
-        ],
-        eligible_support_ids=set(),
-    )
+        }),
+             )
 
     actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
     guidance = detail.split("## General Troubleshooting Guidance", 1)[1].split(
@@ -394,21 +395,18 @@ def test_context_only_artifacts_cannot_emit_catalog_or_historical_actions() -> N
         ]
     }
     detail = pipeline._detail_from(
-        request,
-        [CollectorResult(agent="kubernetes", status="ok", summary="current snapshot")],
-        [],
-        failure_modes=modes,
-        root_cause_candidates=[
+                 request,
+                 [CollectorResult(agent="kubernetes", status="ok", summary="current snapshot")],
+                 [],
+                 root_cause_candidates=[
             RankedCause(family="node_kubelet_pressure", confidence="medium", score=7.0)
         ],
-        kg_context={"enabled": True, "available": True, "knowledge": modes},
-        plan=plan,
-        graph_fixes=GraphRemediation(family_fixes=["GRAPH-REMEDY reset the node"]),
-        components={"component-a": {"checks": ["COMPONENT-REMEDY restart it"]}},
-        # A typed artifact existed but was another target/window, so this is an
-        # explicit production-style no-support verdict rather than a legacy call.
-        eligible_support_ids=set(),
-    )
+                 kg_context={"enabled": True, "available": True, "knowledge": modes},
+                 plan=plan,
+                 graph_fixes=GraphRemediation(family_fixes=["GRAPH-REMEDY reset the node"]),
+                 eligible_support_ids=set(),
+                 knowledge=ReportKnowledge(failure_modes=modes, components={"component-a": {"checks": ["COMPONENT-REMEDY restart it"]}}),
+             )
 
     actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
     assert "Not enough evidence for concrete actions" in actions

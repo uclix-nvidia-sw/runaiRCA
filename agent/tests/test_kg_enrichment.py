@@ -23,6 +23,7 @@ from app.services.kg_enrichment import (
     enrich,
 )
 from app.services.pipeline import (
+    ReportKnowledge,
     _causal_chain_line,
     _knowledge_base_lines,
     _playbook_lines,
@@ -825,19 +826,15 @@ def test_typedb_symptom_component_preserves_yaml_playbook_checks() -> None:
     }
 
     typedb_lines = _playbook_lines(
-        None,
-        "cluster sync unhealthy",
-        {"runai_control_plane_error": [typedb_symptom]},
-        "",
-        components=components,
-    )
+                       None,
+                       "cluster sync unhealthy",
+                       knowledge=ReportKnowledge(failure_modes={"runai_control_plane_error": [typedb_symptom]}, cases="", components=components),
+                   )
     yaml_lines = _playbook_lines(
-        None,
-        "cluster sync unhealthy",
-        {"runai_control_plane_error": [{**typedb_symptom}]},
-        "",
-        components=components,
-    )
+                     None,
+                     "cluster sync unhealthy",
+                     knowledge=ReportKnowledge(failure_modes={"runai_control_plane_error": [{**typedb_symptom}]}, cases="", components=components),
+                 )
 
     assert typedb_lines == yaml_lines
     assert "Check order: cluster-sync → runai-backend" in "\n".join(typedb_lines)

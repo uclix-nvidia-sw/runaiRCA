@@ -32,6 +32,7 @@ from app.knowledge import (
 )
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
+from app.services.pipeline import ReportKnowledge
 from app.services.planner import plan_investigation
 from app.services.root_cause_ranking import RankedCause, rank_root_cause_candidates
 from app.services.self_check import refute_top_cause
@@ -846,15 +847,13 @@ def test_numbered_actions_lead_with_component_checks() -> None:
         alert=Alert(labels={"alertname": "KubePodNotReady"}, annotations={})
     )
     numbered = pipeline._numbered_actions(
-        plan,
-        None,
-        [],
-        "",
-        {},
-        [],
-        request,
-        [],
-        components=COMPONENTS,
-    )
+                   plan,
+                   None,
+                   [],
+                   "",
+                   [],
+                   request,
+                   knowledge=ReportKnowledge(failure_modes={}, known_issues=[], components=COMPONENTS),
+               )
     assert numbered, "component checks should produce actions"
     assert "gpu-operator" in " ".join(numbered)

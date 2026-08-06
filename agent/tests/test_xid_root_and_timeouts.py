@@ -7,6 +7,7 @@ from app.schemas import Alert, AlertAnalysisRequest
 from app.services.kg_enrichment import GraphRemediation
 from app.services.pipeline import (
     _HANGUL_RE,
+    ReportKnowledge,
     _causal_chain_line,
     _numbered_actions,
     _translatable_report_lines,
@@ -60,14 +61,14 @@ def test_root_xid_fix_is_ordered_first() -> None:
         alert=Alert(status="firing", labels={"alertname": "X"}, annotations={}, fingerprint="fp")
     )
     actions = _numbered_actions(
-        None,
-        gr,
-        [RankedCause(family="gpu_hardware_error", confidence="low", score=1.0)],
-        "",
-        {},
-        [],
-        request,
-    )
+                  None,
+                  gr,
+                  [RankedCause(family="gpu_hardware_error", confidence="low", score=1.0)],
+                  "",
+                  [],
+                  request,
+                  knowledge=ReportKnowledge(failure_modes={}),
+              )
     joined = "\n".join(actions)
     assert "root XID 74" in joined
     assert joined.index("root XID 74") < joined.index("XID 45")
@@ -149,7 +150,7 @@ def _xid_actions(
     request = AlertAnalysisRequest(
         alert=Alert(status="firing", labels={"alertname": "X"}, annotations={}, fingerprint="fp")
     )
-    kwargs = {"language": language} if language else {}
+    kwargs = {}
     if observed_codes is not None:
         kwargs["observed_codes"] = observed_codes
     return _numbered_actions(
@@ -157,9 +158,9 @@ def _xid_actions(
         gr,
         [RankedCause(family="gpu_hardware_error", confidence="low", score=1.0)],
         "",
-        {},
         [],
         request,
+        knowledge=ReportKnowledge(language=language) if language else ReportKnowledge(),
         **kwargs,
     )
 
