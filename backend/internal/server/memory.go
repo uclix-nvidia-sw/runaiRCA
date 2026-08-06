@@ -372,13 +372,7 @@ func (s *Store) SearchIncidentMemoryExcluding(
 			RetrievalKind:    retrievalKindSparseIdentity,
 		})
 	}
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].Similarity == results[j].Similarity {
-			return results[i].CreatedAt.After(results[j].CreatedAt)
-		}
-		return results[i].Similarity > results[j].Similarity
-	})
-	return dedupeSimilarByIncident(results, limit)
+	return rankSimilar(results, limit)
 }
 
 func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
@@ -678,13 +672,7 @@ func (s *Store) similarIncidentsLocked(
 			RetrievalKind:    retrievalKindSparseIdentity,
 		})
 	}
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].Similarity == results[j].Similarity {
-			return results[i].CreatedAt.After(results[j].CreatedAt)
-		}
-		return results[i].Similarity > results[j].Similarity
-	})
-	return dedupeSimilarByIncident(results, limit)
+	return rankSimilar(results, limit)
 }
 
 func (s *Store) similarRecentCountLocked(
@@ -716,6 +704,18 @@ func (s *Store) similarRecentCountLocked(
 		}
 	}
 	return len(seen)
+}
+
+// rankSimilar orders sparse-identity matches the way the panel reads them:
+// strongest similarity first, most recent incident breaking a tie.
+func rankSimilar(results []SimilarIncident, limit int) []SimilarIncident {
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Similarity == results[j].Similarity {
+			return results[i].CreatedAt.After(results[j].CreatedAt)
+		}
+		return results[i].Similarity > results[j].Similarity
+	})
+	return dedupeSimilarByIncident(results, limit)
 }
 
 func dedupeSimilarByIncident(results []SimilarIncident, limit int) []SimilarIncident {

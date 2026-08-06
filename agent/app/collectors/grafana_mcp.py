@@ -241,3 +241,16 @@ async def grafana_datasource_uid(
     return await resolve_grafana_datasource_uid(
         url, datasource_type, configured_uid, call_json=call_grafana_mcp_json
     )
+
+
+def raise_on_datasource_error(items: list[dict[str, object]]) -> None:
+    """Abort the whole collector when Grafana rejected the datasource UID.
+
+    That failure is not a property of any one query: every remaining query would
+    fail identically, and reporting it per query turns one configuration problem
+    into N unavailable evidence cards.
+    """
+    for item in items:
+        error = str(item.get("error") or "")
+        if grafana_datasource_error(error):
+            raise RuntimeError(error)

@@ -21,10 +21,10 @@ from app.collectors.base import (
 )
 from app.collectors.grafana_mcp import (
     call_grafana_mcp_json,
-    grafana_datasource_error,
     grafana_datasource_uid,
     grafana_mcp_result_json,
     mark_grafana_datasource_failure,
+    raise_on_datasource_error,
     validate_grafana_datasource_uid,
 )
 from app.collectors.http_json import compact, get_json
@@ -624,16 +624,7 @@ async def _collect_loki_mcp(
                 )
                 for (name, query), result in zip(queries, results, strict=True)
             ]
-            datasource_error = next(
-                (
-                    str(item.get("error") or "")
-                    for item in items
-                    if grafana_datasource_error(str(item.get("error") or ""))
-                ),
-                "",
-            )
-            if datasource_error:
-                raise RuntimeError(datasource_error)
+            raise_on_datasource_error(items)
             return items
     except Exception as exc:
         mark_grafana_datasource_failure(

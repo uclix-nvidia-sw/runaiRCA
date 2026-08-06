@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -3035,15 +3036,20 @@ async def _k8s_mcp_json(
         return await _k8s_mcp_json_within_budget(settings, candidates)
 
 
-async def _k8s_mcp_json_within_budget(
-    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+async def _k8s_mcp_first_usable(
+    settings: Settings,
+    candidates: list[tuple[str, dict[str, object]]],
+    use: Callable[[object, str], object],
 ) -> object:
-    # Walk candidates and return the first one that yields a machine-readable
-    # payload. A candidate can "succeed" at the MCP protocol level yet answer with
-    # a human table (kubernetes-mcp-server's events_list does) that _k8s_yaml_payload
-    # can't parse — when that happens, fall through to the next candidate (e.g.
-    # resources_list, which honors --list-output=yaml) instead of raising and
-    # losing the evidence to the direct-API fallback.
+    """Walk MCP tool candidates and return the first result ``use`` accepts.
+
+    A candidate can "succeed" at the MCP protocol level yet answer with a human
+    table (kubernetes-mcp-server's events_list does) that the payload parser
+    cannot read. ``use`` rejects such a reply by raising RuntimeError, and the
+    walk falls through to the next candidate (e.g. resources_list, which honors
+    --list-output=yaml) instead of losing the evidence to the direct-API
+    fallback.
+    """
     last_error = ""
     for tool, args in candidates:
         try:
@@ -3058,15 +3064,28 @@ async def _k8s_mcp_json_within_budget(
             last_error = f"{tool}: {error}"
             continue
         try:
-            data = _k8s_mcp_payload(result)
+            return use(result, tool)
         except RuntimeError as exc:
             last_error = f"{tool}: {exc}"
             continue
-        if not _k8s_mcp_payload_recognized(data, tool=tool):
-            last_error = f"{tool}: MCP response missing a Kubernetes object/list payload"
-            continue
-        return data
     raise RuntimeError(last_error or "Kubernetes MCP tool failed")
+
+
+def _k8s_mcp_recognized_payload(result: object, tool: str) -> object:
+    data = _k8s_mcp_payload(result)
+    if not _k8s_mcp_payload_recognized(data, tool=tool):
+        raise RuntimeError("MCP response missing a Kubernetes object/list payload")
+    return data
+
+
+async def _k8s_mcp_json_within_budget(
+    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+) -> object:
+    return await _k8s_mcp_first_usable(
+        settings,
+        candidates,
+        _k8s_mcp_recognized_payload,
+    )
 
 
 _KUBERNETES_GO_KEY_ALIASES = {
@@ -3184,21 +3203,7 @@ async def _k8s_mcp_result(
 async def _k8s_mcp_result_within_budget(
     settings: Settings, candidates: list[tuple[str, dict[str, object]]]
 ):
-    last_error = ""
-    for tool, args in candidates:
-        try:
-            result = await mcp_call(settings.kubernetes_mcp_url, tool, args)
-        except TimeoutError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
-            last_error = f"{tool}: {exc.__class__.__name__}: {exc}"
-            continue
-        error = mcp_error(result)
-        if error:
-            last_error = f"{tool}: {error}"
-            continue
-        return result
-    raise RuntimeError(last_error or "Kubernetes MCP tool failed")
+    return await _k8s_mcp_first_usable(settings, candidates, lambda result, _tool: result)
 
 
 def _scope_target(target: AnalysisTarget, plan) -> AnalysisTarget:  # noqa: ANN001

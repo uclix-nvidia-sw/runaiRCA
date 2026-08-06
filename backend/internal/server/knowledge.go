@@ -1588,21 +1588,31 @@ func (s *Store) ShadowKnowledgeCandidate(id string, request KnowledgeDecisionReq
 	return cloneKnowledgeCandidate(candidate), cloneKnowledgePackage(pkg), nil
 }
 
+// shadowPairLocked resolves the candidate and package a shadow decision acts
+// on, refusing anything that is not still in shadow on BOTH sides.
+func (s *Store) shadowPairLocked(id string) (*KnowledgeCandidate, *KnowledgePackage, error) {
+	candidate := s.knowledgeCandidates[id]
+	if candidate == nil {
+		return nil, nil, errors.New("knowledge candidate not found")
+	}
+	if candidate.Status != knowledgeCandidateShadow {
+		return nil, nil, errors.New("knowledge candidate is not in shadow")
+	}
+	pkg := s.knowledgePackages[candidate.PackageID]
+	if pkg == nil || pkg.Status != knowledgePackageShadow {
+		return nil, nil, errors.New("knowledge shadow package not found")
+	}
+	return candidate, pkg, nil
+}
+
 // ActivateShadowKnowledgeCandidate makes an already validated shadow package
 // visible to the Agent. It is the only shadow -> active transition.
 func (s *Store) ActivateShadowKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	candidate := s.knowledgeCandidates[id]
-	if candidate == nil {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate not found")
-	}
-	if candidate.Status != knowledgeCandidateShadow {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate is not in shadow")
-	}
-	pkg := s.knowledgePackages[candidate.PackageID]
-	if pkg == nil || pkg.Status != knowledgePackageShadow {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge shadow package not found")
+	candidate, pkg, err := s.shadowPairLocked(id)
+	if err != nil {
+		return KnowledgeCandidate{}, KnowledgePackage{}, err
 	}
 	validated := s.knowledgeCandidateForSnapshotLocked(s.caseSnapshots[candidate.CaseID])
 	if err := revalidationError(validated, validated != nil && validated.ContentHash == candidate.ContentHash); err != nil {
@@ -1646,16 +1656,9 @@ func (s *Store) ActivateShadowKnowledgeCandidate(id string, request KnowledgeDec
 func (s *Store) RejectShadowKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	candidate := s.knowledgeCandidates[id]
-	if candidate == nil {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate not found")
-	}
-	if candidate.Status != knowledgeCandidateShadow {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate is not in shadow")
-	}
-	pkg := s.knowledgePackages[candidate.PackageID]
-	if pkg == nil || pkg.Status != knowledgePackageShadow {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge shadow package not found")
+	candidate, pkg, err := s.shadowPairLocked(id)
+	if err != nil {
+		return KnowledgeCandidate{}, KnowledgePackage{}, err
 	}
 	now := time.Now().UTC()
 	actor, note := knowledgeActor(request.Actor), strings.TrimSpace(request.Note)
