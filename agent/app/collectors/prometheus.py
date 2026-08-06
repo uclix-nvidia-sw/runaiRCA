@@ -14,8 +14,11 @@ from app.collectors.base import (
     parse_incident_time,
 )
 from app.collectors.grafana_mcp import (
+    call_grafana_mcp_json,
+    grafana_datasource_error,
+    grafana_datasource_uid,
+    grafana_mcp_result_json,
     mark_grafana_datasource_failure,
-    resolve_grafana_datasource_uid,
     validate_grafana_datasource_uid,
 )
 from app.collectors.http_json import compact, get_json
@@ -24,12 +27,9 @@ from app.config import Settings
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
     mcp_budget,
-    mcp_call,
     mcp_call_many,
-    mcp_error,
     mcp_fallback_warning,
     mcp_tls_verify,
-    mcp_tool_json,
 )
 from app.services.query_memory import domain_query_key
 
@@ -593,7 +593,7 @@ async def _collect_prometheus_mcp(
 ) -> list[dict[str, object]]:
     try:
         async with mcp_budget(settings.prometheus_timeout_seconds):
-            datasource_uid = await _grafana_datasource_uid(
+            datasource_uid = await grafana_datasource_uid(
                 settings.prometheus_mcp_url,
                 "prometheus",
                 settings.prometheus_datasource_uid,
@@ -620,7 +620,7 @@ async def _collect_prometheus_mcp(
                 (
                     str(item.get("error") or "")
                     for item in items
-                    if _grafana_datasource_error(str(item.get("error") or ""))
+                    if grafana_datasource_error(str(item.get("error") or ""))
                 ),
                 "",
             )
@@ -646,7 +646,7 @@ async def prom_mcp_query(
 ) -> dict[str, object]:
     try:
         async with mcp_budget(settings.prometheus_timeout_seconds):
-            datasource_uid = await _grafana_datasource_uid(
+            datasource_uid = await grafana_datasource_uid(
                 settings.prometheus_mcp_url,
                 "prometheus",
                 settings.prometheus_datasource_uid,
@@ -687,7 +687,7 @@ async def _mcp_query_prometheus(
     # instead of the incident.
     args = _prometheus_mcp_args(promql, datasource_uid, time_range)
     try:
-        data = await _call_mcp_json(url, "query_prometheus", [args])
+        data = await call_grafana_mcp_json(url, "query_prometheus", [args])
     except Exception as exc:
         mark_grafana_datasource_failure(url, "prometheus", datasource_uid, exc)
         raise
@@ -756,7 +756,7 @@ def _prometheus_mcp_tool_item(
     time_range: dict[str, str] | None,
 ) -> dict[str, object]:
     try:
-        data = _mcp_result_json(result, "query_prometheus")
+        data = grafana_mcp_result_json(result, "query_prometheus")
     except RuntimeError as exc:
         query_window = time_range or {"start": "now-15m", "end": "now"}
         return {
@@ -774,9 +774,6 @@ def _prometheus_mcp_tool_item(
     return _prometheus_mcp_item(name, promql, url, data, time_range)
 
 
-def _grafana_datasource_error(error: str) -> bool:
-    lowered = error.casefold()
-    return "get datasource by uid" in lowered or "id is invalid" in lowered
 
 
 def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
@@ -1454,45 +1451,10 @@ def _prometheus_samples(item: dict[str, object]) -> list[tuple[str, float | None
     return samples
 
 
-async def _grafana_datasource_uid(
-    url: str,
-    datasource_type: str,
-    configured_uid: str = "",
-) -> str:
-    return await resolve_grafana_datasource_uid(
-        url,
-        datasource_type,
-        configured_uid,
-        call_json=_call_mcp_json,
-    )
 
 
-async def _call_mcp_json(
-    url: str, tool: str, args_list: list[dict[str, object]]
-) -> object:
-    last_error = ""
-    for args in args_list:
-        try:
-            result = await mcp_call(url, tool, args)
-        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
-            last_error = f"{exc.__class__.__name__}: {exc}"
-            continue
-        try:
-            return _mcp_result_json(result, tool)
-        except RuntimeError as exc:
-            last_error = str(exc)
-            continue
-    raise RuntimeError(last_error or f"{tool} failed")
 
 
-def _mcp_result_json(result: object, tool: str) -> object:
-    error = mcp_error(result)
-    if error:
-        raise RuntimeError(error)
-    data = mcp_tool_json(result)
-    if isinstance(data, dict) and "raw" in data:
-        raise RuntimeError(f"{tool} result was not JSON")
-    return data
 
 
 def _prometheus_mcp_result(data: object) -> list[object]:

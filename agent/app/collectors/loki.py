@@ -20,8 +20,11 @@ from app.collectors.base import (
     salient_markers,
 )
 from app.collectors.grafana_mcp import (
+    call_grafana_mcp_json,
+    grafana_datasource_error,
+    grafana_datasource_uid,
+    grafana_mcp_result_json,
     mark_grafana_datasource_failure,
-    resolve_grafana_datasource_uid,
     validate_grafana_datasource_uid,
 )
 from app.collectors.http_json import compact, get_json
@@ -32,12 +35,9 @@ from app.masking import build_masker
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
     mcp_budget,
-    mcp_call,
     mcp_call_many,
-    mcp_error,
     mcp_fallback_warning,
     mcp_tls_verify,
-    mcp_tool_json,
 )
 
 _log = logging.getLogger(__name__)
@@ -596,7 +596,7 @@ async def _collect_loki_mcp(
 ) -> list[dict[str, object]]:
     try:
         async with mcp_budget(settings.loki_timeout_seconds):
-            datasource_uid = await _grafana_datasource_uid(
+            datasource_uid = await grafana_datasource_uid(
                 settings.loki_mcp_url,
                 "loki",
                 settings.loki_datasource_uid,
@@ -628,7 +628,7 @@ async def _collect_loki_mcp(
                 (
                     str(item.get("error") or "")
                     for item in items
-                    if _grafana_datasource_error(str(item.get("error") or ""))
+                    if grafana_datasource_error(str(item.get("error") or ""))
                 ),
                 "",
             )
@@ -654,7 +654,7 @@ async def loki_mcp_query(
 ) -> dict[str, object]:
     try:
         async with mcp_budget(settings.loki_timeout_seconds):
-            datasource_uid = await _grafana_datasource_uid(
+            datasource_uid = await grafana_datasource_uid(
                 settings.loki_mcp_url,
                 "loki",
                 settings.loki_datasource_uid,
@@ -697,7 +697,7 @@ async def _mcp_query_loki(
     # with no recognized datasourceUid and misleadingly reported "id is invalid".
     args = _loki_mcp_args(logql, limit, datasource_uid, time_range)
     try:
-        data = await _call_mcp_json(url, "query_loki_logs", [args])
+        data = await call_grafana_mcp_json(url, "query_loki_logs", [args])
     except Exception as exc:
         mark_grafana_datasource_failure(url, "loki", datasource_uid, exc)
         raise
@@ -810,7 +810,7 @@ def _loki_mcp_tool_item(
     time_range: dict[str, str] | None,
 ) -> dict[str, object]:
     try:
-        data = _mcp_result_json(result, "query_loki_logs")
+        data = grafana_mcp_result_json(result, "query_loki_logs")
     except RuntimeError as exc:
         return {
             "name": name,
@@ -832,9 +832,6 @@ def _loki_mcp_tool_item(
     return _loki_mcp_item(name, logql, url, data, time_range)
 
 
-def _grafana_datasource_error(error: str) -> bool:
-    lowered = error.casefold()
-    return "get datasource by uid" in lowered or "id is invalid" in lowered
 
 
 def _incident_time_range(target: AnalysisTarget) -> dict[str, str] | None:
@@ -1456,45 +1453,10 @@ def _loki_flat_log_result_complete(value: object) -> bool:
     )
 
 
-async def _grafana_datasource_uid(
-    url: str,
-    datasource_type: str,
-    configured_uid: str = "",
-) -> str:
-    return await resolve_grafana_datasource_uid(
-        url,
-        datasource_type,
-        configured_uid,
-        call_json=_call_mcp_json,
-    )
 
 
-async def _call_mcp_json(
-    url: str, tool: str, args_list: list[dict[str, object]]
-) -> object:
-    last_error = ""
-    for args in args_list:
-        try:
-            result = await mcp_call(url, tool, args)
-        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
-            last_error = f"{exc.__class__.__name__}: {exc}"
-            continue
-        try:
-            return _mcp_result_json(result, tool)
-        except RuntimeError as exc:
-            last_error = str(exc)
-            continue
-    raise RuntimeError(last_error or f"{tool} failed")
 
 
-def _mcp_result_json(result: object, tool: str) -> object:
-    error = mcp_error(result)
-    if error:
-        raise RuntimeError(error)
-    data = mcp_tool_json(result)
-    if isinstance(data, dict) and "raw" in data:
-        raise RuntimeError(f"{tool} result was not JSON")
-    return data
 
 
 def _log_lines_from_mcp_data(data: object) -> list[str]:

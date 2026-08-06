@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors import kubernetes, loki, postgres, prometheus
+from app.collectors import grafana_mcp, kubernetes, loki, postgres, prometheus
 from app.collectors.base import NO_EVIDENCE
 from app.collectors.grafana_mcp import (
     clear_grafana_datasource_cache,
@@ -92,7 +92,9 @@ def _patch_mcp_calls(monkeypatch, module, call) -> None:
     async def call_many(url, calls):
         return [await call(url, tool, arguments) for tool, arguments in calls]
 
-    monkeypatch.setattr(module, "mcp_call", call)
+    # Datasource discovery now goes through the shared Grafana MCP helper;
+    # the per-collector query calls still use the collector's own mcp_call_many.
+    monkeypatch.setattr(grafana_mcp, "mcp_call", call)
     monkeypatch.setattr(module, "mcp_call_many", call_many)
 
 
@@ -234,7 +236,7 @@ async def test_explicit_prometheus_uid_skips_discovery_and_batches_queries(
             for _ in calls
         ]
 
-    monkeypatch.setattr(prometheus, "mcp_call", discovery_must_not_run)
+    monkeypatch.setattr(grafana_mcp, "mcp_call", discovery_must_not_run)
     monkeypatch.setattr(prometheus, "mcp_call_many", fake_many)
     result = await prometheus.PrometheusCollector(
         replace(
@@ -503,7 +505,7 @@ async def test_explicit_loki_uid_batches_all_queries_in_one_mcp_call(monkeypatch
         batches.append(calls)
         return [_McpResult({"data": []}) for _ in calls]
 
-    monkeypatch.setattr(loki, "mcp_call", discovery_must_not_run)
+    monkeypatch.setattr(grafana_mcp, "mcp_call", discovery_must_not_run)
     monkeypatch.setattr(loki, "mcp_call_many", fake_many)
     result = await loki.LokiCollector(
         replace(
@@ -573,7 +575,7 @@ async def test_loki_mcp_parses_grafana_log_entries(monkeypatch) -> None:
             }
         )
 
-    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(grafana_mcp, "mcp_call", fake_mcp_call)
     result = await loki._mcp_query_loki(
         "http://grafana-mcp/mcp", "smoke", '{namespace="runai"}', 20, "loki"
     )
@@ -594,7 +596,7 @@ async def test_loki_mcp_malformed_success_body_is_not_an_empty_log_search(
     async def fake_mcp_call(url, tool, arguments):
         return _McpResult({"status": "success", "data": {}})
 
-    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(grafana_mcp, "mcp_call", fake_mcp_call)
     result = await loki._mcp_query_loki(
         "http://grafana-mcp/mcp", "smoke", '{namespace="runai"}', 20, "loki"
     )
@@ -608,7 +610,7 @@ async def test_loki_mcp_unrelated_list_is_not_an_empty_log_search(monkeypatch) -
     async def fake_mcp_call(url, tool, arguments):
         return _McpResult({"data": [{"uid": "prom", "type": "prometheus"}]})
 
-    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(grafana_mcp, "mcp_call", fake_mcp_call)
     result = await loki._mcp_query_loki(
         "http://grafana-mcp/mcp", "smoke", '{namespace="runai"}', 20, "loki"
     )

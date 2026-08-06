@@ -4864,49 +4864,21 @@ async def _collect_pod_logs_via_mcp(
     previous_containers: list[str] | None = None,
     since_time: str = "",
 ) -> list[dict[str, object]]:
-    """Fetch logs through MCP, preferring direct time-bounded API for history."""
-    # See _collect_pod_logs: same KUBERNETES_NAMESPACES scope as the rest of the sweep.
-    if not (target.namespace and target.pod and _namespace_allowed(settings, target.namespace)):
+    """Fetch logs through MCP, preferring direct time-bounded API for history.
+
+    Same read as _collect_resolved_pod_logs, which also applies the
+    KUBERNETES_NAMESPACES scope; this entry point additionally requires the
+    target to already name a namespace and Pod.
+    """
+    if not (target.namespace and target.pod):
         return []
-    targets: list[str | None] = list(containers) if containers else [None]
-    logs: list[dict[str, object]] = []
-    for container in targets:
-        previous_requests = [False] + (
-            [True] if container and container in (previous_containers or []) else []
-        )
-        for previous in previous_requests:
-            if previous and not container:
-                continue
-            item = await k8s_logs(
-                settings,
-                target.namespace,
-                target.pod,
-                container=container or "",
-                tail=settings.kubernetes_list_limit,
-                previous=previous,
-                since_time=since_time,
-            )
-            logs.append(
-                {
-                    "namespace": item.get("namespace") or target.namespace,
-                    "pod": item.get("pod") or target.pod,
-                    "container": container,
-                    "previous": previous,
-                    "since_time": since_time or None,
-                    "transport": item.get("transport"),
-                    "source_verified": item.get("source_verified") is True,
-                    "time_scope_verified": item.get("time_scope_verified") is not False,
-                    **(
-                        {"observed_entity": item["observed_entity"]}
-                        if isinstance(item.get("observed_entity"), dict)
-                        else {}
-                    ),
-                    "status_code": item.get("status_code"),
-                    "error": item.get("error"),
-                    "lines": item.get("lines") or [],
-                }
-            )
-    return logs
+    return await _collect_resolved_pod_logs(
+        settings,
+        target,
+        containers,
+        previous_containers=previous_containers,
+        since_time=since_time,
+    )
 
 
 def _log_lines(data: object, *, historical: bool = False) -> list[str]:

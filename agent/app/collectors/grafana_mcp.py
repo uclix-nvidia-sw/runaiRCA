@@ -6,6 +6,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from app.mcp_client import mcp_call, mcp_error, mcp_tool_json
+
 _GRAFANA_UID = re.compile(r"^[a-zA-Z0-9\-_]{1,40}$")
 _SUCCESS_TTL_SECONDS = 300.0
 _FAILURE_TTL_SECONDS = 30.0
@@ -191,3 +193,51 @@ def _datasource_items(data: object) -> list[dict[str, Any]]:
     if isinstance(nested, dict):
         return _datasource_items(nested)
     return []
+
+
+async def call_grafana_mcp_json(
+    url: str, tool: str, args_list: list[dict[str, object]]
+) -> object:
+    """Call one Grafana MCP tool, trying each argument schema in turn.
+
+    v0.x servers disagree on argument names, so callers pass every candidate
+    shape and the first one the server accepts wins; the last failure is raised
+    when none do.
+    """
+    last_error = ""
+    for args in args_list:
+        try:
+            result = await mcp_call(url, tool, args)
+        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
+            last_error = f"{exc.__class__.__name__}: {exc}"
+            continue
+        try:
+            return grafana_mcp_result_json(result, tool)
+        except RuntimeError as exc:
+            last_error = str(exc)
+            continue
+    raise RuntimeError(last_error or f"{tool} failed")
+
+
+def grafana_mcp_result_json(result: object, tool: str) -> object:
+    error = mcp_error(result)
+    if error:
+        raise RuntimeError(error)
+    data = mcp_tool_json(result)
+    if isinstance(data, dict) and "raw" in data:
+        raise RuntimeError(f"{tool} result was not JSON")
+    return data
+
+
+def grafana_datasource_error(error: str) -> bool:
+    """Whether a tool error means the datasource UID itself was rejected."""
+    lowered = error.casefold()
+    return "get datasource by uid" in lowered or "id is invalid" in lowered
+
+
+async def grafana_datasource_uid(
+    url: str, datasource_type: str, configured_uid: str = ""
+) -> str:
+    return await resolve_grafana_datasource_uid(
+        url, datasource_type, configured_uid, call_json=call_grafana_mcp_json
+    )

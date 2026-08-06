@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.collectors import grafana_mcp
 from app.collectors import kubernetes as k8s
 from app.collectors.base import CollectorResult, artifact, salient_markers
 from app.collectors.kubernetes import (
@@ -389,22 +390,21 @@ async def test_k8s_read_uses_mcp_yaml_reply_without_fallback(monkeypatch) -> Non
 async def test_grafana_datasource_uid_rejects_ids_and_names(monkeypatch) -> None:
     # Passing a numeric row id / display name as datasourceUid made grafana-mcp
     # fail every query with 400 "id is invalid" -> whole collector fell back.
-    from app.collectors import prometheus as prom
     from app.collectors.grafana_mcp import clear_grafana_datasource_cache
 
     async def fake_call(url, tool, args_list):
         return [{"type": "prometheus", "name": "Prometheus (default)", "id": 1}]
 
-    monkeypatch.setattr(prom, "_call_mcp_json", fake_call)
+    monkeypatch.setattr(grafana_mcp, "call_grafana_mcp_json", fake_call)
     with pytest.raises(RuntimeError, match="no accessible prometheus datasource"):
-        await prom._grafana_datasource_uid("http://mcp", "prometheus")
+        await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus")
     clear_grafana_datasource_cache()
 
     async def fake_call_uid(url, tool, args_list):
         return [{"type": "prometheus", "name": "Prometheus", "uid": "prom-main_1"}]
 
-    monkeypatch.setattr(prom, "_call_mcp_json", fake_call_uid)
-    assert await prom._grafana_datasource_uid("http://mcp", "prometheus") == "prom-main_1"
+    monkeypatch.setattr(grafana_mcp, "call_grafana_mcp_json", fake_call_uid)
+    assert await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus") == "prom-main_1"
 
 
 @pytest.mark.asyncio
@@ -420,8 +420,8 @@ async def test_empty_datasource_uid_fails_fast_not_400(monkeypatch) -> None:
     async def boom(*args, **kwargs):  # must never be reached
         raise AssertionError("MCP was called with an empty datasource uid")
 
-    monkeypatch.setattr(loki, "_call_mcp_json", boom)
-    monkeypatch.setattr(prom, "_call_mcp_json", boom)
+    monkeypatch.setattr(grafana_mcp, "call_grafana_mcp_json", boom)
+    monkeypatch.setattr(grafana_mcp, "call_grafana_mcp_json", boom)
     with _pytest.raises(RuntimeError, match="datasource uid unresolved"):
         await loki._mcp_query_loki("http://mcp", "q", '{app="x"}', 10, datasource_uid="")
     with _pytest.raises(RuntimeError, match="datasource uid unresolved"):
