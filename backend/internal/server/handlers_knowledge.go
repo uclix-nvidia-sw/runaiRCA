@@ -60,65 +60,73 @@ func tokenOverlap(value string, tokens []string) int {
 }
 
 func (s *Server) handleKnowledge(w http.ResponseWriter, r *http.Request) {
-	prefix := ""
 	switch {
 	case strings.HasPrefix(r.URL.Path, "/api/v1/knowledge-candidates"):
-		prefix = "/api/v1/knowledge-candidates"
+		rest, parts := routeParts(r.URL.Path, "/api/v1/knowledge-candidates")
+		s.handleKnowledgeCandidates(w, r, rest, parts)
 	case strings.HasPrefix(r.URL.Path, "/api/v1/knowledge-packages"):
-		prefix = "/api/v1/knowledge-packages"
+		rest, parts := routeParts(r.URL.Path, "/api/v1/knowledge-packages")
+		s.handleKnowledgePackages(w, r, rest, parts)
 	default:
 		writeError(w, http.StatusNotFound, "unknown knowledge endpoint")
+	}
+}
+
+// routeParts returns what follows prefix, both raw (empty for the collection
+// route) and split into path segments.
+func routeParts(path, prefix string) (string, []string) {
+	rest := strings.Trim(pathPart(path, prefix), "/")
+	return rest, strings.Split(rest, "/")
+}
+
+func (s *Server) handleKnowledgeCandidates(w http.ResponseWriter, r *http.Request, rest string, parts []string) {
+	if rest == "" && r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, envelope(s.store.ListKnowledgeCandidates(strings.TrimSpace(r.URL.Query().Get("status")))))
 		return
 	}
-	rest := strings.Trim(pathPart(r.URL.Path, prefix), "/")
-	parts := strings.Split(rest, "/")
-	if prefix == "/api/v1/knowledge-candidates" {
-		if rest == "" && r.Method == http.MethodGet {
-			writeJSON(w, http.StatusOK, envelope(s.store.ListKnowledgeCandidates(strings.TrimSpace(r.URL.Query().Get("status")))))
-			return
+	if len(parts) == 1 && r.Method == http.MethodGet {
+		if c, ok := s.store.KnowledgeCandidate(parts[0]); ok {
+			writeJSON(w, http.StatusOK, envelope(c))
+		} else {
+			writeError(w, http.StatusNotFound, "knowledge candidate not found")
 		}
-		if len(parts) == 1 && r.Method == http.MethodGet {
-			if c, ok := s.store.KnowledgeCandidate(parts[0]); ok {
-				writeJSON(w, http.StatusOK, envelope(c))
-			} else {
-				writeError(w, http.StatusNotFound, "knowledge candidate not found")
-			}
-			return
-		}
-		if len(parts) == 1 && r.Method == http.MethodDelete {
-			if err := s.store.DeleteKnowledgeCandidate(parts[0]); err != nil {
-				knowledgeError(w, err)
-				return
-			}
-			writeJSON(w, http.StatusOK, envelope(map[string]string{"candidate_id": parts[0]}))
-			return
-		}
-		if len(parts) == 2 && parts[1] == "decision" && r.Method == http.MethodPost {
-			s.handleKnowledgeCandidateDecision(w, r, parts[0])
-			return
-		}
-		if len(parts) == 2 && parts[1] == "actions" && r.Method == http.MethodPost {
-			s.handleKnowledgeCandidateActionsEdit(w, r, parts[0])
-			return
-		}
+		return
 	}
-	if prefix == "/api/v1/knowledge-packages" {
-		if rest == "" && r.Method == http.MethodGet {
-			writeJSON(w, http.StatusOK, envelope(s.store.ListKnowledgePackages(strings.EqualFold(r.URL.Query().Get("include_retired"), "true"))))
+	if len(parts) == 1 && r.Method == http.MethodDelete {
+		if err := s.store.DeleteKnowledgeCandidate(parts[0]); err != nil {
+			knowledgeError(w, err)
 			return
 		}
-		if len(parts) == 1 && r.Method == http.MethodGet {
-			if p, ok := s.store.KnowledgePackage(parts[0]); ok {
-				writeJSON(w, http.StatusOK, envelope(p))
-			} else {
-				writeError(w, http.StatusNotFound, "knowledge package not found")
-			}
-			return
+		writeJSON(w, http.StatusOK, envelope(map[string]string{"candidate_id": parts[0]}))
+		return
+	}
+	if len(parts) == 2 && parts[1] == "decision" && r.Method == http.MethodPost {
+		s.handleKnowledgeCandidateDecision(w, r, parts[0])
+		return
+	}
+	if len(parts) == 2 && parts[1] == "actions" && r.Method == http.MethodPost {
+		s.handleKnowledgeCandidateActionsEdit(w, r, parts[0])
+		return
+	}
+	writeError(w, http.StatusNotFound, "unknown knowledge endpoint")
+}
+
+func (s *Server) handleKnowledgePackages(w http.ResponseWriter, r *http.Request, rest string, parts []string) {
+	if rest == "" && r.Method == http.MethodGet {
+		writeJSON(w, http.StatusOK, envelope(s.store.ListKnowledgePackages(strings.EqualFold(r.URL.Query().Get("include_retired"), "true"))))
+		return
+	}
+	if len(parts) == 1 && r.Method == http.MethodGet {
+		if p, ok := s.store.KnowledgePackage(parts[0]); ok {
+			writeJSON(w, http.StatusOK, envelope(p))
+		} else {
+			writeError(w, http.StatusNotFound, "knowledge package not found")
 		}
-		if len(parts) == 2 && parts[1] == "retire" && r.Method == http.MethodPost {
-			s.handleKnowledgePackageRetirement(w, r, parts[0])
-			return
-		}
+		return
+	}
+	if len(parts) == 2 && parts[1] == "retire" && r.Method == http.MethodPost {
+		s.handleKnowledgePackageRetirement(w, r, parts[0])
+		return
 	}
 	writeError(w, http.StatusNotFound, "unknown knowledge endpoint")
 }
