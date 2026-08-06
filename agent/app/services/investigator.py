@@ -18,7 +18,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from app.collectors.base import (
@@ -849,14 +849,14 @@ def _add_reflected_hypotheses(
         }
         if mechanism and not _same_ledger_text(mechanism, statement):
             entry["mechanism"] = mechanism
-        for field in (
+        for key in (
             "evidence_for",
             "evidence_against",
             "expected_observations",
             "falsifiers",
         ):
-            if values := _texts(candidate.get(field))[:5]:
-                entry[field] = values
+            if values := _texts(candidate.get(key))[:5]:
+                entry[key] = values
         if next_test := str(candidate.get("next_discriminating_test") or "").strip():
             entry["next_discriminating_test"] = next_test
         # Never silently drop an untestable hypothesis — it is still worth
@@ -1121,223 +1121,426 @@ def _is_cluster_wide_target(target: object) -> bool:
     )
 
 
-async def investigate(
-    settings: Settings,
-    target: object,
-    collectors: list,
-    plan: InvestigationPlan | None,
-    kg_context: dict,
-    max_steps: int,
-    reporter: ProgressReporter | None = None,
-    blackboard: Any = None,
-    deadline_monotonic: float | None = None,
-    initial_evidence: list[CollectorResult] | None = None,
-    query_memory: QueryMemory | None = None,
-) -> tuple[list[CollectorResult], dict[str, Any]]:
-    by_name = {_collector_name(c): c for c in collectors}
-    all_names = set(by_name)
-    # Re-analysis must continue from the observations already collected in this
-    # analysis run.  Starting every pass with an empty mapping caused the full
-    # Kubernetes collector (Pod, Events and Node conditions) to run again up to
-    # MAX_REANALYSIS_STEPS times.  Clone the envelopes because ad-hoc artifacts
-    # are appended below and the caller owns its existing result list.
-    evidence: dict[str, CollectorResult] = {
-        item.agent: replace(
-            item,
-            details=dict(item.details),
-            missing_data=list(item.missing_data),
-            warnings=list(item.warnings),
-            artifacts=list(item.artifacts),
-        )
-        for item in (initial_evidence or [])
-        if item.agent in all_names
-    }
-    latest_probe_scopes: dict[str, dict[str, Any]] = {
-        name: _effective_probe_scope(target, plan, {})
-        for name, item in evidence.items()
-        # Partial means this exact collector scope already executed and kept
-        # every usable sub-result. Replaying the full scope repeats those reads
-        # (often Pod/Events/Node) and was the source of three identical passes.
-        # Failed gaps remain visible in missing_data/query receipts and must be
-        # retried through a changed/narrower scope or domain query, not by
-        # scraping the identical collector scope again.
-        if item.status in {"ok", "partial"}
-    }
-    ledger = _initial_ledger(plan)
-    investigation_steps: list[dict[str, Any]] = []
-    seen_probes: set[str] = {
-        _probe_fingerprint(name, target, plan, scope)
-        for name, scope in latest_probe_scopes.items()
-    }
-    seen_queries: set[str] = set()
-    failed_queries: set[str] = set()
-    for item in evidence.values():
-        _remember_kubernetes_queries(seen_queries, item, target, plan)
-        if query_memory is not None:
-            query_memory.seed_result(item, target)
-    if query_memory is not None:
-        for name, scope in latest_probe_scopes.items():
-            query_memory.remember(collector_probe_key(name, target, scope))
+_DECISION_SYSTEM_PROMPT = (
+    "You are a senior SRE investigating a Run:ai GPU-platform alert. "
+    "Given the plan, hypothesis ledger, evidence so far, and available "
+    "collectors, decide the next diagnostic step. Pick the hypothesis "
+    "you are testing and probe collectors most likely to confirm/refute it. "
+    "The compact ledger omits seed defaults: missing status means open, "
+    "missing confidence means 0.5, and a missing mechanism means it is "
+    "identical to statement. "
+    "Use plan.diagnostic_directive as neutral ontology guidance: "
+    "follow its checks and disconfirmations, but never treat its "
+    "provisional_family as observed evidence. Update confidence using "
+    "only observed evidence. A condition name alone is metadata; verify "
+    "its status/value and treat False or a zero sample as refutation. "
+    "Cite shared_observations evidence_id "
+    "values (F-...) in evidence_for/evidence_against; do not invent IDs. "
+    "When diagnostic_directive.probes names a tool you can reach through "
+    "a collector, use it as a discriminator and honor its supports_when/"
+    "refutes_when conditions. You can ALSO "
+    "run kubectl-style READ-ONLY Kubernetes resource queries only "
+    "(get/list of an allowlisted kind, see adhoc_query_kinds). Never put "
+    "promql, pod_logs, logql, or deployment_history in queries: use the "
+    "corresponding collector probe instead. When the alert names a pod, "
+    "request that named pod before broad project/namespace reads: it is "
+    "automatically promoted to full YAML + describe/events evidence. "
+    "If adhoc_results or query_feedback reports "
+    "retryable_by_query_change=true, change the resource kind, target-bound "
+    "name, or selector in the next bounded round; never repeat the exact "
+    "failed "
+    "query. Failure feedback is control metadata, not evidence. Authorization, "
+    "TLS, datasource, and transport failures cannot be repaired by query "
+    "changes. Batch all independent discriminating queries for this step "
+    "instead of spending another "
+    "reasoning round on each query. Conclude once evidence is sufficient. "
+    "For new_hypotheses, set discriminator to the collector name (see "
+    "available_collectors) or adhoc_query_kind that could test it; omit it "
+    "only if nothing here can test it. Never spend a probe or query on a "
+    "ledger entry that already shows untestable_reason. "
+    "Respond with ONLY JSON: "
+    '{"action":"probe"|"conclude","reason":str,'
+    '"selected_hypothesis":str,'
+    '"probes":[{"collector":str,'
+    '"scope":{"namespace"?,"pod"?,"node"?,"workload"?},'
+    '"hypothesis_ids":[str]}],'
+    '"queries":[{"kind":str,"namespace"?,"name"?,"label_selector"?}],'
+    '"hypothesis_updates":[{"id":str,"confidence":number,'
+    '"mechanism":str,"expected_observations":[str],"falsifiers":[str],'
+    '"next_discriminating_test":str,"evidence_for":[str],'
+    '"evidence_against":[str],'
+    '"status":"open|testing|supported|refuted|uncertain"}],'
+    '"new_hypotheses":[{"family"?:str,"statement":str,"mechanism":str,'
+    '"expected_observations":[str],"falsifiers":[str],'
+    '"next_discriminating_test":str,"discriminator"?:str}]}'
+)
+
+_VERIFICATION_SYSTEM_PROMPT = (
+    "You are verifying a hypothesis introduced or changed during RCA "
+    "reflection. Do not promote a conclusion from reasoning alone. Select "
+    "the strongest read-only falsifier or discriminator, probe it, and "
+    "cite F- observation IDs. "
+    "When query feedback says retryable_by_query_change=true, correct the "
+    "kind/name/selector instead of repeating the failed query. Treat "
+    "failure "
+    "feedback as control metadata, never evidence. "
+    "Respond with ONLY JSON: "
+    '{"action":"probe"|"conclude","probes":[{"collector":str,"scope":{}}],'
+    '"queries":[{"kind":str,"namespace"?:str,"name"?:str,"label_selector"?:str}],'
+    '"hypothesis_updates":[{"id":str,"confidence":number,"evidence_for":[str],'
+    '"evidence_against":[str],"status":"open|testing|supported|refuted|uncertain"}]}'
+)
+
+
+@dataclass
+class _Investigation:
+    """The working set every investigation phase reads and mutates.
+
+    The phases below (decision rounds, reflection rounds, final gather) all
+    advance the same ledger/evidence/dedupe state, so it lives here instead of
+    as two dozen locals threaded through one very long function. Keeping it in
+    one object is also what lets the decision and verification rounds share
+    ``resolve_probes``/``resolve_queries``/``run_queries`` rather than carry two
+    copies of the same probe- and query-dispatch code.
+    """
+
+    settings: Settings
+    target: object
+    plan: InvestigationPlan | None
+    kg_context: dict
+    by_name: dict[str, Any]
+    max_steps: int
+    reporter: ProgressReporter | None
+    blackboard: Any
+    deadline_monotonic: float | None
+    query_memory: QueryMemory | None
+    evidence: dict[str, CollectorResult]
+    latest_probe_scopes: dict[str, dict[str, Any]]
+    ledger: list[dict[str, Any]]
+    seen_probes: set[str]
+    seen_queries: set[str] = field(default_factory=set)
+    failed_queries: set[str] = field(default_factory=set)
     # Validation/duplicate feedback is deliberately separate from ``adhoc``:
     # rejected queries were never observations and must not become artifacts.
-    query_feedback: list[dict[str, Any]] = []
+    query_feedback: list[dict[str, Any]] = field(default_factory=list)
+    investigation_steps: list[dict[str, Any]] = field(default_factory=list)
+    adhoc: list[dict] = field(default_factory=list)
 
-    async def run_probe(name: str, scope: dict) -> None:
-        collector = by_name.get(name)
+    @classmethod
+    def start(
+        cls,
+        settings: Settings,
+        target: object,
+        collectors: list,
+        plan: InvestigationPlan | None,
+        kg_context: dict,
+        max_steps: int,
+        *,
+        reporter: ProgressReporter | None,
+        blackboard: Any,
+        deadline_monotonic: float | None,
+        initial_evidence: list[CollectorResult] | None,
+        query_memory: QueryMemory | None,
+    ) -> _Investigation:
+        by_name = {_collector_name(c): c for c in collectors}
+        # Re-analysis must continue from the observations already collected in
+        # this analysis run.  Starting every pass with an empty mapping caused
+        # the full Kubernetes collector (Pod, Events and Node conditions) to run
+        # again up to MAX_REANALYSIS_STEPS times.  Clone the envelopes because
+        # ad-hoc artifacts are appended below and the caller owns its existing
+        # result list.
+        evidence: dict[str, CollectorResult] = {
+            item.agent: replace(
+                item,
+                details=dict(item.details),
+                missing_data=list(item.missing_data),
+                warnings=list(item.warnings),
+                artifacts=list(item.artifacts),
+            )
+            for item in (initial_evidence or [])
+            if item.agent in by_name
+        }
+        latest_probe_scopes: dict[str, dict[str, Any]] = {
+            name: _effective_probe_scope(target, plan, {})
+            for name, item in evidence.items()
+            # Partial means this exact collector scope already executed and kept
+            # every usable sub-result. Replaying the full scope repeats those
+            # reads (often Pod/Events/Node) and was the source of three
+            # identical passes. Failed gaps remain visible in
+            # missing_data/query receipts and must be retried through a
+            # changed/narrower scope or domain query, not by scraping the
+            # identical collector scope again.
+            if item.status in {"ok", "partial"}
+        }
+        state = cls(
+            settings=settings,
+            target=target,
+            plan=plan,
+            kg_context=kg_context,
+            by_name=by_name,
+            max_steps=max_steps,
+            reporter=reporter,
+            blackboard=blackboard,
+            deadline_monotonic=deadline_monotonic,
+            query_memory=query_memory,
+            evidence=evidence,
+            latest_probe_scopes=latest_probe_scopes,
+            ledger=_initial_ledger(plan),
+            seen_probes={
+                _probe_fingerprint(name, target, plan, scope)
+                for name, scope in latest_probe_scopes.items()
+            },
+        )
+        for item in evidence.values():
+            _remember_kubernetes_queries(state.seen_queries, item, target, plan)
+            if query_memory is not None:
+                query_memory.seed_result(item, target)
+        if query_memory is not None:
+            for name, scope in latest_probe_scopes.items():
+                query_memory.remember(collector_probe_key(name, target, scope))
+        return state
+
+    # --- shared state helpers -------------------------------------------------
+
+    @property
+    def all_names(self) -> set[str]:
+        return set(self.by_name)
+
+    @property
+    def round_limit(self) -> int:
+        # Bound LLM decision rounds while allowing every round to batch many
+        # independent read-only queries. Older zero-valued callers use 3.
+        return self.max_steps if self.max_steps > 0 else 3
+
+    def sufficiency(self) -> dict[str, Any]:
+        return _evidence_sufficiency(self.ledger, self.evidence, self.blackboard, self.target)
+
+    def is_sufficient(self) -> bool:
+        return bool(self.sufficiency()["sufficient"])
+
+    def budget_remaining(self) -> float | None:
+        return _budget_remaining(self.deadline_monotonic)
+
+    def out_of_budget(self) -> bool:
+        remaining = self.budget_remaining()
+        return remaining is not None and remaining <= 0
+
+    def apply_updates(self, updates: object) -> None:
+        self.ledger = _apply_ledger_updates(
+            self.ledger,
+            updates,
+            blackboard=self.blackboard,
+            artifacts=[item for result in self.evidence.values() for item in result.artifacts],
+            eligible_support_ids=_eligible_support_ids(self.blackboard, self.target),
+        )
+
+    def user_prompt(self) -> str:
+        return _investigator_masker(self.settings).mask_text(
+            _build_user_prompt(
+                self.plan,
+                self.kg_context,
+                self.evidence,
+                self.by_name,
+                self.ledger,
+                self.adhoc,
+                query_feedback=self.query_feedback,
+                blackboard=self.blackboard,
+            )
+        )
+
+    # --- probe and query dispatch (shared by both LLM round loops) ------------
+
+    async def run_probe(self, name: str, scope: dict) -> None:
+        collector = self.by_name.get(name)
         if collector is None:
             return
-        probe_key = collector_probe_key(name, target, scope)
-        if query_memory is not None and not query_memory.claim(probe_key):
+        probe_key = collector_probe_key(name, self.target, scope)
+        if self.query_memory is not None and not self.query_memory.claim(probe_key):
             return
-        if reporter:
-            reporter.emit(
+        if self.reporter:
+            self.reporter.emit(
                 "investigation",
                 f"Probing {name}",
                 collector=name,
                 scope=scope,
-                hypothesis_ledger=_ledger_summary(ledger),
+                hypothesis_ledger=_ledger_summary(self.ledger),
             )
         result = await _within_budget(
-            deadline_monotonic,
-            lambda: _collect_safely(collector, target, _scoped_plan(plan, scope)),
+            self.deadline_monotonic,
+            lambda: _collect_safely(collector, self.target, _scoped_plan(self.plan, scope)),
         )
-        evidence[name] = _merge_collector_results(
-            evidence.get(name),
+        self.evidence[name] = _merge_collector_results(
+            self.evidence.get(name),
             result,
-            previous_scope=latest_probe_scopes.get(name),
+            previous_scope=self.latest_probe_scopes.get(name),
             current_scope=scope,
         )
-        latest_probe_scopes[name] = dict(scope)
-        _remember_kubernetes_queries(seen_queries, result, target, plan)
-        if query_memory is not None:
-            query_memory.complete(
-                probe_key, succeeded=result.status in {"ok", "partial"}
-            )
-            query_memory.seed_result(result, target)
-        _record_blackboard(blackboard, name, result, target)
-        if reporter:
-            reporter.emit(
+        self.latest_probe_scopes[name] = dict(scope)
+        _remember_kubernetes_queries(self.seen_queries, result, self.target, self.plan)
+        if self.query_memory is not None:
+            self.query_memory.complete(probe_key, succeeded=result.status in {"ok", "partial"})
+            self.query_memory.seed_result(result, self.target)
+        _record_blackboard(self.blackboard, name, result, self.target)
+        if self.reporter:
+            self.reporter.emit(
                 "investigation",
                 f"{name} evidence collected",
                 collector=name,
                 status=result.status,
                 summary=(result.summary or "")[:300],
-                hypothesis_ledger=_ledger_summary(ledger),
+                hypothesis_ledger=_ledger_summary(self.ledger),
             )
 
-    adhoc: list[dict] = []
-    try:
+    async def run_probes(self, fresh: list[dict]) -> None:
+        await _within_budget(
+            self.deadline_monotonic,
+            lambda fresh=fresh: asyncio.gather(
+                *(self.run_probe(p["collector"], p.get("scope") or {}) for p in fresh)
+            ),
+        )
+
+    def resolve_probes(
+        self, probes: object, *, step: int | None = None, selected_hypothesis: str = ""
+    ) -> list[dict]:
+        """Accepted, not-yet-seen probes for this round, strongest first."""
+        fresh: list[dict] = []
+        for probe in probes if isinstance(probes, list) else []:
+            resolved = _resolve_probe(
+                probe,
+                self.all_names,
+                query_feedback=self.query_feedback,
+                reporter=self.reporter,
+                step=step,
+            )
+            if resolved is None:
+                continue
+            fingerprint = _probe_fingerprint(
+                str(resolved.get("collector") or ""),
+                self.target,
+                self.plan,
+                resolved.get("scope") or {},
+            )
+            if fingerprint in self.seen_probes:
+                continue
+            self.seen_probes.add(fingerprint)
+            fresh.append(resolved)
+        return _prioritize_probes(
+            fresh,
+            evidence=self.evidence,
+            ledger=self.ledger,
+            plan=self.plan,
+            selected_hypothesis=selected_hypothesis,
+        )
+
+    def add_fallback_probe(self, fresh: list[dict], selected_hypothesis: str) -> None:
+        fallback = _fallback_probe(
+            self.all_names,
+            evidence=self.evidence,
+            ledger=self.ledger,
+            plan=self.plan,
+            selected_hypothesis=selected_hypothesis,
+        )
+        if fallback is not None:
+            self.seen_probes.add(
+                _probe_fingerprint(
+                    str(fallback["collector"]), self.target, self.plan, fallback["scope"]
+                )
+            )
+            fresh.append(fallback)
+
+    def resolve_queries(
+        self, queries: object, *, step: int | None = None
+    ) -> tuple[list[dict], bool]:
+        """Accepted ad-hoc queries, plus whether a rejection is worth retrying."""
+        wanted: list[dict] = []
+        retryable_rejection = False
+        for query in queries if isinstance(queries, list) else []:
+            accepted, retryable = _resolve_adhoc_query(
+                query,
+                seen_queries=self.seen_queries,
+                failed_queries=self.failed_queries,
+                query_feedback=self.query_feedback,
+                reporter=self.reporter,
+                step=step,
+            )
+            retryable_rejection = retryable_rejection or retryable
+            if not accepted:
+                continue
+            shared_key = domain_query_key(
+                "kubernetes", {"tool": "k8s_read", "args": query}, self.target
+            )
+            if self.query_memory is not None and not self.query_memory.claim(shared_key):
+                continue
+            self.seen_queries.add(_adhoc_query_fingerprint(query))
+            wanted.append(query)
+        return wanted, retryable_rejection
+
+    async def run_queries(self, wanted: list[dict]) -> None:
+        query_results = await _within_budget(
+            self.deadline_monotonic,
+            lambda wanted=wanted: asyncio.gather(
+                *(
+                    _run_adhoc_kubernetes_query(
+                        self.settings,
+                        query,
+                        time_range=_incident_window_for_target(self.target),
+                    )
+                    for query in wanted
+                )
+            ),
+        )
+        self.adhoc.extend(query_results)
+        for query, item in zip(wanted, query_results, strict=True):
+            if self.query_memory is not None:
+                self.query_memory.complete(
+                    domain_query_key(
+                        "kubernetes", {"tool": "k8s_read", "args": query}, self.target
+                    ),
+                    succeeded=not bool(item.get("error")),
+                )
+            if item.get("error"):
+                self.failed_queries.add(_adhoc_query_fingerprint(query))
+
+    # --- phase 1: bounded LLM decision rounds ---------------------------------
+
+    async def decision_rounds(self) -> None:
         # A target-less request is a cluster investigation, not a request to
         # skip collection.  Get every evidence plane's bounded discovery view
         # first; only pod/name-dependent probes remain unavailable until that
         # evidence identifies an entity for a narrower follow-up.
-        if _is_cluster_wide_target(target) and not evidence:
-            await asyncio.gather(*(run_probe(name, {}) for name in by_name))
+        if _is_cluster_wide_target(self.target) and not self.evidence:
+            await asyncio.gather(*(self.run_probe(name, {}) for name in self.by_name))
         ran_queries_last_step = False
         step = 0
-        # Bound LLM decision rounds while allowing every round to batch many
-        # independent read-only queries. Older zero-valued callers use 3.
-        decision_round_limit = max_steps if max_steps > 0 else 3
-        while step < decision_round_limit:
-            remaining_budget = _budget_remaining(deadline_monotonic)
-            if remaining_budget is not None and remaining_budget <= 0:
+        while step < self.round_limit:
+            if self.out_of_budget():
                 break
             step += 1
-            if not ran_queries_last_step and _evidence_sufficiency(
-                ledger, evidence, blackboard, target
-            )["sufficient"]:
+            if not ran_queries_last_step and self.is_sufficient():
                 break  # scoped evidence already grounds a supported hypothesis
-            if reporter:
-                reporter.emit(
+            if self.reporter:
+                self.reporter.emit(
                     "investigation",
                     "Choosing next diagnostic step",
                     step=step,
-                    hypothesis_ledger=_ledger_summary(ledger),
+                    hypothesis_ledger=_ledger_summary(self.ledger),
                 )
             decision = await _within_budget(
-                deadline_monotonic,
-                lambda ledger=ledger: complete_json(
-                    settings,
-                    system=(
-                        "You are a senior SRE investigating a Run:ai GPU-platform alert. "
-                        "Given the plan, hypothesis ledger, evidence so far, and available "
-                        "collectors, decide the next diagnostic step. Pick the hypothesis "
-                        "you are testing and probe collectors most likely to confirm/refute it. "
-                        "The compact ledger omits seed defaults: missing status means open, "
-                        "missing confidence means 0.5, and a missing mechanism means it is "
-                        "identical to statement. "
-                        "Use plan.diagnostic_directive as neutral ontology guidance: "
-                        "follow its checks and disconfirmations, but never treat its "
-                        "provisional_family as observed evidence. Update confidence using "
-                        "only observed evidence. A condition name alone is metadata; verify "
-                        "its status/value and treat False or a zero sample as refutation. "
-                        "Cite shared_observations evidence_id "
-                        "values (F-...) in evidence_for/evidence_against; do not invent IDs. "
-                        "When diagnostic_directive.probes names a tool you can reach through "
-                        "a collector, use it as a discriminator and honor its supports_when/"
-                        "refutes_when conditions. You can ALSO "
-                        "run kubectl-style READ-ONLY Kubernetes resource queries only "
-                        "(get/list of an allowlisted kind, see adhoc_query_kinds). Never put "
-                        "promql, pod_logs, logql, or deployment_history in queries: use the "
-                        "corresponding collector probe instead. When the alert names a pod, "
-                        "request that named pod before broad project/namespace reads: it is "
-                        "automatically promoted to full YAML + describe/events evidence. "
-                        "If adhoc_results or query_feedback reports "
-                        "retryable_by_query_change=true, change the resource kind, target-bound "
-                        "name, or selector in the next bounded round; never repeat the exact "
-                        "failed "
-                        "query. Failure feedback is control metadata, not evidence. Authorization, "
-                        "TLS, datasource, and transport failures cannot be repaired by query "
-                        "changes. Batch all independent discriminating queries for this step "
-                        "instead of spending another "
-                        "reasoning round on each query. Conclude once evidence is sufficient. "
-                        "For new_hypotheses, set discriminator to the collector name (see "
-                        "available_collectors) or adhoc_query_kind that could test it; omit it "
-                        "only if nothing here can test it. Never spend a probe or query on a "
-                        "ledger entry that already shows untestable_reason. "
-                        "Respond with ONLY JSON: "
-                        '{"action":"probe"|"conclude","reason":str,'
-                        '"selected_hypothesis":str,'
-                        '"probes":[{"collector":str,'
-                        '"scope":{"namespace"?,"pod"?,"node"?,"workload"?},'
-                        '"hypothesis_ids":[str]}],'
-                        '"queries":[{"kind":str,"namespace"?,"name"?,"label_selector"?}],'
-                        '"hypothesis_updates":[{"id":str,"confidence":number,'
-                        '"mechanism":str,"expected_observations":[str],"falsifiers":[str],'
-                        '"next_discriminating_test":str,"evidence_for":[str],'
-                        '"evidence_against":[str],'
-                        '"status":"open|testing|supported|refuted|uncertain"}],'
-                        '"new_hypotheses":[{"family"?:str,"statement":str,"mechanism":str,'
-                        '"expected_observations":[str],"falsifiers":[str],'
-                        '"next_discriminating_test":str,"discriminator"?:str}]}'
-                    ),
-                    user=_investigator_masker(settings).mask_text(
-                        _build_user_prompt(
-                            plan,
-                            kg_context,
-                            evidence,
-                            by_name,
-                            ledger,
-                            adhoc,
-                            query_feedback=query_feedback,
-                            blackboard=blackboard,
-                        )
-                    ),
-                    model=settings.llm_model_investigation,
+                self.deadline_monotonic,
+                lambda: complete_json(
+                    self.settings,
+                    system=_DECISION_SYSTEM_PROMPT,
+                    user=self.user_prompt(),
+                    model=self.settings.llm_model_investigation,
                 ),
             )
             if not isinstance(decision, dict):
                 break  # unusable response -> fall through to full gather
-            eligible_support_ids = _eligible_support_ids(blackboard, target)
-            ledger = _apply_ledger_updates(
-                ledger,
-                decision.get("hypothesis_updates"),
-                blackboard=blackboard,
-                artifacts=[item for result in evidence.values() for item in result.artifacts],
-                eligible_support_ids=eligible_support_ids,
+            self.apply_updates(decision.get("hypothesis_updates"))
+            self.ledger = _add_reflected_hypotheses(
+                self.ledger, decision.get("new_hypotheses"), self.all_names
             )
-            ledger = _add_reflected_hypotheses(ledger, decision.get("new_hypotheses"), all_names)
-            investigation_steps.append(
+            self.investigation_steps.append(
                 {
                     "step": step,
                     "action": str(decision.get("action") or ""),
@@ -1345,8 +1548,8 @@ async def investigate(
                     "selected_hypothesis": str(decision.get("selected_hypothesis") or ""),
                 }
             )
-            if reporter:
-                reporter.emit(
+            if self.reporter:
+                self.reporter.emit(
                     "investigation",
                     str(decision.get("reason") or "Diagnostic step selected")[:300],
                     step=step,
@@ -1355,371 +1558,149 @@ async def investigate(
                     probes=decision.get("probes"),
                     queries=decision.get("queries"),
                     hypothesis_updates=decision.get("hypothesis_updates"),
-                    hypothesis_ledger=_ledger_summary(ledger),
+                    hypothesis_ledger=_ledger_summary(self.ledger),
                 )
             unverified_conclusion = (
-                decision.get("action") == "conclude"
-                and not _evidence_sufficiency(
-                    ledger, evidence, blackboard, target
-                )["sufficient"]
+                decision.get("action") == "conclude" and not self.is_sufficient()
             )
             if decision.get("action") == "conclude" and not unverified_conclusion:
                 break
             selected_hypothesis = str(decision.get("selected_hypothesis") or "")
-            probes = decision.get("probes")
-            queries = decision.get("queries")
-            retryable_query_rejection = False
-            fresh = []
-            for probe in probes if isinstance(probes, list) else []:
-                resolved = _resolve_probe(
-                    probe,
-                    all_names,
-                    query_feedback=query_feedback,
-                    reporter=reporter,
-                    step=step,
-                )
-                if resolved is None:
-                    continue
-                fingerprint = _probe_fingerprint(
-                    str(resolved.get("collector") or ""),
-                    target,
-                    plan,
-                    resolved.get("scope") or {},
-                )
-                if fingerprint in seen_probes:
-                    continue
-                seen_probes.add(fingerprint)
-                fresh.append(resolved)
-            fresh = _prioritize_probes(
-                fresh,
-                evidence=evidence,
-                ledger=ledger,
-                plan=plan,
-                selected_hypothesis=selected_hypothesis,
+            fresh = self.resolve_probes(
+                decision.get("probes"), step=step, selected_hypothesis=selected_hypothesis
             )
-            wanted = []
-            for query in queries if isinstance(queries, list) else []:
-                accepted, retryable = _resolve_adhoc_query(
-                    query,
-                    seen_queries=seen_queries,
-                    failed_queries=failed_queries,
-                    query_feedback=query_feedback,
-                    reporter=reporter,
-                    step=step,
-                )
-                retryable_query_rejection = retryable_query_rejection or retryable
-                if not accepted:
-                    continue
-                shared_key = domain_query_key(
-                    "kubernetes", {"tool": "k8s_read", "args": query}, target
-                )
-                if query_memory is not None and not query_memory.claim(shared_key):
-                    continue
-                seen_queries.add(_adhoc_query_fingerprint(query))
-                wanted.append(query)
+            wanted, retryable_query_rejection = self.resolve_queries(
+                decision.get("queries"), step=step
+            )
             if unverified_conclusion and not fresh and not wanted:
                 # Never let a model conclude from its initial, evidence-free
                 # prompt. Run the strongest remaining discriminator, then let
                 # the next bounded round decide whether its scoped observation
                 # is sufficient. Launching every collector here defeated the
                 # adaptive loop and caused avoidable duplicate evidence work.
-                fallback = _fallback_probe(
-                    all_names,
-                    evidence=evidence,
-                    ledger=ledger,
-                    plan=plan,
-                    selected_hypothesis=selected_hypothesis,
-                )
-                if fallback is not None:
-                    fingerprint = _probe_fingerprint(
-                        str(fallback["collector"]), target, plan, fallback["scope"]
-                    )
-                    seen_probes.add(fingerprint)
-                    fresh.append(fallback)
+                self.add_fallback_probe(fresh, selected_hypothesis)
             if not fresh and not wanted and decision.get("action") == "probe":
-                fallback = _fallback_probe(
-                    all_names,
-                    evidence=evidence,
-                    ledger=ledger,
-                    plan=plan,
-                    selected_hypothesis=selected_hypothesis,
-                )
-                if fallback is not None:
-                    fingerprint = _probe_fingerprint(
-                        str(fallback["collector"]), target, plan, fallback["scope"]
-                    )
-                    seen_probes.add(fingerprint)
-                    fresh.append(fallback)
+                self.add_fallback_probe(fresh, selected_hypothesis)
             if not fresh and not wanted:
-                if retryable_query_rejection and step < decision_round_limit:
+                if retryable_query_rejection and step < self.round_limit:
                     # The rejected/duplicate request is not evidence. Give the
                     # LLM one of its remaining bounded rounds to change the
                     # kind/name/selector instead of silently ending the loop.
                     continue
-                if unverified_conclusion and step < decision_round_limit:
+                if unverified_conclusion and step < self.round_limit:
                     # Keep the remaining bounded rounds available for the
                     # model to reconsider the newly collected base evidence.
                     continue
                 break
             if fresh:
-                await _within_budget(
-                    deadline_monotonic,
-                    lambda fresh=fresh: asyncio.gather(
-                        *(run_probe(p["collector"], p.get("scope") or {}) for p in fresh)
-                    ),
-                )
-            for q in wanted:
-                if reporter:
-                    reporter.emit(
+                await self.run_probes(fresh)
+            for query in wanted:
+                if self.reporter:
+                    self.reporter.emit(
                         "investigation",
-                        f"Running {_adhoc_query_repr(q)}",
+                        f"Running {_adhoc_query_repr(query)}",
                         step=step,
-                        query=_adhoc_query_repr(q),
+                        query=_adhoc_query_repr(query),
                     )
             if wanted:
-                query_results = await _within_budget(
-                    deadline_monotonic,
-                    lambda wanted=wanted: asyncio.gather(
-                        *(
-                            _run_adhoc_kubernetes_query(
-                                settings,
-                                q,
-                                time_range=_incident_window_for_target(target),
-                            )
-                            for q in wanted
-                        )
-                    ),
-                )
-                adhoc.extend(query_results)
-                for query, item in zip(wanted, query_results, strict=True):
-                    if query_memory is not None:
-                        query_memory.complete(
-                            domain_query_key(
-                                "kubernetes", {"tool": "k8s_read", "args": query}, target
-                            ),
-                            succeeded=not bool(item.get("error")),
-                        )
-                    if item.get("error"):
-                        failed_queries.add(_adhoc_query_fingerprint(query))
+                await self.run_queries(wanted)
             ran_queries_last_step = bool(wanted)
             # A bounded investigation may finish early only when the ledger
             # cites an actual scoped fact. Model prose or partial observations
             # must consume the remaining (at most three) reasoning rounds.
-            if _evidence_sufficiency(
-                ledger, evidence, blackboard, target
-            )["sufficient"]:
+            if self.is_sufficient():
                 break
-    except Exception:  # noqa: BLE001 - never raise into analyze; keep whatever we have
-        pass
 
-    try:
-        before_reflection = _ledger_fingerprint(ledger)
-        reflection_budget = _budget_remaining(deadline_monotonic)
-        supported_before_reflection = _evidence_sufficiency(
-            ledger, evidence, blackboard, target
-        )["sufficient"]
-        if not supported_before_reflection and (
-            reflection_budget is None or reflection_budget > 0
-        ):
-            ledger = await _within_budget(
-                deadline_monotonic,
-                lambda ledger=ledger: _reflect_hypotheses(
-                    settings,
-                    plan,
-                    kg_context,
-                    evidence,
-                    by_name,
+    # --- phase 2: reflection, then verification of what it changed ------------
+
+    async def reflection_rounds(self) -> None:
+        before_reflection = _ledger_fingerprint(self.ledger)
+        reflection_budget = self.budget_remaining()
+        if not self.is_sufficient() and (reflection_budget is None or reflection_budget > 0):
+            self.ledger = await _within_budget(
+                self.deadline_monotonic,
+                lambda ledger=self.ledger: _reflect_hypotheses(
+                    self.settings,
+                    self.plan,
+                    self.kg_context,
+                    self.evidence,
+                    self.by_name,
                     ledger,
-                    adhoc,
-                    query_feedback=query_feedback,
-                    blackboard=blackboard,
-                    target=target,
+                    self.adhoc,
+                    query_feedback=self.query_feedback,
+                    blackboard=self.blackboard,
+                    target=self.target,
                 ),
             )
-        if _ledger_fingerprint(ledger) != before_reflection:
-            # A reflection is useful only if its new/changed hypothesis is put
-            # back through a discriminating read-only probe. Keep this phase
-            # bounded too: otherwise a model returning endless distinct reads
-            # can consume the entire shared evidence budget before synthesis.
-            verification_round = 0
-            verification_round_limit = max_steps if max_steps > 0 else 3
-            while verification_round < verification_round_limit:
-                remaining_budget = _budget_remaining(deadline_monotonic)
-                if remaining_budget is not None and remaining_budget <= 0:
-                    break
-                verification_round += 1
-                verification = await _within_budget(
-                    deadline_monotonic,
-                    lambda ledger=ledger: complete_json(
-                        settings,
-                        system=(
-                            "You are verifying a hypothesis introduced or changed during RCA "
-                            "reflection. Do not promote a conclusion from reasoning alone. Select "
-                            "the strongest read-only falsifier or discriminator, probe it, and "
-                            "cite F- observation IDs. "
-                            "When query feedback says retryable_by_query_change=true, correct the "
-                            "kind/name/selector instead of repeating the failed query. Treat "
-                            "failure "
-                            "feedback as control metadata, never evidence. "
-                            "Respond with ONLY JSON: "
-                            '{"action":"probe"|"conclude","probes":[{"collector":str,"scope":{}}],'
-                            '"queries":[{"kind":str,"namespace"?:str,"name"?:str,"label_selector"?:str}],'
-                            '"hypothesis_updates":[{"id":str,"confidence":number,"evidence_for":[str],'
-                            '"evidence_against":[str],"status":"open|testing|supported|refuted|uncertain"}]}'
-                        ),
-                        user=_investigator_masker(settings).mask_text(
-                            _build_user_prompt(
-                                plan,
-                                kg_context,
-                                evidence,
-                                by_name,
-                                ledger,
-                                adhoc,
-                                query_feedback=query_feedback,
-                                blackboard=blackboard,
-                            )
-                        ),
-                        model=settings.llm_model_investigation,
-                    ),
-                )
-                if not isinstance(verification, dict):
-                    break
-                ledger = _apply_ledger_updates(
-                    ledger,
-                    verification.get("hypothesis_updates"),
-                    blackboard=blackboard,
-                    artifacts=[item for result in evidence.values() for item in result.artifacts],
-                    eligible_support_ids=_eligible_support_ids(blackboard, target),
-                )
-                if _evidence_sufficiency(
-                    ledger, evidence, blackboard, target
-                )["sufficient"]:
-                    break
-                if verification.get("action") == "conclude":
-                    break
-                retryable_query_rejection = False
-                fresh = []
-                for probe in verification.get("probes") or []:
-                    resolved = _resolve_probe(
-                        probe,
-                        all_names,
-                        query_feedback=query_feedback,
-                        reporter=reporter,
-                    )
-                    if resolved is None:
-                        continue
-                    fingerprint = _probe_fingerprint(
-                        str(resolved.get("collector") or ""),
-                        target,
-                        plan,
-                        resolved.get("scope") or {},
-                    )
-                    if fingerprint not in seen_probes:
-                        seen_probes.add(fingerprint)
-                        fresh.append(resolved)
-                fresh = _prioritize_probes(
-                    fresh,
-                    evidence=evidence,
-                    ledger=ledger,
-                    plan=plan,
-                )
-                wanted = []
-                for query in verification.get("queries") or []:
-                    accepted, retryable = _resolve_adhoc_query(
-                        query,
-                        seen_queries=seen_queries,
-                        failed_queries=failed_queries,
-                        query_feedback=query_feedback,
-                        reporter=reporter,
-                    )
-                    retryable_query_rejection = retryable_query_rejection or retryable
-                    if not accepted:
-                        continue
-                    shared_key = domain_query_key(
-                        "kubernetes", {"tool": "k8s_read", "args": query}, target
-                    )
-                    if query_memory is not None and not query_memory.claim(shared_key):
-                        continue
-                    seen_queries.add(_adhoc_query_fingerprint(query))
-                    wanted.append(query)
-                if not fresh and not wanted:
-                    if (
-                        retryable_query_rejection
-                        and verification_round < verification_round_limit
-                    ):
-                        continue
-                    break
-                if fresh:
-                    await _within_budget(
-                        deadline_monotonic,
-                        lambda fresh=fresh: asyncio.gather(
-                            *(
-                                run_probe(probe["collector"], probe.get("scope") or {})
-                                for probe in fresh
-                            )
-                        ),
-                    )
-                if wanted:
-                    query_results = await _within_budget(
-                        deadline_monotonic,
-                        lambda wanted=wanted: asyncio.gather(
-                            *(
-                                _run_adhoc_kubernetes_query(
-                                    settings,
-                                    query,
-                                    time_range=_incident_window_for_target(target),
-                                )
-                                for query in wanted
-                            )
-                        ),
-                    )
-                    adhoc.extend(query_results)
-                    for query, item in zip(wanted, query_results, strict=True):
-                        if query_memory is not None:
-                            query_memory.complete(
-                                domain_query_key(
-                                    "kubernetes",
-                                    {"tool": "k8s_read", "args": query},
-                                    target,
-                                ),
-                                succeeded=not bool(item.get("error")),
-                            )
-                        if item.get("error"):
-                            failed_queries.add(_adhoc_query_fingerprint(query))
-                if _evidence_sufficiency(
-                    ledger, evidence, blackboard, target
-                )["sufficient"]:
-                    break
-        if reporter:
-            reporter.emit(
+        if _ledger_fingerprint(self.ledger) != before_reflection:
+            await self._verification_rounds()
+        if self.reporter:
+            self.reporter.emit(
                 "reflection",
                 "Checked for missing or contradictory hypotheses",
-                hypothesis_ledger=_ledger_summary(ledger),
+                hypothesis_ledger=_ledger_summary(self.ledger),
             )
-    except Exception:  # noqa: BLE001 - reflection is best-effort
-        pass
 
-    # A supported hypothesis citing a scoped positive fact is a real terminal
-    # condition: ranking/synthesis can consume a subset and must not force every
-    # unrelated evidence plane to run. Without that proof, retain the safe full
-    # gather fallback so transport/LLM failures do not yield an empty RCA.
-    sufficiency = _evidence_sufficiency(ledger, evidence, blackboard, target)
-    evidence_sufficient = bool(sufficiency["sufficient"])
-    remaining = (
-        [] if evidence_sufficient else [name for name in by_name if name not in evidence]
-    )
-    if remaining:
-        if query_memory is not None:
+    async def _verification_rounds(self) -> None:
+        # A reflection is useful only if its new/changed hypothesis is put back
+        # through a discriminating read-only probe. Keep this phase bounded too:
+        # otherwise a model returning endless distinct reads can consume the
+        # entire shared evidence budget before synthesis.
+        verification_round = 0
+        while verification_round < self.round_limit:
+            if self.out_of_budget():
+                break
+            verification_round += 1
+            verification = await _within_budget(
+                self.deadline_monotonic,
+                lambda: complete_json(
+                    self.settings,
+                    system=_VERIFICATION_SYSTEM_PROMPT,
+                    user=self.user_prompt(),
+                    model=self.settings.llm_model_investigation,
+                ),
+            )
+            if not isinstance(verification, dict):
+                break
+            self.apply_updates(verification.get("hypothesis_updates"))
+            if self.is_sufficient():
+                break
+            if verification.get("action") == "conclude":
+                break
+            fresh = self.resolve_probes(verification.get("probes"))
+            wanted, retryable_query_rejection = self.resolve_queries(verification.get("queries"))
+            if not fresh and not wanted:
+                if retryable_query_rejection and verification_round < self.round_limit:
+                    continue
+                break
+            if fresh:
+                await self.run_probes(fresh)
+            if wanted:
+                await self.run_queries(wanted)
+            if self.is_sufficient():
+                break
+
+    # --- phase 3: safe full gather, then the typed-core floor -----------------
+
+    async def final_gather(self, *, evidence_sufficient: bool) -> None:
+        remaining = (
+            []
+            if evidence_sufficient
+            else [name for name in self.by_name if name not in self.evidence]
+        )
+        if not remaining:
+            return
+        if self.query_memory is not None:
             remaining = [
                 name
                 for name in remaining
-                if query_memory.claim(collector_probe_key(name, target, {}))
+                if self.query_memory.claim(collector_probe_key(name, self.target, {}))
             ]
         tasks = {
-            asyncio.create_task(_collect_safely(by_name[name], target, plan)): name
+            asyncio.create_task(_collect_safely(self.by_name[name], self.target, self.plan)): name
             for name in remaining
         }
-        budget = _budget_remaining(deadline_monotonic)
+        budget = self.budget_remaining()
         timeout = None if budget is None else max(0.0, budget)
         done, pending = await asyncio.wait(tasks, timeout=timeout)
         for task in done:
@@ -1734,23 +1715,25 @@ async def investigate(
                     missing_data=[f"{name}.collector_exception"],
                     warnings=[f"{name} failed unexpectedly: {type(exc).__name__}"],
                 )
-            evidence[name] = _merge_collector_results(evidence.get(name), result)
-            if query_memory is not None:
-                query_memory.complete(
-                    collector_probe_key(name, target, {}),
+            self.evidence[name] = _merge_collector_results(self.evidence.get(name), result)
+            if self.query_memory is not None:
+                self.query_memory.complete(
+                    collector_probe_key(name, self.target, {}),
                     succeeded=result.status in {"ok", "partial"},
                 )
-                query_memory.seed_result(result, target)
-            _record_blackboard(blackboard, name, result, target)
+                self.query_memory.seed_result(result, self.target)
+            _record_blackboard(self.blackboard, name, result, self.target)
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         for task in pending:
             name = tasks[task]
-            if query_memory is not None:
-                query_memory.complete(collector_probe_key(name, target, {}), succeeded=False)
-            evidence[name] = CollectorResult(
+            if self.query_memory is not None:
+                self.query_memory.complete(
+                    collector_probe_key(name, self.target, {}), succeeded=False
+                )
+            self.evidence[name] = CollectorResult(
                 agent=name,
                 status="unavailable",
                 summary=f"{name} collector skipped when the shared evidence budget expired.",
@@ -1758,133 +1741,188 @@ async def investigate(
                 warnings=["shared investigation/drill-down budget exhausted"],
             )
 
-    # Typed-core floor: a run must not end with zero target-scoped kubernetes
-    # evidence just because LLM rounds and broad collectors consumed the shared
-    # window (2026-07-24 audit: 15/60 runs ended artifact-free, all carrying
-    # "shared evidence budget expired" skips). One bounded pass fits inside the
-    # backend's deadline slack. A deliberate early stop on a supported scoped
-    # hypothesis is respected — the floor only rescues starved runs.
-    # ponytail: fixed 25s floor; make it a setting if the deadline slack tightens.
-    floor_target = evidence.get("kubernetes")
-    budget_skipped = floor_target is not None and "kubernetes.analysis_budget" in (
-        floor_target.missing_data or []
-    )
-    if (
-        "kubernetes" in by_name
-        and not evidence_sufficient
-        and (floor_target is None or budget_skipped)
-    ):
+    async def kubernetes_floor(self, *, evidence_sufficient: bool) -> None:
+        # Typed-core floor: a run must not end with zero target-scoped
+        # kubernetes evidence just because LLM rounds and broad collectors
+        # consumed the shared window (2026-07-24 audit: 15/60 runs ended
+        # artifact-free, all carrying "shared evidence budget expired" skips).
+        # One bounded pass fits inside the backend's deadline slack. A
+        # deliberate early stop on a supported scoped hypothesis is respected —
+        # the floor only rescues starved runs.
+        # ponytail: fixed 25s floor; make it a setting if the deadline slack tightens.
+        floor_target = self.evidence.get("kubernetes")
+        budget_skipped = floor_target is not None and "kubernetes.analysis_budget" in (
+            floor_target.missing_data or []
+        )
+        if (
+            "kubernetes" not in self.by_name
+            or evidence_sufficient
+            or not (floor_target is None or budget_skipped)
+        ):
+            return
         try:
             floor_result = await asyncio.wait_for(
-                _collect_safely(by_name["kubernetes"], target, plan), 25.0
+                _collect_safely(self.by_name["kubernetes"], self.target, self.plan), 25.0
             )
         except Exception:  # noqa: BLE001 - the floor pass is best-effort
             floor_result = None
         if floor_result is not None:
             # The budget-skip stub carries no observations; replace it outright.
-            evidence["kubernetes"] = _merge_collector_results(None, floor_result)
-            _record_blackboard(blackboard, "kubernetes", floor_result, target)
+            self.evidence["kubernetes"] = _merge_collector_results(None, floor_result)
+            _record_blackboard(self.blackboard, "kubernetes", floor_result, self.target)
 
-    # Ad-hoc reads are evidence too: attach them to the kubernetes result so the
-    # report's evidence trail (and signature matching) sees what was drilled into.
-    kubernetes_result = evidence.get("kubernetes")
-    if adhoc and kubernetes_result is not None:
-        language = getattr(settings, "language", "en")
-        for item in adhoc:
-            error = item.get("error")
-            incident_window_verified = bool(item.get("time_range"))
-            # Finding-first summary: name the problem signals in the data, not
-            # the transport ("HTTP 200" tells the operator nothing).
-            markers = [] if error else kubernetes_salient_markers(item.get("data"))
-            if error:
-                summary = str(error)
-            elif markers:
-                summary = signals_line(markers, language)
-                if not incident_window_verified:
-                    summary = (
-                        f"현재 스냅샷 전용: {summary}"
-                        if language == "ko"
-                        else f"current snapshot only: {summary}"
-                    )
-            else:
-                summary = (
-                    "특이 신호 없음 (HTTP {code})"
-                    if language == "ko"
-                    else "no problem signals (HTTP {code})"
-                ).format(code=item.get("status_code"))
-            kubernetes_result.artifacts.append(
-                artifact(
-                    agent="kubernetes",
-                    source="kubernetes",
-                    type="adhoc_query",
-                    status="unavailable" if error else "ok",
-                    confidence="medium",
-                    query=_adhoc_query_repr(item),
-                    title=(
-                        "Pod YAML + 상세 점검"
-                        if language == "ko" and item.get("operation") == "describe"
-                        else "Pod YAML + describe"
-                        if item.get("operation") == "describe"
-                        else kind_lookup_title(str(item.get("kind") or ""), language)
-                    ),
-                    highlights=markers or None,
-                    summary=summary,
-                    result={
-                        **item,
-                        # Full YAML/describe is valuable operator context, but
-                        # it is a current snapshot. Its filtered events retain
-                        # the incident window separately; the combined ad-hoc
-                        # artifact must never become automatic RCA support.
-                        "observation": {
-                            "kind": "kubernetes_adhoc_query",
-                            "predicate": "kubernetes_adhoc_query",
-                            "polarity": "unavailable" if error else "unknown",
-                            "coverage": "unknown" if error else "partial",
-                            "observation_window": item.get("time_range") or {},
-                            "incident_window_verified": incident_window_verified,
-                        },
-                    },
-                )
-            )
-        _record_blackboard(blackboard, "kubernetes", kubernetes_result, target)
+    # --- phase 4: ad-hoc reads become kubernetes artifacts --------------------
 
-    # The normal collector gather happens after the LLM/reflection rounds. Make
-    # its typed facts available to the same ledger attachment path as probe
-    # results; otherwise a valid final Kubernetes observation can never move a
-    # hypothesis beyond testing.
-    ledger = _apply_ledger_updates(
-        ledger,
-        [],
-        blackboard=blackboard,
-        artifacts=[item for result in evidence.values() for item in result.artifacts],
-        eligible_support_ids=_eligible_support_ids(blackboard, target),
-    )
-    sufficiency = _evidence_sufficiency(ledger, evidence, blackboard, target)
+    def attach_adhoc_artifacts(self) -> None:
+        # Ad-hoc reads are evidence too: attach them to the kubernetes result so
+        # the report's evidence trail (and signature matching) sees what was
+        # drilled into.
+        kubernetes_result = self.evidence.get("kubernetes")
+        if not self.adhoc or kubernetes_result is None:
+            return
+        language = getattr(self.settings, "language", "en")
+        for item in self.adhoc:
+            kubernetes_result.artifacts.append(_adhoc_artifact(item, language))
+        _record_blackboard(self.blackboard, "kubernetes", kubernetes_result, self.target)
 
-    results = list(evidence.values())
-    skipped_collectors = [name for name in by_name if name not in evidence]
-    context = {
-        "hypothesis_ledger": _ledger_summary(ledger),
-        "investigation_steps": investigation_steps,
-        "adhoc_query_count": len(adhoc),
-        "evidence_sufficiency": sufficiency,
-        "skipped_collectors": skipped_collectors if evidence_sufficient else [],
-        "reasoning_trace_v2": {
-            "schema_version": 2,
-            "hypotheses": _ledger_summary(ledger),
-            "referenced_facts": _blackboard_prompt_view(blackboard, limit=30),
-            "stop_reason": (
-                "analysis_budget_exhausted"
-                if (_budget_remaining(deadline_monotonic) is not None)
-                and (_budget_remaining(deadline_monotonic) or 0) <= 0
-                else "supported_hypothesis"
+    # --- phase 5: the context the pipeline reasons about ----------------------
+
+    def finish(self, *, evidence_sufficient: bool) -> tuple[list[CollectorResult], dict]:
+        # The normal collector gather happens after the LLM/reflection rounds.
+        # Make its typed facts available to the same ledger attachment path as
+        # probe results; otherwise a valid final Kubernetes observation can
+        # never move a hypothesis beyond testing.
+        self.apply_updates([])
+        context = {
+            "hypothesis_ledger": _ledger_summary(self.ledger),
+            "investigation_steps": self.investigation_steps,
+            "adhoc_query_count": len(self.adhoc),
+            "evidence_sufficiency": self.sufficiency(),
+            "skipped_collectors": (
+                [name for name in self.by_name if name not in self.evidence]
                 if evidence_sufficient
-                else "all_collectors_probed"
+                else []
             ),
+            "reasoning_trace_v2": {
+                "schema_version": 2,
+                "hypotheses": _ledger_summary(self.ledger),
+                "referenced_facts": _blackboard_prompt_view(self.blackboard, limit=30),
+                "stop_reason": (
+                    "analysis_budget_exhausted"
+                    if self.out_of_budget()
+                    else "supported_hypothesis"
+                    if evidence_sufficient
+                    else "all_collectors_probed"
+                ),
+            },
+        }
+        safe_context = _investigator_masker(self.settings).mask_object(context)
+        return list(self.evidence.values()), (
+            safe_context if isinstance(safe_context, dict) else context
+        )
+
+
+def _adhoc_artifact(item: dict, language: str) -> Any:
+    """One ad-hoc Kubernetes read, projected as never-automatic RCA support."""
+    error = item.get("error")
+    incident_window_verified = bool(item.get("time_range"))
+    # Finding-first summary: name the problem signals in the data, not the
+    # transport ("HTTP 200" tells the operator nothing).
+    markers = [] if error else kubernetes_salient_markers(item.get("data"))
+    if error:
+        summary = str(error)
+    elif markers:
+        summary = signals_line(markers, language)
+        if not incident_window_verified:
+            summary = (
+                f"현재 스냅샷 전용: {summary}"
+                if language == "ko"
+                else f"current snapshot only: {summary}"
+            )
+    else:
+        summary = (
+            "특이 신호 없음 (HTTP {code})"
+            if language == "ko"
+            else "no problem signals (HTTP {code})"
+        ).format(code=item.get("status_code"))
+    return artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="adhoc_query",
+        status="unavailable" if error else "ok",
+        confidence="medium",
+        query=_adhoc_query_repr(item),
+        title=(
+            "Pod YAML + 상세 점검"
+            if language == "ko" and item.get("operation") == "describe"
+            else "Pod YAML + describe"
+            if item.get("operation") == "describe"
+            else kind_lookup_title(str(item.get("kind") or ""), language)
+        ),
+        highlights=markers or None,
+        summary=summary,
+        result={
+            **item,
+            # Full YAML/describe is valuable operator context, but it is a
+            # current snapshot. Its filtered events retain the incident window
+            # separately; the combined ad-hoc artifact must never become
+            # automatic RCA support.
+            "observation": {
+                "kind": "kubernetes_adhoc_query",
+                "predicate": "kubernetes_adhoc_query",
+                "polarity": "unavailable" if error else "unknown",
+                "coverage": "unknown" if error else "partial",
+                "observation_window": item.get("time_range") or {},
+                "incident_window_verified": incident_window_verified,
+            },
         },
-    }
-    safe_context = _investigator_masker(settings).mask_object(context)
-    return results, safe_context if isinstance(safe_context, dict) else context
+    )
+
+
+async def investigate(
+    settings: Settings,
+    target: object,
+    collectors: list,
+    plan: InvestigationPlan | None,
+    kg_context: dict,
+    max_steps: int,
+    reporter: ProgressReporter | None = None,
+    blackboard: Any = None,
+    deadline_monotonic: float | None = None,
+    initial_evidence: list[CollectorResult] | None = None,
+    query_memory: QueryMemory | None = None,
+) -> tuple[list[CollectorResult], dict[str, Any]]:
+    state = _Investigation.start(
+        settings,
+        target,
+        collectors,
+        plan,
+        kg_context,
+        max_steps,
+        reporter=reporter,
+        blackboard=blackboard,
+        deadline_monotonic=deadline_monotonic,
+        initial_evidence=initial_evidence,
+        query_memory=query_memory,
+    )
+    try:
+        await state.decision_rounds()
+    except Exception:  # noqa: BLE001 - never raise into analyze; keep whatever we have
+        pass
+    try:
+        await state.reflection_rounds()
+    except Exception:  # noqa: BLE001 - reflection is best-effort
+        pass
+
+    # A supported hypothesis citing a scoped positive fact is a real terminal
+    # condition: ranking/synthesis can consume a subset and must not force every
+    # unrelated evidence plane to run. Without that proof, retain the safe full
+    # gather fallback so transport/LLM failures do not yield an empty RCA.
+    evidence_sufficient = state.is_sufficient()
+    await state.final_gather(evidence_sufficient=evidence_sufficient)
+    await state.kubernetes_floor(evidence_sufficient=evidence_sufficient)
+    state.attach_adhoc_artifacts()
+    return state.finish(evidence_sufficient=evidence_sufficient)
 
 
 async def _reflect_hypotheses(
