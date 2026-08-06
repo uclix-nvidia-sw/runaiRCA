@@ -17,11 +17,9 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from app.collectors.base import (
-    NO_EVIDENCE,
     AnalysisTarget,
     CollectorResult,
     causal_evidence_time_range,
-    condition_observations,
     parse_incident_time,
     resolve_target,
 )
@@ -64,7 +62,7 @@ from app.progress import ProgressReporter
 from app.prompts import load_agent_souls
 from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse, SimilarIncidentContext
 from app.services.decision_tree import resolve_tree, walk_tree
-from app.services.evidence_projection import EXECUTION_METADATA_KEYS, observed_payload
+from app.services.evidence_projection import EXECUTION_METADATA_KEYS
 from app.services.general_guidance import general_guidance_lines
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
@@ -3449,30 +3447,6 @@ def _json_fingerprint(value: object) -> str:
         return repr(value)
 
 
-def _fresh_results_support_family(
-    family: str,
-    fresh_results: list[CollectorResult],
-    evidence_eligibility: Mapping[str, object],
-) -> bool:
-    """Whether this pass added eligible semantic support for a refuted family.
-
-    A prior self-check is a reason to seek an alternative, not a permanent ban.
-    Direct, target/window-scoped evidence found by the follow-up pass may
-    rehabilitate the family; compatibility summaries and ineligible cards may
-    not.
-    """
-    for result in fresh_results:
-        for artifact in result.artifacts:
-            evidence_id = str(getattr(artifact, "evidence_id", "") or "")
-            eligibility = evidence_eligibility.get(evidence_id)
-            permits = getattr(eligibility, "permits", None)
-            if not callable(permits) or not permits("support"):
-                continue
-            if artifact_supports_family(family, artifact):
-                return True
-    return False
-
-
 async def _reanalyze_once(
     state: PipelineState,
     *,
@@ -3991,201 +3965,7 @@ _COMMAND_ONLY_ACTION = re.compile(
 )
 
 
-def _synthesis_collector_findings(
-    results: list[CollectorResult],
-    *,
-    evidence_eligibility: Mapping[str, object] | None = None,
-) -> list[dict[str, object]]:
-    """Project artifacts into evidence roles before giving them to synthesis.
-
-    This is intentionally stricter than a transport-success check. The LLM may
-    see useful context, but it receives a machine-readable boundary that only
-    a scoped observation can support or contradict the RCA.
-    """
-    findings: list[dict[str, object]] = []
-    for result in results:
-        grouped: dict[str, list[dict[str, object]]] = {
-            "supporting_artifacts": [],
-            "contradicting_artifacts": [],
-            "context_artifacts": [],
-        }
-        for artifact in result.artifacts:
-            if not _artifact_is_evidence(artifact):
-                continue
-            payload = _synthesis_artifact_payload(
-                artifact, evidence_eligibility=evidence_eligibility
-            )
-            role = str(payload["evidence_role"])
-            key = {
-                "support": "supporting_artifacts",
-                "contradict": "contradicting_artifacts",
-            }.get(role, "context_artifacts")
-            grouped[key].append(payload)
-        findings.append(
-            {
-                "agent": result.agent,
-                "status": result.status,
-                "confidence": result.confidence,
-                # A collector headline is operational context, never a direct
-                # observation. Retain it without inviting the model to cite it.
-                "collection_summary": (
-                    result.summary if _collector_is_evidence(result) else NO_EVIDENCE
-                ),
-                **{
-                    key: [
-                        artifact for _index, artifact in sorted(
-                            ([(len(artifacts) - 1, artifacts[-1])] if artifacts else []) + sorted(
-                                enumerate(artifacts[:-1]),
-                                key=lambda item: (
-                                    bool(item[1].get("highlights")),
-                                    item[1].get("status") == "ok",
-                                    item[0],
-                                ),
-                                reverse=True,
-                            )[:5]
-                        )
-                    ]
-                    for key, artifacts in grouped.items()
-                },
-            }
-        )
-    return findings
-
-
-def _synthesis_artifact_payload(
-    artifact: object, *, evidence_eligibility: Mapping[str, object] | None = None
-) -> dict[str, object]:
-    result = getattr(artifact, "result", None)
-    observation = result.get("observation") if isinstance(result, dict) else None
-    polarity = "unknown"
-    coverage = "partial"
-    if isinstance(observation, dict):
-        candidate_polarity = str(observation.get("polarity") or "").strip().lower()
-        candidate_coverage = str(observation.get("coverage") or "").strip().lower()
-        if candidate_polarity in {"present", "absent", "unknown", "unavailable"}:
-            polarity = candidate_polarity
-        if candidate_coverage in {"scoped", "partial", "unknown"}:
-            coverage = candidate_coverage
-    if evidence_eligibility is not None:
-        # The blackboard has already checked run, target entity, topology and
-        # incident-window compatibility.  A raw artifact can claim to be a
-        # scoped observation while still belonging to another workload or a
-        # different time window, so never let the synthesis model re-promote
-        # it from its local polarity alone.
-        evidence_id = str(getattr(artifact, "evidence_id", "") or "")
-        eligibility = evidence_eligibility.get(evidence_id)
-        permits = getattr(eligibility, "permits", None)
-        if callable(permits) and permits("support"):
-            role = "support"
-        elif callable(permits) and permits("contradict"):
-            role = "contradict"
-        else:
-            role = "context"
-    elif polarity == "present" and coverage == "scoped":
-        role = "support"
-    elif polarity == "absent" and coverage == "scoped":
-        role = "contradict"
-    else:
-        role = "context"
-    agent = str(getattr(artifact, "agent", "") or "")
-    prompt_result = _sanitize_synthesis_result(result, agent=agent, role=role)
-    return {
-        "type": str(getattr(artifact, "type", "")),
-        "title": str(getattr(artifact, "title", "")),
-        "status": str(getattr(artifact, "status", "")),
-        "summary": str(getattr(artifact, "summary", "")),
-        "highlights": list(getattr(artifact, "highlights", []) or []),
-        "evidence_role": role,
-        "observation": {"polarity": polarity, "coverage": coverage},
-        "condition_checks": condition_observations(result),
-        "result": _compact_synthesis_value(
-            prompt_result, limit=_SYNTHESIS_ARTIFACT_RESULT_CHARS
-        ),
-    }
-
-
 _SYNTHESIS_OMIT = object()
-
-
-def _sanitize_synthesis_result(value: object, *, agent: str, role: str) -> object:
-    """Remove retrieval intent and diagnostic suggestions from LLM evidence.
-
-    Query text remains in the operator-facing artifact, but it is never an
-    observed value. Grafana MCP can also echo ``debug.hints.possibleCauses``;
-    those are transport suggestions, not incident evidence.
-    """
-
-    projected = observed_payload(value)
-    if agent == "kubernetes" and role == "context":
-        return _sanitize_kubernetes_context_result(projected)
-    return projected
-
-
-def _sanitize_kubernetes_context_result(value: object) -> object:
-    """Project live Kubernetes context without failure-looking configuration.
-
-    The response artifact still retains the full YAML/JSON for the operator.
-    This copy is only for the synthesis prompt, where raw ``spec`` fields such
-    as ``preemptionPolicy=PreemptLowerPriority`` and healthy condition reason
-    strings repeatedly became fabricated observations.
-    """
-
-    def walk(node: object, key: str = "") -> object:
-        if key.casefold() in _K8S_SYNTHESIS_CONTEXT_DROP_KEYS:
-            return _SYNTHESIS_OMIT
-        if isinstance(node, dict):
-            condition_type = str(node.get("type") or "").strip()
-            if condition_type.casefold() in _K8S_CONDITION_TYPES and "status" in node:
-                checks = condition_observations(
-                    {"type": condition_type, "status": node.get("status")}, limit=1
-                )
-                if not checks:
-                    return {"active": "unknown", "status": str(node.get("status") or "")}
-                check = checks[0]
-                # Inactive conditions are already represented, with their
-                # exact names, in the sibling condition_checks projection. Do
-                # not repeat failure vocabulary inside raw result text.
-                if not check.get("active"):
-                    return {"active": False, "status": str(node.get("status") or "")}
-                projected: dict[str, object] = {
-                    "condition": condition_type,
-                    "active": True,
-                    "status": str(node.get("status") or ""),
-                }
-                for field in ("reason", "message", "lastTransitionTime"):
-                    if node.get(field) not in (None, ""):
-                        projected[field] = node[field]
-                return projected
-            projected_dict: dict[str, object] = {}
-            for child_key, child in node.items():
-                projected = walk(child, str(child_key))
-                if projected is not _SYNTHESIS_OMIT:
-                    projected_dict[str(child_key)] = projected
-            return projected_dict
-        if isinstance(node, (list, tuple)):
-            projected_list = []
-            for child in node:
-                projected = walk(child, key)
-                if projected is not _SYNTHESIS_OMIT:
-                    projected_list.append(projected)
-            return projected_list
-        return node
-
-    projected = walk(value)
-    return {} if projected is _SYNTHESIS_OMIT else projected
-
-
-def _compact_synthesis_value(value: object, *, limit: int) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        text = value
-    else:
-        try:
-            text = json.dumps(value, ensure_ascii=False, default=str)
-        except (TypeError, ValueError):
-            text = str(value)
-    return " ".join(text.split())[:limit]
 
 
 
@@ -8254,126 +8034,6 @@ def _collector_is_evidence(result: object) -> bool:
     return getattr(result, "status", "ok") in ("ok", "partial")
 
 
-def _kubernetes_highlights(details: dict[str, object]) -> list[str]:
-    lines: list[str] = []
-    # Run:ai CRD findings first — a not-Ready project/workload is the most direct
-    # answer for a control-plane alert that carried no workload label.
-    crd_findings = details.get("runai_crd_findings")
-    if isinstance(crd_findings, list):
-        for finding in crd_findings[:3]:
-            if not isinstance(finding, dict) or not finding.get("name"):
-                continue
-            kind = finding.get("kind") or "resource"
-            reason = finding.get("reason") or "NotReady"
-            message = str(finding.get("message") or "")
-            line = f"- Run:ai {kind} {finding.get('name')} is not Ready ({reason})"
-            if message:
-                line += f": {_short_sentence(message, limit=200)}"
-            lines.append(line)
-    warning_events = details.get("warning_events")
-    if isinstance(warning_events, list):
-        for event in warning_events[:3]:
-            if not isinstance(event, dict):
-                continue
-            reason = event.get("reason") or "Warning"
-            message = event.get("message") or ""
-            if message:
-                lines.append(
-                    f"- Kubernetes event {reason}: {_short_sentence(str(message), limit=220)}"
-                )
-    pod_statuses = details.get("pod_statuses")
-    if isinstance(pod_statuses, list):
-        for pod in pod_statuses[:2]:
-            if not isinstance(pod, dict):
-                continue
-            if pod.get("phase") and pod.get("name"):
-                lines.append(_pod_describe_line(pod))
-    return lines
-
-
-def _pod_describe_line(pod: dict[str, object]) -> str:
-    """`kubectl describe`-grade one-liner: phase + per-container limits, restarts,
-    and last termination. "phase Running" alone told the operator nothing on a
-    memory-limit alert — the limit and any OOMKilled restarts are the evidence."""
-    base = f"- Kubernetes pod {pod.get('name')} is in phase {pod.get('phase')}"
-    resources = pod.get("resources") if isinstance(pod.get("resources"), dict) else {}
-    statuses = pod.get("containerStatuses")
-    parts: list[str] = []
-    for st in (statuses if isinstance(statuses, list) else [])[:2]:
-        if not isinstance(st, dict) or not st.get("name"):
-            continue
-        cname = str(st["name"])
-        facts: list[str] = []
-        res = resources.get(cname) if isinstance(resources.get(cname), dict) else {}
-        limits = res.get("limits") if isinstance(res.get("limits"), dict) else {}
-        requests = res.get("requests") if isinstance(res.get("requests"), dict) else {}
-        if limits.get("memory"):
-            mem = f"mem limit {limits['memory']}"
-            if requests.get("memory"):
-                mem += f" (request {requests['memory']})"
-            facts.append(mem)
-        if limits.get("cpu"):
-            facts.append(f"cpu limit {limits['cpu']}")
-        restarts = st.get("restartCount")
-        if isinstance(restarts, int) and restarts > 0:
-            facts.append(f"{restarts} restart(s)")
-        state = st.get("state") if isinstance(st.get("state"), dict) else {}
-        waiting = state.get("waiting") if isinstance(state.get("waiting"), dict) else {}
-        if waiting.get("reason"):
-            facts.append(f"waiting: {waiting['reason']}")
-        last_state = st.get("lastState") if isinstance(st.get("lastState"), dict) else {}
-        term = last_state.get("terminated")
-        term = term if isinstance(term, dict) else {}
-        if term.get("reason") or term.get("exitCode") is not None:
-            last = f"last {term.get('reason') or 'terminated'}"
-            if term.get("exitCode") is not None:
-                last += f" (exit {term['exitCode']})"
-            if term.get("finishedAt"):
-                last += f" at {term['finishedAt']}"
-            facts.append(last)
-        if facts:
-            parts.append(f"{cname}: " + ", ".join(facts))
-    if parts:
-        base += " — " + "; ".join(parts)
-    return base + "."
-
-
-def _loki_highlights(details: dict[str, object]) -> list[str]:
-    lines: list[str] = []
-    queries = details.get("queries")
-    if not isinstance(queries, list):
-        return lines
-    for query in queries:
-        if not isinstance(query, dict):
-            continue
-        line_count = query.get("line_count")
-        name = query.get("name") or "query"
-        if isinstance(line_count, int) and line_count > 0:
-            lines.append(f"- Loki {name} returned {line_count} matching log line(s).")
-    return lines
-
-
-def _runai_highlights(details: dict[str, object]) -> list[str]:
-    lines: list[str] = []
-    project = details.get("project")
-    workload = details.get("workload_name") or details.get("runai_workload_id")
-    if project or workload:
-        lines.append(
-            "- Run:ai target context: "
-            f"project={project or 'unknown'}, workload={workload or 'unknown'}."
-        )
-    queries = details.get("queries")
-    if isinstance(queries, list):
-        for query in queries[:3]:
-            if not isinstance(query, dict):
-                continue
-            if query.get("error"):
-                lines.append(
-                    f"- Run:ai {query.get('name', 'query')} failed with {query.get('error')}."
-                )
-    return lines
-
-
 # Backend blended scale: identity contributes at most labelWeight, so scores no
 # longer saturate near 1.0 the way the old additive label bonus made them. Same
 # bar in meaning, different units — see minFeedbackHintSimilarity in the backend.
@@ -8727,37 +8387,6 @@ def _stringify_result(
     if details and not structured:
         parts.append(_evidence_leaf_text(details))
     return " ".join(parts)
-
-
-def _graph_remediation_lines(graph_fixes: GraphRemediation | None) -> list[str]:
-    if graph_fixes is None or graph_fixes.is_empty():
-        return []
-    if not (graph_fixes.xid_fixes or graph_fixes.xid_triggers or graph_fixes.model_xids):
-        return []
-    masker = build_masker(())
-    lines = ["- Knowledge-graph derived remediation:"]
-    # Never render flat family/historical actions here. Curated and promoted
-    # remedies must arrive through a symptom->action relation; this renderer is
-    # reserved for signature-specific graph facts such as XID codes.
-    for code, fixes in graph_fixes.xid_fixes.items():
-        identity = _xid_identity_clause(graph_fixes, code, masker)
-        suffix = f" — {identity}" if identity else ""
-        lines.append(f"  - NVIDIA Xid {code}{suffix}:")
-        lines.extend(
-            f"    - {_safe_line(statement, limit=360, masker=masker)}" for statement in fixes[:5]
-        )
-    for code, trigger in graph_fixes.xid_triggers.items():
-        identity = _xid_identity_clause(graph_fixes, code, masker)
-        suffix = f" — {identity}" if identity else ""
-        lines.append(
-            f"  - Diagnostic guidance (XID {code}{suffix}): "
-            f"{_safe_line(trigger, limit=360, masker=masker)}"
-        )
-    for model, xids in graph_fixes.model_xids.items():
-        rendered = ", ".join(str(x) for x in xids)
-        safe_model = _safe_line(model, limit=120, masker=masker)
-        lines.append(f"  - Known Xid codes for {safe_model}: {rendered}.")
-    return lines
 
 
 def _affected_pods_lines(request: AlertAnalysisRequest, language: str = "en") -> list[str]:

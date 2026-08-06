@@ -2787,19 +2787,6 @@ async def _run_select_mcp(settings: Settings, sql: str) -> list[dict]:
     return [row for row in rows[:50] if isinstance(row, dict)]
 
 
-def _postgres_rows(data: Any) -> list[Any]:
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ("rows", "result", "data"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
-        if all(not isinstance(value, (list, dict)) for value in data.values()):
-            return [data]
-    return []
-
-
 async def _tool_sql_select(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
     title = _title(settings, "DB 조회 (SQL)", "Database query (SQL)")
     error, sql = _validate_select(str(args.get("query") or ""))

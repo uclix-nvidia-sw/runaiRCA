@@ -1950,16 +1950,6 @@ func (s *Store) analyzingAnalysisRunLocked(targetType string, targetID string, a
 	return selected
 }
 
-func (s *Store) ExistingAutoAnalysisRun(alertID string) (AnalysisRun, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	selected := s.latestAutoAnalysisRunLocked(alertID)
-	if selected == nil {
-		return AnalysisRun{}, false
-	}
-	return cloneAnalysisRun(selected), true
-}
-
 func (s *Store) latestAutoAnalysisRunLocked(alertID string) *AnalysisRun {
 	var selected *AnalysisRun
 	for _, run := range s.analysisRuns {

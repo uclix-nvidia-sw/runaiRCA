@@ -16,7 +16,7 @@ from app.collectors.kubernetes import (
 from app.collectors.prometheus import _queries_for
 from app.config import load_settings
 from app.nat_engine import RcaStageConfig, RunaiRcaPipelineConfig
-from app.prompts import agent_role_coverage_lines, load_agent_souls
+from app.prompts import load_agent_souls
 
 CONFIG_DIR = Path(__file__).parents[1] / "configs"
 
@@ -74,15 +74,6 @@ def test_engine_workflow_declares_all_pipeline_stages() -> None:
         assert functions[ref]["_type"] == "rca_stage"
         stages.add(functions[ref]["stage"])
     assert stages == expected
-
-
-def test_role_coverage_lines_are_operator_visible() -> None:
-    text = "\n".join(agent_role_coverage_lines())
-
-    assert "KubeRCA-style RCA verdict" in text
-    assert "no CLI by default" in text
-    assert "Run:ai control-plane pod health" in text
-    assert "runai` and `runai-backend" in text
 
 
 def test_runai_control_plane_pod_scan_is_not_filtered_by_workload_name() -> None:

@@ -857,16 +857,6 @@ func (s *Store) loadMemories(ctx context.Context) {
 	}
 }
 
-// dbSearchMemory runs the free-text similarity search inside Postgres using the
-// pgvector cosine distance operator (`<=>`) against the dense `embedding`
-// column, then enriches each hit with feedback metadata held in memory. It
-// returns (results, true) when pgvector served the query, or (nil, false) to
-// signal the caller to fall back to the in-process sparse-vector search (when
-// the extension is unavailable or the query errors).
-func (s *Store) dbSearchMemory(query string, limit int) ([]SimilarIncident, bool) {
-	return s.dbSearchMemoryExcluding(query, "", limit)
-}
-
 func (s *Store) dbSearchSimilarIncidents(query, incidentID string, limit int) ([]SimilarIncident, bool) {
 	return s.dbSearchMemoryExcluding(query, incidentID, limit)
 }

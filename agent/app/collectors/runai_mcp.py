@@ -28,7 +28,6 @@ from app.mcp_client import (
     mcp_error,
     mcp_tls_verify,
     mcp_tool_json,
-    mcp_tool_text,
 )
 
 
@@ -167,10 +166,6 @@ async def _call_tool(
         "error": None,
         "data": _tool_json(result),
     }
-
-
-def _tool_text(result: Any) -> str:
-    return mcp_tool_text(result)
 
 
 def _tool_json(result: Any) -> Any:

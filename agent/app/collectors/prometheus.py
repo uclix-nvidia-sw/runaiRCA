@@ -1472,20 +1472,6 @@ def _mcp_result_json(result: object, tool: str) -> object:
     return data
 
 
-def _first_result_list(data: object) -> list[object]:
-    if isinstance(data, list):
-        return data
-    if not isinstance(data, dict):
-        return []
-    for value in data.values():
-        if isinstance(value, list):
-            return value
-        found = _first_result_list(value)
-        if found:
-            return found
-    return []
-
-
 def _prometheus_mcp_result(data: object) -> list[object]:
     """Return only documented/native MCP metric-vector envelopes."""
     native = _prometheus_result(data)

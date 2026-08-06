@@ -65,10 +65,6 @@ export function normalizeAnalysisSource(source: string) {
   return 'manual';
 }
 
-export function analysisSourceClass(source: string) {
-  return normalizeAnalysisSource(source);
-}
-
 export function latestEvidenceForAgent(items: EvidenceItem[], agent: string) {
   return items
     .filter((item) => item.agent === agent)

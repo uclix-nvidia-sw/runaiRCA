@@ -53,24 +53,6 @@ def build_timeline(results: list[CollectorResult]) -> list[dict]:
     return entries
 
 
-def to_markdown(timeline: list[dict], *, limit: int = 30) -> str:
-    if not timeline:
-        return "- No timestamped signals were correlated across collectors."
-    lines = []
-    masker = build_masker(())
-    for entry in timeline[:limit]:
-        ts = _clean_timestamp(entry.get("timestamp") or "unknown-time", masker)
-        lines.append(
-            f"- `{ts}` **{_clean(entry.get('source', '?'), masker, limit=80)}** "
-            f"({_clean(entry.get('kind', 'event'), masker, limit=120)}, "
-            f"{_clean(entry.get('evidence_role', 'context'), masker, limit=16)}): "
-            f"{_clean(entry.get('message', ''), masker, limit=300)}"
-        )
-    if len(timeline) > limit:
-        lines.append(f"- … and {len(timeline) - limit} more signal(s)")
-    return "\n".join(lines)
-
-
 def _from_result(result: CollectorResult) -> list[dict]:
     agent = result.agent
     details = result.details or {}

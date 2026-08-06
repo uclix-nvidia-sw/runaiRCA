@@ -1,9 +1,9 @@
 import re
 
 from app.collectors import kubernetes, loki, postgres, runai
-from app.collectors.base import AnalysisTarget, CollectorResult, artifact
+from app.collectors.base import AnalysisTarget, CollectorResult
 from app.masking import MASK_TOKEN, build_masker
-from app.services import pipeline, self_check
+from app.services import pipeline
 
 
 def _target(**values) -> AnalysisTarget:
@@ -170,20 +170,3 @@ def test_loki_samples_newest_per_stream_then_orders_chronologically() -> None:
         limit=2,
     )
     assert [entry["line"] for entry in entries] == ["middle", "new"]
-
-
-def test_newest_artifact_has_a_guaranteed_synthesis_and_digest_slot() -> None:
-    result = CollectorResult(agent="loki", status="ok", summary="headline")
-    for index in range(6):
-        result.artifacts.append(artifact(
-            agent="loki", source="loki", type="logs", status="ok", confidence="high",
-            summary=f"old-{index}", highlights=["signal"],
-            result={"observation": {"polarity": "unknown", "coverage": "partial"}},
-        ))
-    result.artifacts.append(artifact(
-        agent="loki", source="loki", type="logs", status="partial", confidence="low",
-        summary="newest", result={"observation": {"polarity": "unknown", "coverage": "partial"}},
-    ))
-    findings = pipeline._synthesis_collector_findings([result])[0]
-    assert "newest" in [item["summary"] for item in findings["context_artifacts"]]
-    assert "newest" in self_check._evidence_digest([result], build_masker(()))

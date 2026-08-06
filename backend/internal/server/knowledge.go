@@ -1101,10 +1101,6 @@ func readyTraceV3Hypothesis(trace map[string]any, finalFamily, finalMechanism st
 	return nil, nil, nil, "missing selected trace-v3 hypothesis"
 }
 
-func traceV3HasLinkedProbe(trace map[string]any, hypothesisID string, evidence map[string]bool) bool {
-	return len(traceV3LinkedProbeTemplateIDs(trace, hypothesisID, evidence)) > 0
-}
-
 func traceV3LinkedProbeTemplateIDs(trace map[string]any, hypothesisID string, evidence map[string]bool) []string {
 	probes, _ := trace["probe_executions"].([]any)
 	seen, ids := map[string]bool{}, []string{}

@@ -1001,19 +1001,6 @@ async def _mcp_fetchval(settings: Settings, sql: str) -> Any:
     return next(iter(first.values()), None)
 
 
-def _postgres_rows(data: Any) -> list[Any]:
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ("rows", "result", "data"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
-        if all(not isinstance(value, (list, dict)) for value in data.values()):
-            return [data]
-    return []
-
-
 def _mcp_postgres_rows(data: Any) -> list[Any] | None:
     """Return a recognized SQL-row envelope, or None for malformed success.
 

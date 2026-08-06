@@ -136,7 +136,6 @@ def _select_datasource_uid(data: object, datasource_type: str) -> str:
     candidates: list[dict[str, Any]] = []
     for datasource in _datasource_items(data):
         dtype = str(datasource.get("type") or "").strip().lower()
-        name = str(datasource.get("name") or "").strip().lower()
         if datasource_type not in dtype:
             continue
         uid = str(datasource.get("uid") or "").strip()

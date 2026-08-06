@@ -19,7 +19,6 @@ from app.collectors import kubernetes as k8s
 from app.collectors.base import CollectorResult, artifact, salient_markers
 from app.collectors.kubernetes import (
     _collect_kubernetes_responses_via_mcp,
-    _k8s_yaml_payload,
     _pod_lifecycle_artifact,
     _target_pod_missing,
     k8s_read,
@@ -301,10 +300,10 @@ async def test_mcp_sweep_raises_only_when_everything_fails(monkeypatch) -> None:
 def test_k8s_yaml_payload_parses_yaml_and_rejects_tables() -> None:
     # kubernetes-mcp-server speaks YAML (the 2026-07-08 run demoted EVERY query
     # to the direct API with "MCP result was not JSON").
-    pod = _k8s_yaml_payload("metadata:\n  name: x\nspec:\n  nodeName: dgx01\n")
+    pod = k8s._k8s_mcp_payload(_McpResult(text="metadata:\n  name: x\nspec:\n  nodeName: dgx01\n"))
     assert isinstance(pod, dict) and pod["spec"]["nodeName"] == "dgx01"
     with pytest.raises(RuntimeError):
-        _k8s_yaml_payload("NAME   READY   STATUS\nfoo    1/1     Running")
+        k8s._k8s_mcp_payload(_McpResult(text="NAME   READY   STATUS\nfoo    1/1     Running"))
 
 
 # The 0.1.42 run's exact corruption: masking TEXT before parsing swallowed the
@@ -328,7 +327,7 @@ _POD_YAML_WITH_SECRET_VOLUME = (
 
 
 def test_k8s_yaml_payload_survives_secret_shaped_fields_and_masks_values() -> None:
-    parsed = _k8s_yaml_payload(_POD_YAML_WITH_SECRET_VOLUME)
+    parsed = k8s._k8s_mcp_payload(_McpResult(text=_POD_YAML_WITH_SECRET_VOLUME))
     # Structure is intact (text-masking corrupted it into a parse error before).
     assert parsed["spec"]["volumes"][0]["name"] == "runai-ca"
     assert parsed["status"]["phase"] == "Running"

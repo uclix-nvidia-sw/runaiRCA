@@ -1148,11 +1148,6 @@ def _mcp_pod_log_observed_entity(
     return _pod_log_entity(observed_namespace, observed_name)
 
 
-def _mcp_pod_log_source_verified(data: object, namespace: str, pod: str) -> bool:
-    """Compatibility predicate for callers that only need source verification."""
-    return _mcp_pod_log_observed_entity(data, namespace, pod) is not None
-
-
 def _pod_log_entity(namespace: str, pod: str) -> dict[str, str]:
     """The concrete namespaced Pod provenance required for log causality."""
     return {"kind": "pod", "name": pod, "namespace": namespace}
@@ -2921,16 +2916,6 @@ def _k8s_mcp_payload(result: object) -> object:
     return build_masker(()).mask_object(_canonicalize_kubernetes_payload(parsed))
 
 
-def _k8s_yaml_payload(text: str) -> object:
-    """Return a masked Kubernetes YAML reply for compatibility callers.
-
-    Parsing occurs before masking so secret-shaped values cannot corrupt YAML
-    syntax. The MCP transport uses the same parser, then normalizes Go-field
-    keys before applying this mask.
-    """
-    return build_masker(()).mask_object(_parse_k8s_yaml_payload(text))
-
-
 def _parse_k8s_yaml_payload(text: str) -> object:
     """Parse a Kubernetes YAML reply without masking it first.
 
@@ -3418,26 +3403,6 @@ async def _collect_resolved_pod_logs(
                 }
             )
     return logs
-
-
-def best_matching_pod(items: list[dict], stems: list[str]) -> dict | None:
-    """The stem-matching pod that is most plausibly the alert's subject.
-
-    Prefer UNHEALTHY matches: a crashlooping workload's replacement is unhealthy
-    too, while e.g. a DaemonSet has healthy siblings on every OTHER node —
-    newest-wins alone would happily pick one of those and attach node evidence
-    to the wrong node. The preferred pool is only trusted when it is
-    unambiguous: a single pod, or several pods all on the SAME node (successive
-    incarnations). Unhealthy siblings spread across nodes cannot be attributed
-    to the alert's pod — None; no evidence beats wrong-node evidence."""
-    matches: list[tuple[str, dict]] = []
-    for item in items:
-        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-        name = str(metadata.get("name") or "")
-        if not name or not any(stem and name.startswith(stem) for stem in stems):
-            continue
-        matches.append((str(metadata.get("creationTimestamp") or ""), item))
-    return _best_unambiguous_pod(matches)
 
 
 def _best_unambiguous_pod(matches: list[tuple[str, dict]]) -> dict | None:
@@ -5516,11 +5481,6 @@ def _event_summary(
     if observed_entity:
         summary["observed_entity"] = observed_entity
     return summary
-
-
-def _event_timestamp(event: dict[str, object]) -> object:
-    timestamps = _event_timestamps(event)
-    return timestamps[-1][1] if timestamps else None
 
 
 def _event_sort_timestamp(event: dict[str, object]) -> tuple[bool, str]:

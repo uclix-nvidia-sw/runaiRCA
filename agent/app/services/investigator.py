@@ -893,19 +893,6 @@ def _normalise_hypothesis(value: object) -> str:
     return re.sub(r"\W+", " ", str(value or "").lower()).strip()
 
 
-def _legacy_supported(
-    ledger: list[dict[str, Any]], *, eligible_support_ids: set[str] | None = None
-) -> bool:
-    return any(
-        item.get("status") == "supported"
-        and bool(
-            set(_texts(item.get("evidence_for")))
-            & (eligible_support_ids if eligible_support_ids is not None else set())
-        )
-        for item in ledger
-    )
-
-
 def _evidence_sufficiency(
     ledger: list[dict[str, Any]],
     evidence: dict[str, CollectorResult] | list[CollectorResult],

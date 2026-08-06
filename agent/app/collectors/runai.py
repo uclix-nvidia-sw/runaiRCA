@@ -36,14 +36,6 @@ _RUNAI_TOKEN_INFLIGHT: dict[
 ] = {}
 
 
-def _version_from_results(query_results: list[dict[str, Any]]) -> str:
-    """Pull the Run:ai version out of the MCP 'version' query result, if present."""
-    for item in query_results or []:
-        if item.get("name") == "version" and not item.get("error"):
-            return _extract_version(item.get("data"))
-    return ""
-
-
 def _extract_version(data: Any) -> str:
     """Find a semver-ish version string in an arbitrary Run:ai version payload.
 

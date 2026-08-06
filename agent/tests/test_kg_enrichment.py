@@ -24,7 +24,6 @@ from app.services.kg_enrichment import (
 )
 from app.services.pipeline import (
     _causal_chain_line,
-    _graph_remediation_lines,
     _knowledge_base_lines,
     _playbook_lines,
     _xid_diagnostic_guidance_lines,
@@ -230,7 +229,7 @@ def test_query_remediation_projects_xid_trigger_and_renders_guidance() -> None:
 
     assert out.xid_triggers == {79: "Check for PCIe link errors before reset."}
     assert out.as_dict()["xid_triggers"] == {"79": "Check for PCIe link errors before reset."}
-    rendered = "\n".join(_graph_remediation_lines(out))
+    rendered = "\n".join(_xid_diagnostic_guidance_lines(out, "en"))
     assert "Diagnostic guidance (XID 79" in rendered
     assert "Check for PCIe link errors before reset." in rendered
     # This FakeClient never returns a detail_for_xid() row, but XID 79 is a

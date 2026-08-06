@@ -141,12 +141,6 @@ func (e *embedder) embedResultContext(ctx context.Context, text string) embedRes
 	return embedResult{vector: normalize(vector), basis: embeddingBasisRemote}
 }
 
-// remoteEmbed POSTs to {endpoint}/embeddings and returns the raw model vector.
-// The response follows the OpenAI embeddings schema: {"data":[{"embedding":[...]}]}.
-func (e *embedder) remoteEmbed(text string) ([]float32, error) {
-	return e.remoteEmbedContext(context.Background(), text)
-}
-
 func (e *embedder) remoteEmbedContext(parent context.Context, text string) ([]float32, error) {
 	body, err := json.Marshal(map[string]any{"model": e.model, "input": text})
 	if err != nil {
@@ -484,14 +478,6 @@ func (s *Store) applyAnalysisLocked(alert *AlertRecord, response AgentAnalysisRe
 	s.invalidateRecurrenceStatsLocked()
 }
 
-func (s *Store) MarkAnalyzing(incidentID string, analyzing bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if incident := s.incidents[incidentID]; incident != nil {
-		incident.IsAnalyzing = analyzing
-	}
-}
-
 // BeginAnalyzing flags the incident and alert as analyzing so the dashboard can
 // render an in-progress state for the whole lifecycle, and records the start as
 // incident activity. Starting an analysis IS activity, so the ordinary
@@ -517,21 +503,6 @@ func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
 // reused run, not because this does anything different from BeginAnalyzing.
 func (s *Store) BeginManualAnalysis(incidentID string, alertID string) {
 	s.BeginAnalyzing(incidentID, alertID)
-}
-
-// ApplyFallbackAnalysisIfAbsent implements the overwrite policy for failed runs:
-// a successful RCA already attached to the alert is always preserved, and the
-// fallback RCA is only surfaced on the alert when there is nothing to keep. It
-// returns true when the fallback was written. The analyzing flags are cleared in
-// both cases. Fallback RCA is never written to incident memory.
-func (s *Store) ApplyFallbackAnalysisIfAbsent(alertID string, response AgentAnalysisResponse) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	alert := s.alerts[alertID]
-	if alert == nil {
-		return false
-	}
-	return s.applyFallbackAnalysisIfAbsentLocked(alert, response)
 }
 
 // ApplyFallbackAnalysisIfAbsentForRun is the guarded version used by async run
