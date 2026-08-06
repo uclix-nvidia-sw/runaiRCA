@@ -421,6 +421,59 @@ def _historical_journal_response_verified(
     )
 
 
+async def _scan_source(
+    settings: Settings,
+    source: str,
+    *,
+    node: str,
+    base_url: str,
+    headers: dict[str, str],
+    time_range: dict[str, str] | None,
+    causal_time_range: dict[str, str] | None,
+) -> tuple[dict[str, object], list[str]]:
+    """One node log source: its result row plus the lines that matched."""
+    params = {"source": source, "lines": "500"}
+    # Only journalctl sources have a trustworthy historical time predicate.
+    # Snapshot sources are current-state context, not proof about a past
+    # incident.
+    if source in _TIME_WINDOWABLE_SOURCES and time_range:
+        params.update({"since": time_range["start"], "until": time_range["end"]})
+    if "{node}" not in settings.system_agent_url:
+        params["node"] = node
+    response = await get_json(
+        base_url=base_url,
+        path="/logs",
+        timeout_seconds=settings.system_agent_timeout_seconds,
+        params=params,
+        headers=headers,
+    )
+    lines = _lines(response.data)
+    matches = _matching_lines(source, lines)
+    historical_window_verified = bool(
+        source in _TIME_WINDOWABLE_SOURCES
+        and time_range
+        and _historical_journal_response_verified(response.data, time_range, source)
+    )
+    matching_timestamps = _journal_matching_timestamps(
+        matches, causal_time_range if historical_window_verified else None
+    )
+    return {
+        "source": source,
+        "url": response.url,
+        "status_code": response.status_code,
+        "line_count": len(lines),
+        "error_count": len(matches),
+        "errors": compact(matches, limit=8),
+        "error": response.error,
+        "time_range": (
+            time_range if source in _TIME_WINDOWABLE_SOURCES and time_range else None
+        ),
+        "historical_scope": bool(source in _TIME_WINDOWABLE_SOURCES and time_range),
+        "historical_window_verified": historical_window_verified,
+        "matching_timestamps": matching_timestamps,
+    }, matches
+
+
 class SystemCollector:
     name = "system"
 
@@ -665,51 +718,19 @@ class SystemCollector:
         ]
         sources_to_scan = [source for source in _SOURCES if source not in sources_skipped]
         for source in sources_to_scan:
-            params = {"source": source, "lines": "500"}
-            # Only journalctl sources have a trustworthy historical time
-            # predicate. Snapshot sources are current-state context, not proof
-            # about a past incident.
-            if source in _TIME_WINDOWABLE_SOURCES and time_range:
-                params.update({"since": time_range["start"], "until": time_range["end"]})
-            if "{node}" not in self._settings.system_agent_url:
-                params["node"] = node
-            response = await get_json(
+            row, matches = await _scan_source(
+                self._settings,
+                source,
+                node=node,
                 base_url=base_url,
-                path="/logs",
-                timeout_seconds=self._settings.system_agent_timeout_seconds,
-                params=params,
                 headers=headers,
+                time_range=time_range,
+                causal_time_range=causal_time_range,
             )
-            lines = _lines(response.data)
-            matches = _matching_lines(source, lines)
             raw_matches[source] = matches
-            historical_window_verified = bool(
-                source in _TIME_WINDOWABLE_SOURCES
-                and time_range
-                and _historical_journal_response_verified(response.data, time_range, source)
-            )
-            matching_timestamps = _journal_matching_timestamps(
-                matches, causal_time_range if historical_window_verified else None
-            )
-            source_results.append(
-                {
-                    "source": source,
-                    "url": response.url,
-                    "status_code": response.status_code,
-                    "line_count": len(lines),
-                    "error_count": len(matches),
-                    "errors": compact(matches, limit=8),
-                    "error": response.error,
-                    "time_range": (
-                        time_range if source in _TIME_WINDOWABLE_SOURCES and time_range else None
-                    ),
-                    "historical_scope": bool(source in _TIME_WINDOWABLE_SOURCES and time_range),
-                    "historical_window_verified": historical_window_verified,
-                    "matching_timestamps": matching_timestamps,
-                }
-            )
-            if response.error:
-                warnings.append(f"System agent query failed for {source}: {response.error}")
+            source_results.append(row)
+            if row["error"]:
+                warnings.append(f"System agent query failed for {source}: {row['error']}")
 
         successful = [item for item in source_results if not item["error"]]
         incident_sources = (

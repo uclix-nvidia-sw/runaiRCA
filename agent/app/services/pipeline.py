@@ -5156,6 +5156,89 @@ def _promote_signature_cause(
     return candidates
 
 
+def _typed_cause(family: str, reason: str, evidence_id: str) -> tuple[str, str, list[str]]:
+    return (
+        family,
+        f"typed container state {reason} on the alert Pod "
+        "(machine-reported, not keyword-matched)",
+        [evidence_id],
+    )
+
+
+def _lifecycle_typed_cause(payload: dict, evidence_id: str) -> tuple[str, str, list[str]] | None:
+    """A waiting/terminated container state whose reason is a known signature."""
+    containers = payload.get("containers")
+    for container in containers if isinstance(containers, list) else []:
+        if not isinstance(container, dict):
+            continue
+        for state_key in ("state", "lastTerminated"):
+            state = container.get(state_key)
+            if not isinstance(state, dict):
+                continue
+            reason = str(state.get("reason") or "")
+            if state_key == "state" and state.get("phase") not in {"waiting", "terminated"}:
+                continue
+            exit_code = state.get("exitCode")
+            if state_key == "lastTerminated" and not (reason or exit_code is not None):
+                continue
+            if family := _typed_reason_family(reason):
+                return _typed_cause(family, reason, evidence_id)
+    return None
+
+
+def _warning_event_typed_cause(
+    payload: dict, evidence_id: str
+) -> tuple[str, str, list[str]] | None:
+    """A repeated (>=3), target-verified Warning Event with a known reason."""
+    events = payload.get("events")
+    for event in events if isinstance(events, list) else []:
+        if not isinstance(event, dict):
+            continue
+        if (
+            str(event.get("type") or "") != "Warning"
+            or event.get("target_identity_verified") is not True
+        ):
+            continue
+        try:
+            count = int(event.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count < 3:
+            continue
+        reason = str(event.get("reason") or "")
+        if family := _typed_reason_family(reason):
+            return _typed_cause(family, reason, evidence_id)
+    return None
+
+
+def _scheduling_typed_cause(
+    payload: dict, observation: dict, evidence_id: str
+) -> tuple[str, str, list[str]] | None:
+    """A PodScheduled reason, attributed to the scheduler that owns it."""
+    reason = _canonical_scheduling_reason(payload)
+    family = _typed_reason_family(reason) if reason else ""
+    if not family:
+        return None
+    # The dispositive table decides WHETHER this reason is a signature; the
+    # owning scheduler decides WHOSE. Same choke point as the ranker, or the
+    # floor-scored signature and the support gate would name different families
+    # for one Pod.
+    scheduled_by = observation.get("scheduler") if isinstance(observation, dict) else ""
+    family = scheduling_reason_family(reason, scheduled_by) or family
+    return _typed_cause(family, reason, evidence_id)
+
+
+_TYPED_STATE_CAUSES = {
+    "kubernetes_container_lifecycle": lambda payload, observation, evidence_id: (
+        _lifecycle_typed_cause(payload, evidence_id)
+    ),
+    "kubernetes_warning_events": lambda payload, observation, evidence_id: (
+        _warning_event_typed_cause(payload, evidence_id)
+    ),
+    "kubernetes_pod_scheduling": _scheduling_typed_cause,
+}
+
+
 def _dispositive_typed_state(
     results: list[CollectorResult],
     eligible_support_ids: set[str] | None,
@@ -5184,81 +5267,9 @@ def _dispositive_typed_state(
                 and observation.get("target_identity_verified") is True
             ):
                 continue
-            if getattr(item, "type", "") == "kubernetes_container_lifecycle":
-                containers = payload.get("containers")
-                if not isinstance(containers, list):
-                    continue
-                for container in containers:
-                    if not isinstance(container, dict):
-                        continue
-                    for state_key in ("state", "lastTerminated"):
-                        state = container.get(state_key)
-                        if not isinstance(state, dict):
-                            continue
-                        reason = str(state.get("reason") or "")
-                        if state_key == "state" and state.get("phase") not in {
-                            "waiting",
-                            "terminated",
-                        }:
-                            continue
-                        exit_code = state.get("exitCode")
-                        if state_key == "lastTerminated" and not (
-                            reason or exit_code is not None
-                        ):
-                            continue
-                        family = _typed_reason_family(reason)
-                        if family:
-                            return (
-                                family,
-                                f"typed container state {reason} on the alert Pod "
-                                "(machine-reported, not keyword-matched)",
-                                [evidence_id],
-                            )
-            if getattr(item, "type", "") == "kubernetes_warning_events":
-                events = payload.get("events")
-                if not isinstance(events, list):
-                    continue
-                for event in events:
-                    if not isinstance(event, dict):
-                        continue
-                    if (
-                        str(event.get("type") or "") != "Warning"
-                        or event.get("target_identity_verified") is not True
-                    ):
-                        continue
-                    try:
-                        count = int(event.get("count") or 0)
-                    except (TypeError, ValueError):
-                        count = 0
-                    if count < 3:
-                        continue
-                    reason = str(event.get("reason") or "")
-                    family = _typed_reason_family(reason)
-                    if family:
-                        return (
-                            family,
-                            f"typed container state {reason} on the alert Pod "
-                            "(machine-reported, not keyword-matched)",
-                            [evidence_id],
-                        )
-            if getattr(item, "type", "") == "kubernetes_pod_scheduling":
-                reason = _canonical_scheduling_reason(payload)
-                family = _typed_reason_family(reason) if reason else ""
-                if family:
-                    # The dispositive table decides WHETHER this reason is a
-                    # signature; the owning scheduler decides WHOSE. Same choke
-                    # point as the ranker, or the floor-scored signature and the
-                    # support gate would name different families for one Pod.
-                    scheduled_by = (
-                        observation.get("scheduler") if isinstance(observation, dict) else ""
-                    )
-                    family = scheduling_reason_family(reason, scheduled_by) or family
-                    return (
-                        family,
-                        f"typed container state {reason} on the alert Pod "
-                        "(machine-reported, not keyword-matched)",
-                        [evidence_id],
-                    )
+            find = _TYPED_STATE_CAUSES.get(str(getattr(item, "type", "")))
+            if find and (cause := find(payload, observation, evidence_id)):
+                return cause
     return "", "", []
 
 
@@ -7152,107 +7163,132 @@ _PROBE_LABELS = {
 }
 
 
+def _container_lifecycle_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    for container in payload.get("containers", []):
+        if not isinstance(container, dict):
+            continue
+        pairs = _resource_pairs(container.get("resources"), _CONTAINER_RESOURCE_KEYS, unset)
+        if image := str(container.get("image") or ""):
+            pairs.append(f"image {image}")
+        if pairs:
+            name = str(container.get("name") or "")
+            subject = f"{labels['container']} ({name})" if name else labels["container"]
+            return f"- {subject}: " + " · ".join(pairs)
+    return ""
+
+
+def _pod_scheduling_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    resources = payload.get("resources")
+    parts: list[str] = []
+    for name, spec in (resources or {}).items() if isinstance(resources, dict) else ():
+        requested = spec.get("requests") if isinstance(spec, dict) else None
+        if pairs := _flat_resource_pairs(requested, _CONTAINER_RESOURCE_KEYS):
+            parts.append(f"{name}: " + ", ".join(pairs))
+    selector = payload.get("node_selector")
+    if isinstance(selector, dict) and selector:
+        rendered = ", ".join(f"{key}={value}" for key, value in sorted(selector.items()))
+        parts.append(f"{labels['selector']} {rendered}")
+    if scheduler := str(payload.get("scheduler") or ""):
+        parts.append(f"{labels['scheduler']} {scheduler}")
+    parts.extend(_runai_allocation_parts(payload.get("runai_allocation"), labels))
+    return f"- {labels['requested']}: " + " · ".join(parts) if parts else ""
+
+
+def _queue_quota_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    parts = []
+    quota = str(payload.get("gpu_quota") or "")
+    requested = str(payload.get("gpu_requested") or "")
+    if quota or requested:
+        # requested/quota is the borrow question: above quota, the project is
+        # only served from idle capacity, and only if its weight allows it.
+        parts.append(
+            f"{labels['quota_gpu']} {requested or '?'}/{quota or labels['unlimited']}"
+        )
+    if allocated := str(payload.get("gpu_allocated") or ""):
+        parts.append(f"{labels['quota_allocated']} {allocated}")
+    if limit := str(payload.get("gpu_limit") or ""):
+        parts.append(f"{labels['quota_limit']} {limit}")
+    if weight := str(payload.get("gpu_over_quota_weight") or ""):
+        parts.append(f"{labels['quota_weight']} {weight}")
+    if pool := str(payload.get("node_pool") or ""):
+        parts.append(f"{labels['quota_pool']} {pool}")
+    if not parts:
+        return ""
+    queue = str(payload.get("queue") or "")
+    subject = f"{labels['quota']} ({queue})" if queue else labels["quota"]
+    return f"- {subject}: " + " · ".join(parts)
+
+
+def _storage_claim_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    claim = str(payload.get("claim") or "")
+    parts = []
+    if requested := payload.get("requested_storage"):
+        actual = payload.get("actual_storage")
+        # A bound PV can be larger than the request; both numbers matter.
+        parts.append(
+            f"{labels['requested_size']} {requested}"
+            + (f" ({labels['bound_size']} {actual})" if actual and actual != requested else "")
+        )
+    for key, label in (("storage_class", "storageClass"), ("volume_mode", "volumeMode")):
+        if value := payload.get(key):
+            parts.append(f"{label} {value}")
+    if modes := payload.get("access_modes"):
+        parts.append(", ".join(str(mode) for mode in modes))
+    if phase := payload.get("phase"):
+        parts.append(f"phase {phase}")
+    if volume := payload.get("volume_name"):
+        parts.append(f"PV {volume}")
+    if not parts:
+        return ""
+    subject = f"{labels['storage']} ({claim})" if claim else labels["storage"]
+    return f"- {subject}: " + " · ".join(parts)
+
+
+def _node_gpu_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    # The comparison a pending GPU workload turns on: what the node can give
+    # against what the Pods already on it hold.
+    node = str(payload.get("node") or "")
+    free, allocatable = payload.get("gpu_estimated_free"), payload.get("gpu_allocatable")
+    if free is None or allocatable is None:
+        return ""
+    parts = [
+        f"{labels['gpu_free']} {free}/{allocatable}",
+        f"{labels['gpu_held']} {payload.get('gpu_requested')}",
+    ]
+    if capacity := payload.get("gpu_capacity"):
+        parts.append(f"capacity {capacity}")
+    if pods := payload.get("scheduled_non_terminal_pods"):
+        parts.append(f"{labels['gpu_pods']} {pods}")
+    subject = f"{labels['gpu']} ({node})" if node else labels["gpu"]
+    return f"- {subject}: " + " · ".join(parts)
+
+
+def _node_condition_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    pairs = _flat_resource_pairs(payload.get("allocatable"), _NODE_RESOURCE_KEYS)
+    node = str(payload.get("node") or "")
+    if not pairs:
+        return ""
+    subject = f"{labels['node']} ({node})" if node else labels["node"]
+    return f"- {subject}: " + ", ".join(pairs)
+
+
+# Each observation kind renders the settings an operator would have to change,
+# never the observed values themselves.
+_CONFIGURATION_LINES: dict[str, Callable[[dict[str, Any], dict[str, str], str], str]] = {
+    "kubernetes_container_lifecycle": _container_lifecycle_config,
+    "kubernetes_pod_scheduling": _pod_scheduling_config,
+    "runai_queue_quota": _queue_quota_config,
+    "kubernetes_storage_claim": _storage_claim_config,
+    "kubernetes_node_gpu_resources": _node_gpu_config,
+    "kubernetes_node_condition": _node_condition_config,
+}
+
+
 def _configuration_line(
     kind: str, payload: dict[str, Any], labels: dict[str, str], unset: str
 ) -> str:
-    if kind == "kubernetes_container_lifecycle":
-        for container in payload.get("containers", []):
-            if not isinstance(container, dict):
-                continue
-            pairs = _resource_pairs(container.get("resources"), _CONTAINER_RESOURCE_KEYS, unset)
-            if image := str(container.get("image") or ""):
-                pairs.append(f"image {image}")
-            if pairs:
-                name = str(container.get("name") or "")
-                subject = f"{labels['container']} ({name})" if name else labels["container"]
-                return f"- {subject}: " + " · ".join(pairs)
-        return ""
-    if kind == "kubernetes_pod_scheduling":
-        resources = payload.get("resources")
-        parts: list[str] = []
-        for name, spec in (resources or {}).items() if isinstance(resources, dict) else ():
-            requested = spec.get("requests") if isinstance(spec, dict) else None
-            if pairs := _flat_resource_pairs(requested, _CONTAINER_RESOURCE_KEYS):
-                parts.append(f"{name}: " + ", ".join(pairs))
-        selector = payload.get("node_selector")
-        if isinstance(selector, dict) and selector:
-            rendered = ", ".join(f"{key}={value}" for key, value in sorted(selector.items()))
-            parts.append(f"{labels['selector']} {rendered}")
-        if scheduler := str(payload.get("scheduler") or ""):
-            parts.append(f"{labels['scheduler']} {scheduler}")
-        parts.extend(_runai_allocation_parts(payload.get("runai_allocation"), labels))
-        return f"- {labels['requested']}: " + " · ".join(parts) if parts else ""
-    if kind == "runai_queue_quota":
-        parts = []
-        quota = str(payload.get("gpu_quota") or "")
-        requested = str(payload.get("gpu_requested") or "")
-        if quota or requested:
-            # requested/quota is the borrow question: above quota, the project is
-            # only served from idle capacity, and only if its weight allows it.
-            parts.append(
-                f"{labels['quota_gpu']} {requested or '?'}/{quota or labels['unlimited']}"
-            )
-        if allocated := str(payload.get("gpu_allocated") or ""):
-            parts.append(f"{labels['quota_allocated']} {allocated}")
-        if limit := str(payload.get("gpu_limit") or ""):
-            parts.append(f"{labels['quota_limit']} {limit}")
-        if weight := str(payload.get("gpu_over_quota_weight") or ""):
-            parts.append(f"{labels['quota_weight']} {weight}")
-        if pool := str(payload.get("node_pool") or ""):
-            parts.append(f"{labels['quota_pool']} {pool}")
-        if not parts:
-            return ""
-        queue = str(payload.get("queue") or "")
-        subject = f"{labels['quota']} ({queue})" if queue else labels["quota"]
-        return f"- {subject}: " + " · ".join(parts)
-    if kind == "kubernetes_storage_claim":
-        claim = str(payload.get("claim") or "")
-        parts = []
-        if requested := payload.get("requested_storage"):
-            actual = payload.get("actual_storage")
-            # A bound PV can be larger than the request; both numbers matter.
-            parts.append(
-                f"{labels['requested_size']} {requested}"
-                + (f" ({labels['bound_size']} {actual})" if actual and actual != requested else "")
-            )
-        for key, label in (("storage_class", "storageClass"), ("volume_mode", "volumeMode")):
-            if value := payload.get(key):
-                parts.append(f"{label} {value}")
-        if modes := payload.get("access_modes"):
-            parts.append(", ".join(str(mode) for mode in modes))
-        if phase := payload.get("phase"):
-            parts.append(f"phase {phase}")
-        if volume := payload.get("volume_name"):
-            parts.append(f"PV {volume}")
-        if not parts:
-            return ""
-        subject = f"{labels['storage']} ({claim})" if claim else labels["storage"]
-        return f"- {subject}: " + " · ".join(parts)
-    if kind == "kubernetes_node_gpu_resources":
-        # The comparison a pending GPU workload turns on: what the node can give
-        # against what the Pods already on it hold.
-        node = str(payload.get("node") or "")
-        free, allocatable = payload.get("gpu_estimated_free"), payload.get("gpu_allocatable")
-        if free is None or allocatable is None:
-            return ""
-        parts = [
-            f"{labels['gpu_free']} {free}/{allocatable}",
-            f"{labels['gpu_held']} {payload.get('gpu_requested')}",
-        ]
-        if capacity := payload.get("gpu_capacity"):
-            parts.append(f"capacity {capacity}")
-        if pods := payload.get("scheduled_non_terminal_pods"):
-            parts.append(f"{labels['gpu_pods']} {pods}")
-        subject = f"{labels['gpu']} ({node})" if node else labels["gpu"]
-        return f"- {subject}: " + " · ".join(parts)
-    if kind == "kubernetes_node_condition":
-        pairs = _flat_resource_pairs(payload.get("allocatable"), _NODE_RESOURCE_KEYS)
-        node = str(payload.get("node") or "")
-        if not pairs:
-            return ""
-        subject = f"{labels['node']} ({node})" if node else labels["node"]
-        return f"- {subject}: " + ", ".join(pairs)
-    return ""
+    render = _CONFIGURATION_LINES.get(kind)
+    return render(payload, labels, unset) if render else ""
 
 
 def _as_sentence(text: str) -> str:

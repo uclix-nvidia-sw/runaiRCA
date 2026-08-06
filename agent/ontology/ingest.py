@@ -727,35 +727,14 @@ def _relate_trace_evidence(
     _trace_relation(tx, match, edge, f"$x isa {relation}, links (claim: $h, proof: $e)")
 
 
-def _write_trace_v3_projection(tx: Any, inc: OntologyIncident, ensured_evidence: set[str]) -> None:
-    """Write only the explicit, versioned hypothesis/probe trace contract."""
-    trace = inc.reasoning_trace_v3
-    if not inc.run_id or not isinstance(trace, dict):
-        return
-    try:
-        version = int(trace.get("schema_version") or 0)
-    except (TypeError, ValueError):
-        return
-    if version != 3:
-        return
-
-    raw_hypotheses = trace.get("hypotheses")
-    raw_evidence = trace.get("evidence")
-    raw_executions = trace.get("probe_executions")
-    if not isinstance(raw_hypotheses, list):
-        raw_hypotheses = []
-    if not isinstance(raw_evidence, list):
-        raw_evidence = []
-    if not isinstance(raw_executions, list):
-        raw_executions = []
-    _clear_trace_v3_projection(tx, inc.run_id)
-
-    evidence = {
-        evidence_id: evidence_id
-        for item in raw_evidence
-        if isinstance(item, dict)
-        if (evidence_id := _ensure_trace_evidence(tx, inc, item, ensured_evidence))
-    }
+def _write_trace_hypotheses(
+    tx: Any,
+    inc: OntologyIncident,
+    raw_hypotheses: list,
+    evidence: dict[str, str],
+    version: int,
+) -> dict[str, str]:
+    """Each hypothesis node, its run/incident edge, and its evidence links."""
     hypothesis_ids: dict[str, str] = {}
     for item in raw_hypotheses:
         if not isinstance(item, dict):
@@ -789,7 +768,18 @@ def _write_trace_v3_projection(tx: Any, inc: OntologyIncident, ensured_evidence:
         for evidence_id in item.get("evidence_against") or []:
             if _trace_id(evidence_id) in evidence:
                 _relate_trace_evidence(tx, hypothesis_id, evidence[_trace_id(evidence_id)], "contradicted_by")
+    return hypothesis_ids
 
+
+def _write_trace_probe_executions(
+    tx: Any,
+    inc: OntologyIncident,
+    raw_executions: list,
+    evidence: dict[str, str],
+    hypothesis_ids: dict[str, str],
+    version: int,
+) -> None:
+    """Each probe execution, bound to its authored template, hypotheses, evidence."""
     for item in raw_executions:
         if not isinstance(item, dict):
             continue
@@ -835,6 +825,11 @@ def _write_trace_v3_projection(tx: Any, inc: OntologyIncident, ensured_evidence:
             eedge = "$link isa probe_execution_evidence, links (execution: $x, proof: $e)"
             _trace_relation(tx, ematch, eedge, "$link isa probe_execution_evidence, links (execution: $x, proof: $e)")
 
+
+def _write_trace_rejected_links(
+    tx: Any, trace: dict, evidence: dict[str, str], hypothesis_ids: dict[str, str]
+) -> None:
+    """Evidence a hypothesis explicitly refused, with the stated reason."""
     for item in trace.get("rejected_evidence_links") or []:
         if not isinstance(item, dict):
             continue
@@ -851,6 +846,42 @@ def _write_trace_v3_projection(tx: Any, inc: OntologyIncident, ensured_evidence:
         if not list(tx.query(f"match {match} {edge}; select $x;").resolve().as_concept_rows()):
             suffix = f', has rejection_reason "{esc(reason)}"' if reason else ""
             tx.query(f"match {match} insert $x isa rejected_evidence_link, links (hypothesis: $h, proof: $e){suffix};").resolve()
+
+
+def _write_trace_v3_projection(tx: Any, inc: OntologyIncident, ensured_evidence: set[str]) -> None:
+    """Write only the explicit, versioned hypothesis/probe trace contract."""
+    trace = inc.reasoning_trace_v3
+    if not inc.run_id or not isinstance(trace, dict):
+        return
+    try:
+        version = int(trace.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        return
+    if version != 3:
+        return
+
+    raw_hypotheses = trace.get("hypotheses")
+    raw_evidence = trace.get("evidence")
+    raw_executions = trace.get("probe_executions")
+    if not isinstance(raw_hypotheses, list):
+        raw_hypotheses = []
+    if not isinstance(raw_evidence, list):
+        raw_evidence = []
+    if not isinstance(raw_executions, list):
+        raw_executions = []
+    _clear_trace_v3_projection(tx, inc.run_id)
+
+    evidence = {
+        evidence_id: evidence_id
+        for item in raw_evidence
+        if isinstance(item, dict)
+        if (evidence_id := _ensure_trace_evidence(tx, inc, item, ensured_evidence))
+    }
+    hypothesis_ids = _write_trace_hypotheses(tx, inc, raw_hypotheses, evidence, version)
+    _write_trace_probe_executions(
+        tx, inc, raw_executions, evidence, hypothesis_ids, version
+    )
+    _write_trace_rejected_links(tx, trace, evidence, hypothesis_ids)
     stop_reason = _trace_text(trace.get("stop_reason"), 300)
     if stop_reason:
         _replace_attr(tx, "analysis_run", "run_id", inc.run_id, "trace_stop_reason", stop_reason)

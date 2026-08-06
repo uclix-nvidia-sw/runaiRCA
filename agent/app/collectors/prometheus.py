@@ -996,18 +996,19 @@ def _has_prometheus_samples(
     return target_scope_verified is True
 
 
-def _prometheus_query_observation(
+def _prometheus_polarity(
     item: dict[str, object],
+    summary: dict[str, object],
     *,
+    name: str,
     time_range: dict[str, str] | None,
-    target: AnalysisTarget | None = None,
-    control_plane_namespaces: tuple[str, ...] = (),
-) -> dict[str, object]:
-    """Classify output without treating a non-empty all-zero vector as a failure."""
-    name = str(item.get("name") or "metric")
-    value_summary = item.get("value_summary")
-    summary = value_summary if isinstance(value_summary, dict) else {}
-    sample_window_verified = _prometheus_samples_in_window(summary, time_range)
+    sample_window_verified: bool | None,
+) -> tuple[str, str]:
+    """Per-metric semantics: what this reply proves about the incident window.
+
+    Every branch is a rule about what a Prometheus answer can and cannot
+    establish — an unbounded lookup, a counter without a delta, or a live
+    sample returned for a range request all stay context-only."""
     if item.get("error"):
         polarity, coverage = "unavailable", "unknown"
     else:
@@ -1110,6 +1111,28 @@ def _prometheus_query_observation(
             polarity, coverage = "absent", "scoped"
         else:
             polarity, coverage = "present", "scoped"
+    return polarity, coverage
+
+
+def _prometheus_query_observation(
+    item: dict[str, object],
+    *,
+    time_range: dict[str, str] | None,
+    target: AnalysisTarget | None = None,
+    control_plane_namespaces: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Classify output without treating a non-empty all-zero vector as a failure."""
+    name = str(item.get("name") or "metric")
+    value_summary = item.get("value_summary")
+    summary = value_summary if isinstance(value_summary, dict) else {}
+    sample_window_verified = _prometheus_samples_in_window(summary, time_range)
+    polarity, coverage = _prometheus_polarity(
+        item,
+        summary,
+        name=name,
+        time_range=time_range,
+        sample_window_verified=sample_window_verified,
+    )
     observed_entity: dict[str, str] | None = None
     target_scope_verified: bool | None = None
     if target is not None and polarity in {"present", "absent"}:
