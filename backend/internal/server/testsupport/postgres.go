@@ -23,6 +23,7 @@ func RegisterPostgresDriver(state *PostgresState) string {
 
 type PostgresState struct {
 	mu                       sync.Mutex
+	execLatency              time.Duration
 	failCreateVector         bool
 	failAnalysisRuns         bool
 	failAnalysisRunExecAfter int
@@ -64,6 +65,21 @@ func NewPostgresState(failCreateVector bool) *PostgresState {
 		emptyObjectJSON:  []byte(`{}`),
 		emptyArrayJSON:   []byte(`[]`),
 	}
+}
+
+// SetExecLatency makes every statement take as long as a real round-trip to a
+// Postgres in the same cluster, so a benchmark can see what a caller holding a
+// lock across several of them costs everyone else.
+func (s *PostgresState) SetExecLatency(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.execLatency = d
+}
+
+func (s *PostgresState) latency() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.execLatency
 }
 
 func (s *PostgresState) SetFailAnalysisRuns(value bool) {
@@ -222,6 +238,9 @@ func maxDollarPlaceholder(query string) int {
 }
 
 func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if d := c.state.latency(); d > 0 {
+		time.Sleep(d)
+	}
 	// Mimic Postgres bind semantics: it binds exactly the number of $N params the
 	// statement references. Passing extra args (a real bug that fails at runtime)
 	// used to silently "work" against this fake driver.

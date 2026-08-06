@@ -56,6 +56,9 @@ type recurrenceStatsCacheEntry struct {
 
 type Store struct {
 	mu sync.RWMutex
+	// dbMu serialises the Postgres writes that commitAfterUnlock runs with
+	// s.mu released. Lock order is always mu -> dbMu.
+	dbMu sync.Mutex
 	// Dense-score calibration state. Guarded by its own mutex: the centroid is
 	// read on the search path, which must never contend with the store lock.
 	centroidMu           sync.Mutex
@@ -535,8 +538,33 @@ func (s *Store) resolveAlertRecordLocked(
 
 func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) AlertUpsertResult {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	result, write := s.upsertAlertResultLocked(webhook, alert)
+	s.commitAfterUnlock(write)
+	return result
+}
 
+// commitAfterUnlock releases the store lock and only then runs write, so a
+// Postgres round trip never blocks a reader. dbMu is taken while s.mu is still
+// held, so writers still commit in the order they held the store lock.
+//
+// write may only touch clones the caller owns: once s.mu is released another
+// goroutine may be mutating the store's own objects. This is why only callers
+// that IGNORE the persist result can use it — the ones that roll their
+// in-memory change back when the write fails must stay under the lock.
+func (s *Store) commitAfterUnlock(write func()) {
+	if write == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.dbMu.Lock()
+	s.mu.Unlock()
+	defer s.dbMu.Unlock()
+	write()
+}
+
+func (s *Store) upsertAlertResultLocked(
+	webhook AlertmanagerWebhook, alert Alert,
+) (AlertUpsertResult, func()) {
 	if alert.Labels == nil {
 		alert.Labels = map[string]string{}
 	}
@@ -550,13 +578,13 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 	now := time.Now().UTC()
 	alertFiredAt := firstTime(alert.StartsAt, now)
 	if s.episodeTombstoneDropsLocked(fingerprint, alertStatus, alertFiredAt) {
-		return AlertUpsertResult{CorrelationKey: key, Dropped: true}
+		return AlertUpsertResult{CorrelationKey: key, Dropped: true}, nil
 	}
 	alertID, existingIDForFingerprint, incidentID, dropped := s.resolveAlertRecordLocked(
 		key, storageKey, fingerprint, alertFiredAt,
 	)
 	if dropped {
-		return AlertUpsertResult{CorrelationKey: key, Dropped: true}
+		return AlertUpsertResult{CorrelationKey: key, Dropped: true}, nil
 	}
 	newIncident := false
 	if incidentID == "" {
@@ -667,9 +695,13 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		!previousFiredAt.Equal(record.FiredAt) ||
 		previousOccurrenceCount != record.OccurrenceCount ||
 		!sameTimePtr(previousResolvedAt, record.ResolvedAt)
-	s.persistIncidentLocked(incident)
-	s.persistAlertLocked(record)
 	s.invalidateRecurrenceStatsLocked()
+	// Clones, because these writes run after the lock is released.
+	incidentRow, alertRow := cloneIncident(incident), cloneAlert(record)
+	write := func() {
+		s.persistIncidentLocked(incidentRow)
+		s.persistAlertLocked(alertRow)
+	}
 	return AlertUpsertResult{
 		Incident:         cloneIncident(incident),
 		Alert:            cloneAlert(record),
@@ -678,7 +710,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		NewAlert:         newAlert,
 		Changed:          changed,
 		IncidentResolved: previousIncidentStatus != "resolved" && incident.Status == "resolved",
-	}
+	}, write
 }
 
 func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident, firedAt time.Time) bool {
