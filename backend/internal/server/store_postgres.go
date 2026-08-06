@@ -1384,6 +1384,25 @@ func (s *Store) persistIncidentLocked(incident *Incident) bool {
 	return true
 }
 
+// execExactlyOne runs a statement that must change exactly one row. Anything
+// else fails the transaction — including a WHERE that matched nothing, which is
+// how a status guard narrower than the in-memory gate reports "could not
+// persist" rather than silently doing nothing. what names the operation in the
+// error log.
+//
+// The handful of call sites that log their OWN sentence for the no-match case
+// ("candidate was not ready for approval") keep their inline form: for them the
+// reason the WHERE missed is the diagnostic, not an implementation detail.
+func execExactlyOne(ctx context.Context, tx *sql.Tx, what, query string, args ...any) bool {
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		log.Printf("Failed to %s: %v", what, err)
+		return false
+	}
+	changed, err := result.RowsAffected()
+	return err == nil && changed == 1
+}
+
 // withTransaction runs work inside one transaction, committing only when it
 // returns true and rolling back otherwise. what names the operation in both log
 // lines; argsValid carries the caller's own precondition.
@@ -1840,20 +1859,12 @@ func (s *Store) persistKnowledgeApprovalLocked(candidate *KnowledgeCandidate, pk
 
 func (s *Store) persistKnowledgeActivationLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, prior *KnowledgePackage, event *KnowledgeEvent) bool {
 	return s.withTransaction("knowledge shadow activation", true, func(ctx context.Context, tx *sql.Tx) bool {
-		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, payload = $2, decided_at = $3, decided_by = $4, decision_note = $5, updated_at = $6 WHERE candidate_id = $7 AND status = 'shadow'`, candidate.Status, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
-		if err != nil {
-			log.Printf("Failed to activate knowledge candidate %s: %v", candidate.CandidateID, err)
+		if !execExactlyOne(ctx, tx, fmt.Sprintf("activate knowledge candidate %s", candidate.CandidateID),
+			`UPDATE knowledge_candidates SET status = $1, payload = $2, decided_at = $3, decided_by = $4, decision_note = $5, updated_at = $6 WHERE candidate_id = $7 AND status = 'shadow'`, candidate.Status, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID) {
 			return false
 		}
-		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-			return false
-		}
-		result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = $1, payload = $2 WHERE package_id = $3 AND status = 'shadow'`, pkg.Status, mustJSON(pkg.Payload), pkg.PackageID)
-		if err != nil {
-			log.Printf("Failed to activate knowledge package %s: %v", pkg.PackageID, err)
-			return false
-		}
-		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		if !execExactlyOne(ctx, tx, fmt.Sprintf("activate knowledge package %s", pkg.PackageID),
+			`UPDATE knowledge_packages SET status = $1, payload = $2 WHERE package_id = $3 AND status = 'shadow'`, pkg.Status, mustJSON(pkg.Payload), pkg.PackageID) {
 			return false
 		}
 		if prior != nil {
@@ -1875,20 +1886,12 @@ func (s *Store) persistKnowledgeActivationLocked(candidate *KnowledgeCandidate, 
 
 func (s *Store) persistKnowledgeShadowRejectionLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, event *KnowledgeEvent) bool {
 	return s.withTransaction("knowledge shadow rejection", true, func(ctx context.Context, tx *sql.Tx) bool {
-		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates SET status = $1, payload = $2, decided_at = $3, decided_by = $4, decision_note = $5, updated_at = $6 WHERE candidate_id = $7 AND status = 'shadow'`, candidate.Status, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
-		if err != nil {
-			log.Printf("Failed to reject shadow knowledge candidate %s: %v", candidate.CandidateID, err)
+		if !execExactlyOne(ctx, tx, fmt.Sprintf("reject shadow knowledge candidate %s", candidate.CandidateID),
+			`UPDATE knowledge_candidates SET status = $1, payload = $2, decided_at = $3, decided_by = $4, decision_note = $5, updated_at = $6 WHERE candidate_id = $7 AND status = 'shadow'`, candidate.Status, mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID) {
 			return false
 		}
-		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
-			return false
-		}
-		result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages SET status = $1, payload = $2, retired_at = $3, retired_by = $4, retirement_note = $5 WHERE package_id = $6 AND status = 'shadow'`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID)
-		if err != nil {
-			log.Printf("Failed to retire shadow knowledge package %s: %v", pkg.PackageID, err)
-			return false
-		}
-		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+		if !execExactlyOne(ctx, tx, fmt.Sprintf("retire shadow knowledge package %s", pkg.PackageID),
+			`UPDATE knowledge_packages SET status = $1, payload = $2, retired_at = $3, retired_by = $4, retirement_note = $5 WHERE package_id = $6 AND status = 'shadow'`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt, pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID) {
 			return false
 		}
 		if !persistKnowledgeEventTx(ctx, tx, event) {
@@ -1900,30 +1903,22 @@ func (s *Store) persistKnowledgeShadowRejectionLocked(candidate *KnowledgeCandid
 
 func (s *Store) persistKnowledgeReviewInvalidationLocked(candidate *KnowledgeCandidate, pkg *KnowledgePackage, event *KnowledgeEvent) bool {
 	return s.withTransaction("knowledge review invalidation", candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
-		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+		if !execExactlyOne(ctx, tx, fmt.Sprintf("invalidate knowledge candidate %s", candidate.CandidateID),
+			`UPDATE knowledge_candidates
 			SET status = $1, validation_error = $2, payload = $3, decided_at = $4,
 			    decided_by = $5, decision_note = $6, updated_at = $7
 			WHERE candidate_id = $8`, candidate.Status, candidate.ValidationError,
 			mustJSON(candidate.Payload), candidate.DecidedAt, candidate.DecidedBy,
-			candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID)
-		if err != nil {
-			log.Printf("Failed to invalidate knowledge candidate %s: %v", candidate.CandidateID, err)
-			return false
-		}
-		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			candidate.DecisionNote, candidate.UpdatedAt, candidate.CandidateID) {
 			return false
 		}
 		if pkg != nil {
-			result, err = tx.ExecContext(ctx, `UPDATE knowledge_packages
+			if !execExactlyOne(ctx, tx, fmt.Sprintf("retire invalidated knowledge package %s", pkg.PackageID),
+				`UPDATE knowledge_packages
 				SET status = $1, payload = $2, retired_at = $3, retired_by = $4,
 				    retirement_note = $5
 				WHERE package_id = $6`, pkg.Status, mustJSON(pkg.Payload), pkg.RetiredAt,
-				pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID)
-			if err != nil {
-				log.Printf("Failed to retire invalidated knowledge package %s: %v", pkg.PackageID, err)
-				return false
-			}
-			if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+				pkg.RetiredBy, pkg.RetirementNote, pkg.PackageID) {
 				return false
 			}
 		}
@@ -1936,18 +1931,14 @@ func (s *Store) persistKnowledgeReviewInvalidationLocked(candidate *KnowledgeCan
 
 func (s *Store) persistKnowledgeReviewRevalidationLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
 	return s.withTransaction("knowledge review revalidation", candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
-		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+		if !execExactlyOne(ctx, tx, fmt.Sprintf("revalidate knowledge candidate %s", candidate.CandidateID),
+			`UPDATE knowledge_candidates
 			SET status = $1, package_id = '', validation_error = '', trace = $2,
 			    payload = $3, decided_at = NULL, decided_by = '', decision_note = '',
 			    updated_at = $4
 			WHERE candidate_id = $5 AND status = 'validation_failed'`,
 			candidate.Status, mustJSON(candidate.Trace), mustJSON(candidate.Payload),
-			candidate.UpdatedAt, candidate.CandidateID)
-		if err != nil {
-			log.Printf("Failed to revalidate knowledge candidate %s: %v", candidate.CandidateID, err)
-			return false
-		}
-		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			candidate.UpdatedAt, candidate.CandidateID) {
 			return false
 		}
 		if !persistKnowledgeEventTx(ctx, tx, event) {
@@ -1959,16 +1950,12 @@ func (s *Store) persistKnowledgeReviewRevalidationLocked(candidate *KnowledgeCan
 
 func (s *Store) persistKnowledgeCandidateValidationRefreshLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
 	return s.withTransaction("knowledge candidate validation refresh", candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
-		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+		if !execExactlyOne(ctx, tx, fmt.Sprintf("refresh knowledge candidate validation %s", candidate.CandidateID),
+			`UPDATE knowledge_candidates
 			SET validation_error = $1, trace = $2, payload = $3, updated_at = $4
 			WHERE candidate_id = $5 AND status = 'validation_failed'`,
 			candidate.ValidationError, mustJSON(candidate.Trace), mustJSON(candidate.Payload),
-			candidate.UpdatedAt, candidate.CandidateID)
-		if err != nil {
-			log.Printf("Failed to refresh knowledge candidate validation %s: %v", candidate.CandidateID, err)
-			return false
-		}
-		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			candidate.UpdatedAt, candidate.CandidateID) {
 			return false
 		}
 		if !persistKnowledgeEventTx(ctx, tx, event) {
@@ -1983,15 +1970,11 @@ func (s *Store) persistKnowledgeCandidateValidationRefreshLocked(candidate *Know
 // concurrent decision: once a candidate leaves review, curation is closed.
 func (s *Store) persistKnowledgeCandidateActionsLocked(candidate *KnowledgeCandidate, event *KnowledgeEvent) bool {
 	return s.withTransaction("knowledge candidate action curation", candidate != nil && event != nil, func(ctx context.Context, tx *sql.Tx) bool {
-		result, err := tx.ExecContext(ctx, `UPDATE knowledge_candidates
+		if !execExactlyOne(ctx, tx, fmt.Sprintf("persist knowledge candidate action curation %s", candidate.CandidateID),
+			`UPDATE knowledge_candidates
 			SET payload = $1, updated_at = $2
 			WHERE candidate_id = $3 AND status = $4`,
-			mustJSON(candidate.Payload), candidate.UpdatedAt, candidate.CandidateID, knowledgeCandidateReady)
-		if err != nil {
-			log.Printf("Failed to persist knowledge candidate action curation %s: %v", candidate.CandidateID, err)
-			return false
-		}
-		if changed, err := result.RowsAffected(); err != nil || changed != 1 {
+			mustJSON(candidate.Payload), candidate.UpdatedAt, candidate.CandidateID, knowledgeCandidateReady) {
 			return false
 		}
 		if !persistKnowledgeEventTx(ctx, tx, event) {
