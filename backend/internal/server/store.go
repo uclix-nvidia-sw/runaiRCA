@@ -462,47 +462,42 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 	return result.Incident, result.Alert
 }
 
-func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) AlertUpsertResult {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if alert.Labels == nil {
-		alert.Labels = map[string]string{}
+// episodeTombstoneDropsLocked reports whether a purged episode should swallow
+// this webhook. The tombstone is cleared once its episode ends (the resolve) or
+// a strictly newer firing arrives; see clearEpisodeTombstoneLocked.
+func (s *Store) episodeTombstoneDropsLocked(fingerprint, alertStatus string, alertFiredAt time.Time) bool {
+	tombstone, ok := s.deletedEpisodes[fingerprint]
+	if !ok {
+		return false
 	}
-	if alert.Annotations == nil {
-		alert.Annotations = map[string]string{}
-	}
-	key := correlationKey(webhook, alert)
-	fingerprint := alertIdentity(alert)
-	storageKey := alertStorageKey(webhook, alert, key)
-	alertStatus := status(alert.Status)
-	now := time.Now().UTC()
-	alertFiredAt := firstTime(alert.StartsAt, now)
-	if tombstone, ok := s.deletedEpisodes[fingerprint]; ok {
-		if tombstone.FiredAt.Equal(alertFiredAt) {
-			// The operator purged this exact firing; its resolve notification
-			// ends the episode, so the tombstone has done its job.
-			if alertStatus == "resolved" {
-				s.clearEpisodeTombstoneLocked(fingerprint)
-			}
-			return AlertUpsertResult{CorrelationKey: key, Dropped: true}
-		}
-		if alertFiredAt.After(tombstone.FiredAt) {
+	if tombstone.FiredAt.Equal(alertFiredAt) {
+		// The operator purged this exact firing; its resolve notification
+		// ends the episode, so the tombstone has done its job.
+		if alertStatus == "resolved" {
 			s.clearEpisodeTombstoneLocked(fingerprint)
 		}
+		return true
 	}
-	alertID := ""
+	if alertFiredAt.After(tombstone.FiredAt) {
+		s.clearEpisodeTombstoneLocked(fingerprint)
+	}
+	return false
+}
+
+// resolveAlertRecordLocked finds the alert row and incident this webhook belongs
+// to. dropped is true when the episode was trashed and must not be resurrected.
+func (s *Store) resolveAlertRecordLocked(
+	key, storageKey, fingerprint string, alertFiredAt time.Time,
+) (alertID, existingIDForFingerprint, incidentID string, dropped bool) {
 	if storageKey != "" {
 		alertID = s.alertByGroup[storageKey]
 	}
-	existingIDForFingerprint := ""
 	if fingerprint != "" {
 		existingIDForFingerprint = s.alertByFinger[fingerprint]
 	}
 	if alertID == "" && existingIDForFingerprint != "" {
 		alertID = existingIDForFingerprint
 	}
-	incidentID := ""
 	if alertID != "" {
 		if existing := s.alerts[alertID]; existing != nil {
 			existingIncident := s.incidents[existing.IncidentID]
@@ -519,7 +514,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 				if sameEpisode {
 					// The operator trashed this episode; don't resurrect it as a
 					// fresh active row on every resend.
-					return AlertUpsertResult{CorrelationKey: key, Dropped: true}
+					return "", "", "", true
 				}
 				alertID = ""
 			case sameEpisode || s.shouldReuseIncidentForAlertLocked(key, existingIncident, alertFiredAt):
@@ -534,6 +529,34 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		if incidentID != "" && !s.shouldReuseIncidentForAlertLocked(key, s.incidents[incidentID], alertFiredAt) {
 			incidentID = ""
 		}
+	}
+	return alertID, existingIDForFingerprint, incidentID, false
+}
+
+func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) AlertUpsertResult {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if alert.Labels == nil {
+		alert.Labels = map[string]string{}
+	}
+	if alert.Annotations == nil {
+		alert.Annotations = map[string]string{}
+	}
+	key := correlationKey(webhook, alert)
+	fingerprint := alertIdentity(alert)
+	storageKey := alertStorageKey(webhook, alert, key)
+	alertStatus := status(alert.Status)
+	now := time.Now().UTC()
+	alertFiredAt := firstTime(alert.StartsAt, now)
+	if s.episodeTombstoneDropsLocked(fingerprint, alertStatus, alertFiredAt) {
+		return AlertUpsertResult{CorrelationKey: key, Dropped: true}
+	}
+	alertID, existingIDForFingerprint, incidentID, dropped := s.resolveAlertRecordLocked(
+		key, storageKey, fingerprint, alertFiredAt,
+	)
+	if dropped {
+		return AlertUpsertResult{CorrelationKey: key, Dropped: true}
 	}
 	newIncident := false
 	if incidentID == "" {
@@ -1065,41 +1088,41 @@ func (s *Store) HardDeleteIncident(id string) bool {
 		}
 	}
 	for key, record := range s.feedback {
-		if record == nil {
-			continue
-		}
-		if record.IncidentID == id || (record.TargetType == "incident" && record.TargetID == id) {
+		if record != nil && hangsOffIncident(id, alertIDs, record.IncidentID, record.AlertID, record.TargetType, record.TargetID) {
 			delete(s.feedback, key)
-			continue
-		}
-		if _, ok := alertIDs[record.AlertID]; ok {
-			delete(s.feedback, key)
-			continue
-		}
-		if record.TargetType == "alert" {
-			if _, ok := alertIDs[record.TargetID]; ok {
-				delete(s.feedback, key)
-			}
 		}
 	}
 	for key, record := range s.comments {
-		if record == nil {
-			continue
-		}
-		if record.IncidentID == id || (record.TargetType == "incident" && record.TargetID == id) {
+		if record != nil && hangsOffIncident(id, alertIDs, record.IncidentID, record.AlertID, record.TargetType, record.TargetID) {
 			delete(s.comments, key)
-			continue
-		}
-		if _, ok := alertIDs[record.AlertID]; ok {
-			delete(s.comments, key)
-			continue
-		}
-		if record.TargetType == "alert" {
-			if _, ok := alertIDs[record.TargetID]; ok {
-				delete(s.comments, key)
-			}
 		}
 	}
+	s.purgeAnalysisRunsForIncidentLocked(id, alertIDs)
+	s.invalidateRecurrenceStatsLocked()
+	return true
+}
+
+// hangsOffIncident reports whether a feedback/comment row belongs to the
+// incident being purged, either directly or through one of its alerts.
+func hangsOffIncident(
+	id string, alertIDs map[string]struct{}, rowIncidentID, rowAlertID, targetType, targetID string,
+) bool {
+	if rowIncidentID == id || (targetType == "incident" && targetID == id) {
+		return true
+	}
+	if _, ok := alertIDs[rowAlertID]; ok {
+		return true
+	}
+	if targetType == "alert" {
+		_, ok := alertIDs[targetID]
+		return ok
+	}
+	return false
+}
+
+// purgeAnalysisRunsForIncidentLocked drops the incident's runs and every
+// evaluation review that pointed at them.
+func (s *Store) purgeAnalysisRunsForIncidentLocked(id string, alertIDs map[string]struct{}) {
 	for key, run := range s.analysisRuns {
 		if run == nil {
 			continue
@@ -1108,17 +1131,16 @@ func (s *Store) HardDeleteIncident(id string) bool {
 		if !remove {
 			_, remove = alertIDs[run.AlertID]
 		}
-		if remove {
-			for reviewKey, review := range s.evaluationReviews {
-				if review != nil && review.RunID == run.RunID {
-					delete(s.evaluationReviews, reviewKey)
-				}
-			}
-			delete(s.analysisRuns, key)
+		if !remove {
+			continue
 		}
+		for reviewKey, review := range s.evaluationReviews {
+			if review != nil && review.RunID == run.RunID {
+				delete(s.evaluationReviews, reviewKey)
+			}
+		}
+		delete(s.analysisRuns, key)
 	}
-	s.invalidateRecurrenceStatsLocked()
-	return true
 }
 
 // deletedEpisodeRetention bounds how long a purged episode's tombstone keeps

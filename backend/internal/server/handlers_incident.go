@@ -221,32 +221,302 @@ func (s *Server) handleIncident(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "incident not found")
 }
 
+// Every incident action here is POST /api/v1/incidents/{id}/{action} with
+// nothing after it, so the switch used to repeat that same guard nine times.
+// "comments" is deliberately absent: it owns the rest of the path and its own
+// methods, and is dispatched before this table.
+var incidentActions = map[string]func(*Server, http.ResponseWriter, *http.Request, string){
+	"rca-correction": (*Server).incidentRCACorrection,
+	"rca-pin":        (*Server).incidentRCAPin,
+	"reverify":       (*Server).incidentReverify,
+	"analyze":        (*Server).incidentAnalyze,
+	"cancel":         (*Server).incidentCancelAnalysis,
+	"resolve":        (*Server).incidentResolve,
+	"feedback":       (*Server).incidentFeedback,
+	"vote":           (*Server).incidentFeedback,
+	"archive": func(s *Server, w http.ResponseWriter, r *http.Request, id string) {
+		s.incidentArchive(w, r, id, "archive")
+	},
+	"unarchive": func(s *Server, w http.ResponseWriter, r *http.Request, id string) {
+		s.incidentArchive(w, r, id, "unarchive")
+	},
+	"restore": func(s *Server, w http.ResponseWriter, r *http.Request, id string) {
+		s.incidentArchive(w, r, id, "restore")
+	},
+}
+
+// DELETE /api/v1/incidents/{id}; ?permanent=true skips the trash.
+func (s *Server) deleteIncident(w http.ResponseWriter, r *http.Request, id string) {
+	if id == "" {
+		writeError(w, http.StatusNotFound, "incident id required")
+		return
+	}
+	permanent := strings.EqualFold(r.URL.Query().Get("permanent"), "true")
+	if permanent {
+		if !s.store.HardDeleteIncident(id) {
+			writeError(w, http.StatusNotFound, "incident not found")
+			return
+		}
+		s.hub.Broadcast(incidentUpdatedEvent(id, "delete_permanent", "", nil, nil))
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+		return
+	}
+	incident, ok := s.store.SoftDeleteIncident(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "incident not found")
+		return
+	}
+	s.hub.Broadcast(incidentUpdatedEvent(id, "delete", incident.Status, incident.ArchivedAt, incident.DeletedAt))
+	writeJSON(w, http.StatusOK, envelope(incident))
+	return
+}
+
+// The operator overrides the RCA: a new run authored by them, not the agent.
+func (s *Server) incidentRCACorrection(w http.ResponseWriter, r *http.Request, id string) {
+	detail, ok := s.store.IncidentDetail(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "incident not found")
+		return
+	}
+	var req rcaCorrectionRequest
+	if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+		writeError(w, status, err.Error())
+		return
+	}
+	req.RootCauseFamily = strings.TrimSpace(req.RootCauseFamily)
+	req.NewCause = strings.TrimSpace(req.NewCause)
+	req.Summary = strings.TrimSpace(req.Summary)
+	if req.Summary == "" {
+		writeError(w, http.StatusBadRequest, "summary is required")
+		return
+	}
+	if req.NewCause != "" && req.RootCauseFamily != "" {
+		writeError(w, http.StatusBadRequest, "new_cause and root_cause_family are mutually exclusive")
+		return
+	}
+	if len([]rune(req.NewCause)) > 200 {
+		writeError(w, http.StatusBadRequest, "new_cause must be 200 characters or fewer")
+		return
+	}
+	catalog, err := s.fetchRootCauseFamilyCatalog(r.Context())
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "root-cause family catalog unavailable")
+		return
+	}
+	reused := ""
+	if req.NewCause != "" {
+		family, fingerprint := novelFamilySlug(req.NewCause)
+		for _, known := range catalog.Families {
+			if compactCause(known) == compactCause(req.NewCause) {
+				family = known
+				reused = known
+				break
+			}
+		}
+		if reused == "" {
+			if existing := s.existingNovelFamily(req.NewCause, fingerprint); existing != "" {
+				family, reused = existing, existing
+			}
+		}
+		req.RootCauseFamily = family
+	}
+	if !mapContains(catalog.Families, req.RootCauseFamily) && !strings.HasPrefix(req.RootCauseFamily, "novel_") {
+		writeError(w, http.StatusBadRequest, "root_cause_family must be selected from the root-cause family catalog")
+		return
+	}
+	actions := compactCorrectionActions(req.Actions)
+	detailMarkdown := renderOperatorCorrectionDetail(req.RootCauseFamily, req.Summary, actions, detail.AnalysisRunID, s.language)
+	alertID := ""
+	if len(detail.Alerts) > 0 {
+		alertID = detail.Alerts[0].AlertID
+	}
+	run, created := s.store.CreateOperatorRun(id, alertID, detail.AnalysisRunID, req.RootCauseFamily, req.Summary, detailMarkdown)
+	if !created {
+		writeError(w, http.StatusInternalServerError, "could not persist operator RCA correction")
+		return
+	}
+	s.broadcastAnalysisRunCompleted(run, id, alertID)
+	if reused != "" {
+		run.Metadata["reused_family"] = reused
+	}
+	writeJSON(w, http.StatusCreated, envelope(run))
+}
+
+// Pin (or unpin) the latest operator correction as the incident's answer.
+func (s *Server) incidentRCAPin(w http.ResponseWriter, r *http.Request, id string) {
+	if _, ok := s.store.IncidentDetail(id); !ok {
+		writeError(w, http.StatusNotFound, "incident not found")
+		return
+	}
+	var req rcaPinRequest
+	if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
+		writeError(w, status, err.Error())
+		return
+	}
+	if req.Pinned == nil {
+		writeError(w, http.StatusBadRequest, "pinned is required")
+		return
+	}
+	run, ok := s.store.SetLatestOperatorRunPinned(id, *req.Pinned)
+	if !ok {
+		writeError(w, http.StatusNotFound, "operator RCA correction not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, envelope(run))
+}
+
+// Re-run the agent with the pinned operator correction as leading hypothesis.
+func (s *Server) incidentReverify(w http.ResponseWriter, r *http.Request, id string) {
+	operatorRun, ok := s.store.PinnedOperatorRun(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "pinned operator RCA correction not found")
+		return
+	}
+	prompt := fmt.Sprintf(
+		"Re-verify the operator RCA correction. Treat %q as the leading hypothesis, collect supporting and refuting evidence, and do not force the conclusion. Operator summary: %s",
+		operatorRun.RootCauseFamily,
+		operatorRun.AnalysisSummary,
+	)
+	run, started := s.startAnalysisRun("incident", id, "reverify", prompt)
+	if !started {
+		if run != nil && run.Status == "analyzing" {
+			writeJSON(w, http.StatusAccepted, map[string]any{"status": "analysis_already_running"})
+			return
+		}
+		writeError(w, http.StatusConflict, "incident has no analyzable alerts")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, envelope(run))
+}
+
+func (s *Server) incidentAnalyze(w http.ResponseWriter, r *http.Request, id string) {
+	detail, ok := s.store.IncidentDetail(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "incident not found")
+		return
+	}
+	if len(detail.Alerts) == 0 {
+		writeError(w, http.StatusConflict, "incident has no alerts to analyze")
+		return
+	}
+	// One incident-scoped run per click: the agent analyzes the representative
+	// firing alert with full incident context, and Slack gets exactly one
+	// thread reply. The old per-alert fanout made one click on a 3-alert
+	// incident produce 3 runs (and would have produced 3 Slack replies).
+	run, ok := s.startAnalysisRun("incident", id, "manual", "")
+	if !ok {
+		if run != nil && run.Status == "analyzing" {
+			writeJSON(w, http.StatusAccepted, map[string]any{
+				"status": "analysis_already_running",
+			})
+			return
+		}
+		writeError(w, http.StatusConflict, "incident has no analyzable alerts")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"status":        "analysis_requested",
+		"mode":          "incident",
+		"analysis_runs": 1,
+		"alert_count":   len(detail.Alerts),
+	})
+}
+
+func (s *Server) incidentCancelAnalysis(w http.ResponseWriter, r *http.Request, id string) {
+	detail, ok := s.store.IncidentDetail(id)
+	if !ok {
+		writeError(w, http.StatusNotFound, "incident not found")
+		return
+	}
+	runID := strings.TrimSpace(detail.ActiveAnalysisRunID)
+	if runID == "" {
+		runID = strings.TrimSpace(detail.AnalysisRunID)
+	}
+	if !detail.IsAnalyzing || runID == "" {
+		writeJSON(w, http.StatusOK, map[string]any{"status": "not_analyzing"})
+		return
+	}
+	// Stop the agent's in-flight pipeline. The existing analysis goroutine
+	// drives the run to a terminal state (clears is_analyzing + emits the SSE
+	// completion) when its now-cancelled agent call returns.
+	s.cancelAgentRun(runID)
+	writeJSON(w, http.StatusAccepted, map[string]any{"status": "cancel_requested", "run_id": runID})
+}
+
+// Toggle operator approval, which binds (or revokes) the CaseSnapshot.
+func (s *Server) incidentResolve(w http.ResponseWriter, r *http.Request, id string) {
+	now := time.Now().UTC()
+	s.store.mu.Lock()
+	incident := s.store.incidents[id]
+	if incident == nil {
+		s.store.mu.Unlock()
+		writeError(w, http.StatusNotFound, "incident not found")
+		return
+	}
+	if incident.UserApprovedAt == nil {
+		incident.UserApprovedAt = &now
+		// The approval binds a CaseSnapshot to the exact completed analysis
+		// hash. Re-analysis may update the run later, but it cannot rewrite
+		// this approved historical record.
+		if !s.store.approveCaseSnapshotLocked(incident, now) {
+			incident.UserApprovedAt = nil
+			s.store.mu.Unlock()
+			writeError(w, http.StatusInternalServerError, "could not persist approved RCA snapshot")
+			return
+		}
+		s.store.upsertApprovedIncidentMemoriesLocked(incident)
+	} else {
+		if !s.store.revokeCaseSnapshotsLocked(incident.IncidentID, now) {
+			s.store.mu.Unlock()
+			writeError(w, http.StatusInternalServerError, "could not revoke approved RCA snapshot")
+			return
+		}
+		incident.UserApprovedAt = nil
+	}
+	status := incident.Status
+	resolvedAt := incident.ResolvedAt
+	userApprovedAt := incident.UserApprovedAt
+	s.store.persistIncidentLocked(incident)
+	s.store.invalidateRecurrenceStatsLocked()
+	s.store.mu.Unlock()
+	s.hub.Broadcast(incidentResolvedEvent(id, status, resolvedAt, userApprovedAt))
+	if userApprovedAt != nil {
+		// Approval may have minted a knowledge candidate whose actions are the
+		// operator's verbatim, instance-specific text. Generalize them off the
+		// request path; failures leave the originals for manual curation.
+		go s.refineKnowledgeCandidateActions()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": status, "user_approved_at": userApprovedAt})
+}
+
+func (s *Server) incidentArchive(w http.ResponseWriter, r *http.Request, id string, action string) {
+	var incident *Incident
+	var ok bool
+	switch action {
+	case "archive":
+		incident, ok = s.store.ArchiveIncident(id, true)
+	case "unarchive":
+		incident, ok = s.store.ArchiveIncident(id, false)
+	case "restore":
+		incident, ok = s.store.RestoreIncident(id)
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "incident not found")
+		return
+	}
+	s.hub.Broadcast(incidentUpdatedEvent(id, action, incident.Status, incident.ArchivedAt, incident.DeletedAt))
+	writeJSON(w, http.StatusOK, envelope(incident))
+}
+
+func (s *Server) incidentFeedback(w http.ResponseWriter, r *http.Request, id string) {
+	s.handleFeedback(w, r, "incident", id)
+}
+
 func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 	rest := pathPart(r.URL.Path, "/api/v1/incidents/")
 	parts := strings.Split(strings.Trim(rest, "/"), "/")
 	if len(parts) == 1 && r.Method == http.MethodDelete {
-		id := parts[0]
-		if id == "" {
-			writeError(w, http.StatusNotFound, "incident id required")
-			return
-		}
-		permanent := strings.EqualFold(r.URL.Query().Get("permanent"), "true")
-		if permanent {
-			if !s.store.HardDeleteIncident(id) {
-				writeError(w, http.StatusNotFound, "incident not found")
-				return
-			}
-			s.hub.Broadcast(incidentUpdatedEvent(id, "delete_permanent", "", nil, nil))
-			writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
-			return
-		}
-		incident, ok := s.store.SoftDeleteIncident(id)
-		if !ok {
-			writeError(w, http.StatusNotFound, "incident not found")
-			return
-		}
-		s.hub.Broadcast(incidentUpdatedEvent(id, "delete", incident.Status, incident.ArchivedAt, incident.DeletedAt))
-		writeJSON(w, http.StatusOK, envelope(incident))
+		s.deleteIncident(w, r, parts[0])
 		return
 	}
 	if len(parts) < 2 {
@@ -254,271 +524,16 @@ func (s *Server) handleIncidentAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, action := parts[0], parts[1]
-	switch action {
-	case "rca-correction":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeError(w, http.StatusNotFound, "unknown incident action")
-			return
-		}
-		detail, ok := s.store.IncidentDetail(id)
-		if !ok {
-			writeError(w, http.StatusNotFound, "incident not found")
-			return
-		}
-		var req rcaCorrectionRequest
-		if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
-			writeError(w, status, err.Error())
-			return
-		}
-		req.RootCauseFamily = strings.TrimSpace(req.RootCauseFamily)
-		req.NewCause = strings.TrimSpace(req.NewCause)
-		req.Summary = strings.TrimSpace(req.Summary)
-		if req.Summary == "" {
-			writeError(w, http.StatusBadRequest, "summary is required")
-			return
-		}
-		if req.NewCause != "" && req.RootCauseFamily != "" {
-			writeError(w, http.StatusBadRequest, "new_cause and root_cause_family are mutually exclusive")
-			return
-		}
-		if len([]rune(req.NewCause)) > 200 {
-			writeError(w, http.StatusBadRequest, "new_cause must be 200 characters or fewer")
-			return
-		}
-		catalog, err := s.fetchRootCauseFamilyCatalog(r.Context())
-		if err != nil {
-			writeError(w, http.StatusServiceUnavailable, "root-cause family catalog unavailable")
-			return
-		}
-		reused := ""
-		if req.NewCause != "" {
-			family, fingerprint := novelFamilySlug(req.NewCause)
-			for _, known := range catalog.Families {
-				if compactCause(known) == compactCause(req.NewCause) {
-					family = known
-					reused = known
-					break
-				}
-			}
-			if reused == "" {
-				if existing := s.existingNovelFamily(req.NewCause, fingerprint); existing != "" {
-					family, reused = existing, existing
-				}
-			}
-			req.RootCauseFamily = family
-		}
-		if !mapContains(catalog.Families, req.RootCauseFamily) && !strings.HasPrefix(req.RootCauseFamily, "novel_") {
-			writeError(w, http.StatusBadRequest, "root_cause_family must be selected from the root-cause family catalog")
-			return
-		}
-		actions := compactCorrectionActions(req.Actions)
-		detailMarkdown := renderOperatorCorrectionDetail(req.RootCauseFamily, req.Summary, actions, detail.AnalysisRunID, s.language)
-		alertID := ""
-		if len(detail.Alerts) > 0 {
-			alertID = detail.Alerts[0].AlertID
-		}
-		run, created := s.store.CreateOperatorRun(id, alertID, detail.AnalysisRunID, req.RootCauseFamily, req.Summary, detailMarkdown)
-		if !created {
-			writeError(w, http.StatusInternalServerError, "could not persist operator RCA correction")
-			return
-		}
-		s.broadcastAnalysisRunCompleted(run, id, alertID)
-		if reused != "" {
-			run.Metadata["reused_family"] = reused
-		}
-		writeJSON(w, http.StatusCreated, envelope(run))
-	case "rca-pin":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeError(w, http.StatusNotFound, "unknown incident action")
-			return
-		}
-		if _, ok := s.store.IncidentDetail(id); !ok {
-			writeError(w, http.StatusNotFound, "incident not found")
-			return
-		}
-		var req rcaPinRequest
-		if status, err := decodeJSONBody(w, r, &req, maxJSONBodyBytes); err != nil {
-			writeError(w, status, err.Error())
-			return
-		}
-		if req.Pinned == nil {
-			writeError(w, http.StatusBadRequest, "pinned is required")
-			return
-		}
-		run, ok := s.store.SetLatestOperatorRunPinned(id, *req.Pinned)
-		if !ok {
-			writeError(w, http.StatusNotFound, "operator RCA correction not found")
-			return
-		}
-		writeJSON(w, http.StatusOK, envelope(run))
-	case "reverify":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeError(w, http.StatusNotFound, "unknown incident action")
-			return
-		}
-		operatorRun, ok := s.store.PinnedOperatorRun(id)
-		if !ok {
-			writeError(w, http.StatusNotFound, "pinned operator RCA correction not found")
-			return
-		}
-		prompt := fmt.Sprintf(
-			"Re-verify the operator RCA correction. Treat %q as the leading hypothesis, collect supporting and refuting evidence, and do not force the conclusion. Operator summary: %s",
-			operatorRun.RootCauseFamily,
-			operatorRun.AnalysisSummary,
-		)
-		run, started := s.startAnalysisRun("incident", id, "reverify", prompt)
-		if !started {
-			if run != nil && run.Status == "analyzing" {
-				writeJSON(w, http.StatusAccepted, map[string]any{"status": "analysis_already_running"})
-				return
-			}
-			writeError(w, http.StatusConflict, "incident has no analyzable alerts")
-			return
-		}
-		writeJSON(w, http.StatusAccepted, envelope(run))
-	case "analyze":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeError(w, http.StatusNotFound, "unknown incident action")
-			return
-		}
-		detail, ok := s.store.IncidentDetail(id)
-		if !ok {
-			writeError(w, http.StatusNotFound, "incident not found")
-			return
-		}
-		if len(detail.Alerts) == 0 {
-			writeError(w, http.StatusConflict, "incident has no alerts to analyze")
-			return
-		}
-		// One incident-scoped run per click: the agent analyzes the representative
-		// firing alert with full incident context, and Slack gets exactly one
-		// thread reply. The old per-alert fanout made one click on a 3-alert
-		// incident produce 3 runs (and would have produced 3 Slack replies).
-		run, ok := s.startAnalysisRun("incident", id, "manual", "")
-		if !ok {
-			if run != nil && run.Status == "analyzing" {
-				writeJSON(w, http.StatusAccepted, map[string]any{
-					"status": "analysis_already_running",
-				})
-				return
-			}
-			writeError(w, http.StatusConflict, "incident has no analyzable alerts")
-			return
-		}
-		writeJSON(w, http.StatusAccepted, map[string]any{
-			"status":        "analysis_requested",
-			"mode":          "incident",
-			"analysis_runs": 1,
-			"alert_count":   len(detail.Alerts),
-		})
-	case "cancel":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeError(w, http.StatusNotFound, "unknown incident action")
-			return
-		}
-		detail, ok := s.store.IncidentDetail(id)
-		if !ok {
-			writeError(w, http.StatusNotFound, "incident not found")
-			return
-		}
-		runID := strings.TrimSpace(detail.ActiveAnalysisRunID)
-		if runID == "" {
-			runID = strings.TrimSpace(detail.AnalysisRunID)
-		}
-		if !detail.IsAnalyzing || runID == "" {
-			writeJSON(w, http.StatusOK, map[string]any{"status": "not_analyzing"})
-			return
-		}
-		// Stop the agent's in-flight pipeline. The existing analysis goroutine
-		// drives the run to a terminal state (clears is_analyzing + emits the SSE
-		// completion) when its now-cancelled agent call returns.
-		s.cancelAgentRun(runID)
-		writeJSON(w, http.StatusAccepted, map[string]any{"status": "cancel_requested", "run_id": runID})
-	case "resolve":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeError(w, http.StatusNotFound, "unknown incident action")
-			return
-		}
-		now := time.Now().UTC()
-		s.store.mu.Lock()
-		incident := s.store.incidents[id]
-		if incident == nil {
-			s.store.mu.Unlock()
-			writeError(w, http.StatusNotFound, "incident not found")
-			return
-		}
-		if incident.UserApprovedAt == nil {
-			incident.UserApprovedAt = &now
-			// The approval binds a CaseSnapshot to the exact completed analysis
-			// hash. Re-analysis may update the run later, but it cannot rewrite
-			// this approved historical record.
-			if !s.store.approveCaseSnapshotLocked(incident, now) {
-				incident.UserApprovedAt = nil
-				s.store.mu.Unlock()
-				writeError(w, http.StatusInternalServerError, "could not persist approved RCA snapshot")
-				return
-			}
-			s.store.upsertApprovedIncidentMemoriesLocked(incident)
-		} else {
-			if !s.store.revokeCaseSnapshotsLocked(incident.IncidentID, now) {
-				s.store.mu.Unlock()
-				writeError(w, http.StatusInternalServerError, "could not revoke approved RCA snapshot")
-				return
-			}
-			incident.UserApprovedAt = nil
-		}
-		status := incident.Status
-		resolvedAt := incident.ResolvedAt
-		userApprovedAt := incident.UserApprovedAt
-		s.store.persistIncidentLocked(incident)
-		s.store.invalidateRecurrenceStatsLocked()
-		s.store.mu.Unlock()
-		s.hub.Broadcast(incidentResolvedEvent(id, status, resolvedAt, userApprovedAt))
-		if userApprovedAt != nil {
-			// Approval may have minted a knowledge candidate whose actions are the
-			// operator's verbatim, instance-specific text. Generalize them off the
-			// request path; failures leave the originals for manual curation.
-			go s.refineKnowledgeCandidateActions()
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"status": status, "user_approved_at": userApprovedAt})
-	case "archive", "unarchive", "restore":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeError(w, http.StatusNotFound, "unknown incident action")
-			return
-		}
-		var incident *Incident
-		var ok bool
-		switch action {
-		case "archive":
-			incident, ok = s.store.ArchiveIncident(id, true)
-		case "unarchive":
-			incident, ok = s.store.ArchiveIncident(id, false)
-		case "restore":
-			incident, ok = s.store.RestoreIncident(id)
-		}
-		if !ok {
-			writeError(w, http.StatusNotFound, "incident not found")
-			return
-		}
-		s.hub.Broadcast(incidentUpdatedEvent(id, action, incident.Status, incident.ArchivedAt, incident.DeletedAt))
-		writeJSON(w, http.StatusOK, envelope(incident))
-	case "feedback":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeError(w, http.StatusNotFound, "unknown incident action")
-			return
-		}
-		s.handleFeedback(w, r, "incident", id)
-	case "vote":
-		if len(parts) != 2 || r.Method != http.MethodPost {
-			writeError(w, http.StatusNotFound, "unknown incident action")
-			return
-		}
-		s.handleFeedback(w, r, "incident", id)
-	case "comments":
+	if action == "comments" {
 		s.handleCommentAction(w, r, "incident", id, parts)
-	default:
-		writeError(w, http.StatusNotFound, "unknown incident action")
+		return
 	}
+	handle, ok := incidentActions[action]
+	if !ok || len(parts) != 2 || r.Method != http.MethodPost {
+		writeError(w, http.StatusNotFound, "unknown incident action")
+		return
+	}
+	handle(s, w, r, id)
 }
 
 func compactCorrectionActions(actions []string) []string {
