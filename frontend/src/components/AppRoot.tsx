@@ -56,6 +56,9 @@ import { FeedbackPanel } from './workspace/FeedbackPanel';
 import { ConfidenceBreakdownPanel } from './workspace/ConfidenceBreakdownPanel';
 import { EvaluationPanel } from './workspace/EvaluationPanel';
 import { FloatingChat } from './workspace/FloatingChat';
+import { RcaCorrectionPanel } from './workspace/RcaCorrectionPanel';
+import { useRcaCorrection } from './workspace/rcaCorrection';
+import { useWorkspaceDialog } from './workspace/workspaceDialog';
 import { SimilarIncidentsPanel } from './workspace/SimilarIncidentsPanel';
 import { useRcaChat } from './workspace/chatSession';
 import { exportIncidentDocx } from '../exportDocx';
@@ -747,23 +750,6 @@ function UnifiedWorkspace({
   onResolve: (id: string) => Promise<void>;
 }) {
   const [busyAction, setBusyAction] = useState('');
-  const [closing, setClosing] = useState(false);
-  const [justApproved, setJustApproved] = useState(false);
-  const [correctionOpen, setCorrectionOpen] = useState(false);
-  const [correctionFamily, setCorrectionFamily] = useState('');
-  const [correctionNewCause, setCorrectionNewCause] = useState('');
-  const [correctionSuggestions, setCorrectionSuggestions] = useState<{ catalog: string[]; novel: Array<{ family: string; mechanism: string }>; slug: string }>();
-  const [correctionSummary, setCorrectionSummary] = useState('');
-  const [correctionActions, setCorrectionActions] = useState('');
-  const [correctionCatalogStatus, setCorrectionCatalogStatus] = useState<'loading' | 'ready' | 'failed'>('ready');
-  const [correctionFamilies, setCorrectionFamilies] = useState<string[]>([]);
-  const [correctionError, setCorrectionError] = useState('');
-  const [operatorActionError, setOperatorActionError] = useState('');
-  const [operatorPinnedOverride, setOperatorPinnedOverride] = useState<boolean>();
-  const closeTimerRef = useRef<number | null>(null);
-  const approveTimerRef = useRef<number | null>(null);
-  const correctionTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const correctionFamilyRef = useRef<HTMLSelectElement | null>(null);
   const runWorkspaceAction = useCallback(async (action: string, work: () => Promise<void>) => {
     if (busyAction) return;
     setBusyAction(action);
@@ -779,121 +765,27 @@ function UnifiedWorkspace({
       ? detail.data.incident_id
       : detail.data.alert_id
     : null;
+  const { closing, justApproved, handleClose, flashApproved, sectionRef } =
+    useWorkspaceDialog(detailKey, onClose);
+
+  // Every hook must run before the `if (!detail)` bail-out below: React matches
+  // hooks by call order, so one behind a conditional return crashes the panel
+  // the moment detail goes null.
+  const incident = detail?.kind === 'incident' ? detail.data : null;
+  const correction = useRcaCorrection({
+    incident,
+    analysisRun,
+    report: (analysisRun ?? detail?.data ?? {}) as { analysis_summary?: string; analysis_detail?: string },
+    busyAction,
+    setBusyAction,
+    onRefresh,
+    onReverify,
+  });
 
   // Opening a different target (or reopening) cancels any in-flight close, so the
   // new detail shows immediately instead of finishing the previous exit animation.
-  useEffect(() => {
-    setClosing(false);
-    if (closeTimerRef.current !== null) {
-      window.clearTimeout(closeTimerRef.current);
-      closeTimerRef.current = null;
-    }
-  }, [detailKey]);
-
-  useEffect(() => () => {
-    if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
-    if (approveTimerRef.current !== null) window.clearTimeout(approveTimerRef.current);
-  }, []);
-
-  useEffect(() => {
-    if (!correctionOpen) return undefined;
-    let cancelled = false;
-    setCorrectionCatalogStatus('loading');
-    setCorrectionError('');
-    void fetchRootCauseFamilies().then((families) => {
-      if (cancelled) return;
-      setCorrectionFamilies(families);
-      setCorrectionCatalogStatus('ready');
-      // "수정" edits the RCA the operator is looking at: seed the form from
-      // the current analysis. Pristine fields only, so reopening the panel
-      // never clobbers an in-progress edit.
-      if (!correctionFamily && !correctionNewCause && !correctionSummary && !correctionActions) {
-        const currentFamily = String(incident?.root_cause_family ?? '');
-        if (currentFamily && families.includes(currentFamily)) {
-          setCorrectionFamily(currentFamily);
-        }
-        const report = (analysisRun ?? detail?.data ?? {}) as {
-          analysis_summary?: string;
-          analysis_detail?: string;
-        };
-        setCorrectionSummary(report.analysis_summary ?? '');
-        setCorrectionActions(reportActionLines(report.analysis_detail ?? ''));
-      }
-    }).catch((err: unknown) => {
-      if (cancelled) return;
-      setCorrectionCatalogStatus('failed');
-      setCorrectionError(`Root-cause family catalog unavailable: ${errorMessage(err, 'Failed to load catalog.')}`);
-    });
-    return () => { cancelled = true; };
-  }, [correctionOpen]);
-
-  useEffect(() => {
-    if (!correctionNewCause.trim()) { setCorrectionSuggestions(undefined); return undefined; }
-    let cancelled = false;
-    const handle = window.setTimeout(() => { void fetchFamilySuggestions(correctionNewCause).then((value) => { if (!cancelled) setCorrectionSuggestions(value); }).catch(() => { if (!cancelled) setCorrectionSuggestions(undefined); }); }, 300);
-    return () => { cancelled = true; window.clearTimeout(handle); };
-  }, [correctionNewCause]);
-
-  useEffect(() => {
-    if (!correctionOpen) return undefined;
-    correctionFamilyRef.current?.focus();
-
-    const handleCorrectionKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      event.stopPropagation();
-      setCorrectionOpen(false);
-      correctionTriggerRef.current?.focus();
-    };
-
-    document.addEventListener('keydown', handleCorrectionKeyDown, true);
-    return () => document.removeEventListener('keydown', handleCorrectionKeyDown, true);
-  }, [correctionOpen]);
-
-  useEffect(() => {
-    setOperatorPinnedOverride(undefined);
-  }, [analysisRun?.run_id]);
-
-  // Play the exit animation, then let the parent unmount. Timer-based (not
-  // animationend) so it still closes under prefers-reduced-motion.
-  const handleClose = useCallback(() => {
-    if (closeTimerRef.current !== null) return;
-    setClosing(true);
-    closeTimerRef.current = window.setTimeout(() => {
-      closeTimerRef.current = null;
-      onClose();
-    }, 220);
-  }, [onClose]);
-
-  const flashApproved = useCallback(() => {
-    setJustApproved(true);
-    if (approveTimerRef.current !== null) window.clearTimeout(approveTimerRef.current);
-    approveTimerRef.current = window.setTimeout(() => {
-      approveTimerRef.current = null;
-      setJustApproved(false);
-    }, 1400);
-  }, []);
-
-  const sectionRef = useRef<HTMLElement | null>(null);
-  const openerRef = useRef<HTMLElement | null>(null);
-
-  // Dialog focus management: remember what opened the workspace (the table row
-  // activated by Enter/click), move focus into the dialog so Tab starts on its
-  // actions instead of the covered list, and hand focus back on close.
-  // useLayoutEffect, not useEffect: the same commit that mounts the dialog also
-  // hides `.main` (visibility), and the browser blurs the row during the style
-  // recalc that follows — a passive effect would only ever see <body> focused.
-  useLayoutEffect(() => {
-    if (!detailKey) return undefined;
-    openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    sectionRef.current?.focus();
-    return () => {
-      openerRef.current?.focus();
-    };
-  }, [detailKey]);
 
   if (!detail) return null;
-  const incident = detail.kind === 'incident' ? detail.data : null;
   const alert = detail.kind === 'alert' ? detail.data : null;
   const title = incident?.title ?? alert?.alarm_title ?? '';
   const id = incident?.incident_id ?? alert?.alert_id ?? '';
@@ -914,9 +806,6 @@ function UnifiedWorkspace({
     incident?.missing_data,
     incident?.artifacts?.length ?? 0,
   );
-  const isOperatorCorrection = analysisRun?.source === 'operator';
-  const operatorCorrectionPinned = isOperatorCorrection &&
-    (operatorPinnedOverride ?? analysisRun?.metadata?.pinned === true);
   const evidencePresentation = collectorEvidencePresentation({
     isAnalyzing,
     runStatus: analysisRun?.status,
@@ -931,54 +820,6 @@ function UnifiedWorkspace({
   const commentCount = feedback?.comments?.length ?? 0;
   const scrollToFeedback = () => {
     document.getElementById('operator-feedback')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  };
-  const saveCorrection = async () => {
-    if (!incident || busyAction || correctionCatalogStatus !== 'ready' || (!correctionFamily && !correctionNewCause.trim()) || !correctionSummary.trim()) return;
-    setBusyAction('rca-correction');
-    setCorrectionError('');
-    try {
-      await rcaCorrection(incident.incident_id, {
-        ...(correctionNewCause.trim() ? { new_cause: correctionNewCause.trim() } : { root_cause_family: correctionFamily }),
-        summary: correctionSummary.trim(),
-        actions: parseCorrectionActions(correctionActions),
-      });
-      await onRefresh();
-      setCorrectionOpen(false);
-      setCorrectionFamily('');
-      setCorrectionNewCause('');
-      setCorrectionSummary('');
-      setCorrectionActions('');
-    } catch (err) {
-      setCorrectionError(errorMessage(err, 'Failed to save RCA correction.'));
-    } finally {
-      setBusyAction('');
-    }
-  };
-  const updateOperatorPin = async () => {
-    if (!incident || !isOperatorCorrection || busyAction) return;
-    setBusyAction('rca-pin');
-    setOperatorActionError('');
-    try {
-      const run = await rcaPin(incident.incident_id, !operatorCorrectionPinned);
-      setOperatorPinnedOverride(run.metadata?.pinned === true);
-      await onRefresh();
-    } catch (err) {
-      setOperatorActionError(errorMessage(err, 'Failed to update RCA correction pin.'));
-    } finally {
-      setBusyAction('');
-    }
-  };
-  const reverifyCorrection = async () => {
-    if (!incident || !operatorCorrectionPinned || busyAction) return;
-    setBusyAction('reverify');
-    setOperatorActionError('');
-    try {
-      await onReverify(incident.incident_id);
-    } catch (err) {
-      setOperatorActionError(errorMessage(err, 'Failed to start re-verification.'));
-    } finally {
-      setBusyAction('');
-    }
   };
 
   return (
@@ -1059,27 +900,27 @@ function UnifiedWorkspace({
               <button
                 className="ghost-button"
                 disabled={Boolean(busyAction) || isAnalyzing}
-                onClick={() => setCorrectionOpen((open) => !open)}
-                ref={correctionTriggerRef}
+                onClick={() => correction.setOpen((open) => !open)}
+                ref={correction.triggerRef}
                 type="button"
               >
                 <FileText size={16} /> RCA 수정
               </button>
-              {isOperatorCorrection && (
+              {correction.isOperatorRun && (
                 <button
                   className={`ghost-button compact-button ${busyAction === 'rca-pin' ? 'is-busy' : ''}`}
                   disabled={Boolean(busyAction)}
-                  onClick={() => void updateOperatorPin()}
+                  onClick={() => void correction.togglePin()}
                   type="button"
                 >
-                  {busyAction === 'rca-pin' ? 'Updating...' : operatorCorrectionPinned ? '고정 해제' : '고정'}
+                  {busyAction === 'rca-pin' ? 'Updating...' : correction.pinned ? '고정 해제' : '고정'}
                 </button>
               )}
-              {operatorCorrectionPinned && (
+              {correction.pinned && (
                 <button
                   className={`ghost-button compact-button ${busyAction === 'reverify' ? 'is-busy' : ''}`}
                   disabled={Boolean(busyAction)}
-                  onClick={() => void reverifyCorrection()}
+                  onClick={() => void correction.reverify()}
                   type="button"
                 >
                   <RefreshCw size={14} /> {busyAction === 'reverify' ? 'Analyzing...' : '수정 결론으로 재검증'}
@@ -1146,79 +987,8 @@ function UnifiedWorkspace({
       )}
 
       <div className="workspace-body">
-        {incident && correctionOpen && (
-          <section className="rca-correction-panel evaluation-panel" aria-label="RCA correction">
-            <div className="section-title"><FileText size={18} /> RCA 수정</div>
-            {correctionError && <p className="feedback-error">{correctionError}</p>}
-            <form className="evaluation-form" onSubmit={(event) => { event.preventDefault(); void saveCorrection(); }}>
-              <label className="evaluation-field">
-                <span>Root-cause family</span>
-                <select
-                  ref={correctionFamilyRef}
-                  value={correctionFamily}
-                  onChange={(event) => setCorrectionFamily(event.target.value)}
-                  disabled={correctionCatalogStatus !== 'ready' || Boolean(busyAction)}
-                  required
-                >
-                  <option value="">
-                    {correctionCatalogStatus === 'loading'
-                      ? 'Loading families…'
-                      : correctionCatalogStatus === 'failed'
-                        ? 'Family catalog unavailable'
-                        : 'Select family'}
-                  </option>
-                  {correctionFamilies.map((family) => (
-                    <option key={family} value={family}>{family.split('_').join(' ')}</option>
-                  ))}
-                </select>
-              </label>
-              <label className="evaluation-field">
-                <span>New cause <small>Optional; leave blank to use the catalog family</small></span>
-                <input value={correctionNewCause} onChange={(event) => { setCorrectionNewCause(event.target.value); setCorrectionFamily(''); }} disabled={Boolean(busyAction)} maxLength={200} />
-                {correctionSuggestions && (
-                  <small>
-                    {correctionSuggestions.catalog.map((family) => <button key={family} type="button" className="link-button" onClick={() => { setCorrectionFamily(family); setCorrectionNewCause(''); }}>{family}</button>)}
-                    {correctionSuggestions.novel.map((item) => <button key={item.family} type="button" className="link-button" onClick={() => { setCorrectionFamily(item.family); setCorrectionNewCause(''); }}>{item.mechanism || item.family}</button>)}
-                    {correctionNewCause.trim() && <> New slug: <code>{correctionSuggestions.slug}</code></>}
-                  </small>
-                )}
-              </label>
-              <label className="evaluation-field">
-                <span>RCA summary</span>
-                <textarea
-                  value={correctionSummary}
-                  onChange={(event) => setCorrectionSummary(event.target.value)}
-                  disabled={Boolean(busyAction)}
-                  required
-                />
-              </label>
-              <label className="evaluation-field">
-                <span>Actions <small>One action per line</small></span>
-                <textarea
-                  value={correctionActions}
-                  onChange={(event) => setCorrectionActions(event.target.value)}
-                  disabled={Boolean(busyAction)}
-                />
-              </label>
-              <div className="evaluation-actions">
-                <button
-                  className="ghost-button"
-                  disabled={Boolean(busyAction)}
-                  onClick={() => setCorrectionOpen(false)}
-                  type="button"
-                >
-                  Cancel
-                </button>
-                <button
-                  className={`primary-button evaluation-save ${busyAction === 'rca-correction' ? 'is-busy' : ''}`}
-                  disabled={Boolean(busyAction) || correctionCatalogStatus !== 'ready' || (!correctionFamily && !correctionNewCause.trim()) || !correctionSummary.trim()}
-                  type="submit"
-                >
-                  {busyAction === 'rca-correction' ? 'Saving...' : 'Save'}
-                </button>
-              </div>
-            </form>
-          </section>
+        {incident && correction.open && (
+          <RcaCorrectionPanel correction={correction} busyAction={busyAction} />
         )}
         <section className="rca-summary">
           <div className="rca-summary-heading">
@@ -1239,10 +1009,10 @@ function UnifiedWorkspace({
                 증거 일부 누락
               </span>
             )}
-            {isOperatorCorrection && (
+            {correction.isOperatorRun && (
               <div className="rca-operator-meta">
                 <span className="quality quality-operator">운영자 수정</span>
-                <span className="rca-operator-pin">{operatorCorrectionPinned ? '고정됨' : '고정 해제됨'}</span>
+                <span className="rca-operator-pin">{correction.pinned ? '고정됨' : '고정 해제됨'}</span>
               </div>
             )}
           </div>
@@ -1255,7 +1025,7 @@ function UnifiedWorkspace({
               <MessageSquare size={14} /> Feedback
             </button>
           </div>
-          {operatorActionError && <p className="feedback-error">{operatorActionError}</p>}
+          {correction.actionError && <p className="feedback-error">{correction.actionError}</p>}
         </section>
 
         {(isAnalyzing || progressEvents.length > 0) && (
