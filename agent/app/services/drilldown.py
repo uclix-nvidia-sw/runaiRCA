@@ -33,6 +33,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
@@ -248,6 +249,282 @@ async def run_drilldowns(
         await asyncio.gather(*done, return_exceptions=True)
 
 
+@dataclass
+class _Drilldown:
+    """One agent's adaptive think->query->observe loop, and the state it carries.
+
+    The declared-probe pass and the LLM rounds below share the same dedupe
+    ledgers, the same run-scoped query memory, and the same fold ledger, so they
+    live here rather than as a dozen locals in one long function.
+    """
+
+    settings: Settings
+    result: CollectorResult
+    tools: dict[str, dict[str, Any]]
+    target: AnalysisTarget
+    plan: InvestigationPlan | None
+    masker: Any
+    architecture: Any
+    memory: QueryMemory
+    seen_queries: set[str]
+    blackboard: Any = None
+    deadline_monotonic: float | None = None
+    external_case_hints: list[dict[str, Any]] | None = None
+    history: list[dict[str, Any]] = field(default_factory=list)
+    probe_attempts: dict[str, int] = field(default_factory=dict)
+    # One fold ledger per agent run, spanning every round below: repeat calls to
+    # change_query/promql_query that add no new information get merged into
+    # their first row instead of stacking (see _fold_into_prior_row).
+    fold_state: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
+    system_no_node_query_attempted: bool = False
+
+    @classmethod
+    def start(
+        cls,
+        settings: Settings,
+        result: CollectorResult,
+        tools: dict[str, dict[str, Any]],
+        target: AnalysisTarget,
+        plan: InvestigationPlan | None,
+        masker: Any,
+        *,
+        blackboard: Any,
+        query_memory: QueryMemory | None,
+        deadline_monotonic: float | None,
+        external_case_hints: list[dict[str, Any]] | None,
+    ) -> _Drilldown:
+        memory = query_memory if query_memory is not None else QueryMemory()
+        memory.seed_result(result, target)
+        return cls(
+            settings=settings,
+            result=result,
+            tools=tools,
+            target=target,
+            plan=plan,
+            masker=masker,
+            architecture=_implicated_architecture(settings, result, target),
+            memory=memory,
+            # Keep the legacy local fingerprint for standalone callers, but use
+            # the run-scoped ledger for actual execution. It spans every evidence
+            # domain, not just Kubernetes.
+            seen_queries=_existing_query_fingerprints(result, target),
+            blackboard=blackboard,
+            deadline_monotonic=deadline_monotonic,
+            external_case_hints=external_case_hints,
+        )
+
+    def out_of_budget(self) -> bool:
+        return self.deadline_monotonic is not None and time.monotonic() >= self.deadline_monotonic
+
+    def skip_nodeless_system_query(self, query: dict[str, Any]) -> bool:
+        """A node-less system agent may attempt its log query exactly once."""
+        if not (
+            self.result.agent == "system"
+            and not self.target.node
+            and str(query.get("tool") or "") == "system_log_query"
+        ):
+            return False
+        if self.system_no_node_query_attempted:
+            return True
+        self.system_no_node_query_attempted = True
+        return False
+
+    async def run_query(self, query: dict[str, Any], execution_key: str, **kwargs: Any) -> Any:
+        return await _run_query(
+            self.settings,
+            self.result,
+            self.tools,
+            self.target,
+            self.plan,
+            query,
+            self.history,
+            self.masker,
+            blackboard=self.blackboard,
+            query_memory=self.memory,
+            execution_key=execution_key,
+            fold_state=self.fold_state,
+            **kwargs,
+        )
+
+    async def run_declared_probes(self) -> bool:
+        """Run the plan's declarative probes. False when the budget ran out.
+
+        A TypeDB/YAML probe is executable only through this agent's existing
+        read-only registry.  Run it before asking the LLM to improvise a query:
+        the declarative probe is the durable operational knowledge, while the
+        LLM decides what additional discriminator is worthwhile.
+        """
+        for query in _declared_probe_queries(self.plan, self.tools, self.target):
+            if self.out_of_budget():
+                return False
+            if self.skip_nodeless_system_query(query):
+                continue
+            key = _query_fingerprint(query, self.target)
+            execution_key = domain_query_key(self.result.agent, query, self.target)
+            if key in self.seen_queries or not self.memory.claim(execution_key):
+                # The equivalent read already ran in the base pass. Skipping the
+                # probe outright discarded its supports/refutes verdict on exactly
+                # the obvious incidents whose base pass had already fetched the
+                # answer, starving the trace-v3 hypothesis ledger. Assess the
+                # declared signals against the collected observations instead.
+                _replay_declared_probe(self.result, query, self.plan, self.probe_attempts)
+                continue
+            self.seen_queries.add(key)
+            await self.run_query(
+                query,
+                execution_key,
+                artifact_type="ontology_probe",
+                probe_attempts=self.probe_attempts,
+            )
+        return True
+
+    def declared_probes_settled(self) -> bool:
+        assessments = self.result.details.get("ontology_probe_assessments", [])
+        return not assessments or all(
+            isinstance(item, dict) and item.get("verdict") == "supports" for item in assessments
+        )
+
+    def select_queries(
+        self, decision: dict[str, Any]
+    ) -> tuple[list[tuple[dict[str, Any], str]], list[dict[str, Any]]]:
+        """Accepted (query, execution_key) pairs, plus feedback for the rejects."""
+        queries: list[tuple[dict[str, Any], str]] = []
+        rejected: list[dict[str, Any]] = []
+        for q in decision.get("queries") or []:
+            if not isinstance(q, dict) or str(q.get("tool") or "") not in self.tools:
+                rejected.append(_rejected_query_feedback(q, self.tools))
+                continue
+            if not _valid_domain_query(q):
+                # Do not turn a PromQL/LogQL name hallucinated as a Kubernetes
+                # kind into an unavailable evidence card. The tool descriptions
+                # already name the valid kinds; keeping this out of the history
+                # also prevents repeated noise.
+                rejected.append(_rejected_query_feedback(q, self.tools))
+                continue
+            if self.skip_nodeless_system_query(q):
+                continue
+            key = _query_fingerprint(q, self.target)
+            if key in self.seen_queries:
+                continue
+            execution_key = domain_query_key(self.result.agent, q, self.target)
+            if not self.memory.claim(execution_key):
+                continue
+            self.seen_queries.add(key)
+            queries.append((q, execution_key))
+        return queries, rejected
+
+    async def decide(self) -> tuple[dict[str, Any] | None, str]:
+        """The next round's LLM decision plus, on failure, why it failed.
+
+        One bounded transport retry: a failed decision is recoverable when it
+        returns usable JSON, and a persistent failure still surfaces its
+        diagnostic to the operator."""
+        user_prompt = self.masker.mask_text(
+            _user_prompt(
+                self.result,
+                self.target,
+                self.plan,
+                self.history,
+                self.architecture,
+                blackboard=self.blackboard,
+                external_case_hints=self.external_case_hints,
+            )
+        )
+        decision_system = _system_prompt(self.result.agent, self.tools)
+        decision = await complete_json(
+            self.settings,
+            system=decision_system,
+            user=user_prompt,
+            model=self.settings.llm_model_drilldown,
+        )
+        if decision is not None:
+            return decision, ""
+        retry_text, decision_error = await complete_with_error(
+            self.settings,
+            system=decision_system,
+            user=user_prompt,
+            model=self.settings.llm_model_drilldown,
+        )
+        retry_decision = parse_json_object(retry_text or "")
+        if isinstance(retry_decision, dict):
+            return retry_decision, ""
+        return None, f": {decision_error}" if decision_error else ""
+
+    async def decision_rounds(self) -> None:
+        step = 0
+        invalid_query_repair_used = False
+        parser_repair_pending = False
+        parser_repair_used = False
+        decision_round_limit = self.settings.max_investigation_steps or 3
+        while step < decision_round_limit:
+            if self.out_of_budget():
+                _log.info(
+                    "shared evidence budget reached; stopped optional %s drill-down",
+                    self.result.agent,
+                )
+                break
+            step += 1
+            decision, decision_error = await self.decide()
+            if decision is None:
+                self.result.warnings.append(
+                    f"{self.result.agent} drill-down stopped at step {step}: "
+                    f"LLM decision call failed{decision_error}"
+                )
+                break
+            if not isinstance(decision, dict) or decision.get("action") != "query":
+                _log.info(
+                    "drilldown %s: done after %d follow-up quer(ies)",
+                    self.result.agent,
+                    len(self.history),
+                )
+                break
+            is_parser_repair = parser_repair_pending
+            if is_parser_repair:
+                parser_repair_pending = False
+                parser_repair_used = True
+            queries, rejected = self.select_queries(decision)
+            if rejected:
+                self.history.extend(rejected)
+            if not queries:
+                # Give one malformed/unknown-tool decision a correction round.
+                # This remains bounded by both this one-shot allowance and the
+                # normal reasoning-round/deadline limits.  Duplicate valid
+                # queries still stop immediately instead of looping.
+                if rejected and not invalid_query_repair_used and step < decision_round_limit:
+                    invalid_query_repair_used = True
+                    continue
+                self.result.warnings.append(
+                    f"{self.result.agent} drill-down stopped at step {step}: "
+                    "no new allowed read-only query was returned"
+                )
+                break
+            _log.info(
+                "drilldown %s: step %d running %d quer(ies)",
+                self.result.agent,
+                step + 1,
+                len(queries),
+            )
+            # The model batches independent read-only discriminators in one
+            # reasoning round. Run that batch concurrently: the round limit is
+            # deliberately small (three), while evidence breadth is not.
+            parser_rejections = await asyncio.gather(
+                *(self.run_query(q, execution_key) for q, execution_key in queries)
+            )
+            if any(parser_rejections):
+                if is_parser_repair:
+                    self.result.warnings.append(
+                        f"{self.result.agent} drill-down stopped after one query-syntax repair attempt"
+                    )
+                    break
+                if not parser_repair_used:
+                    # The next LLM turn receives the structured HTTP 400/parse
+                    # feedback in history. One repair is enough; repeated parser
+                    # failures must not consume the drill-down budget.
+                    parser_repair_pending = True
+            if _system_node_scope_unavailable(self.result, self.target):
+                break
+
+
 async def _drill_one(
     settings: Settings,
     result: CollectorResult,
@@ -266,227 +543,27 @@ async def _drill_one(
     try:
         if _system_node_scope_unavailable(result, target):
             return
-        architecture = _implicated_architecture(settings, result, target)
-        history: list[dict[str, Any]] = []
-        # Keep the legacy local fingerprint for standalone callers, but use the
-        # run-scoped ledger for actual execution. It spans every evidence
-        # domain, not just Kubernetes.
-        seen_queries: set[str] = _existing_query_fingerprints(result, target)
-        memory = query_memory if query_memory is not None else QueryMemory()
-        memory.seed_result(result, target)
-        probe_attempts: dict[str, int] = {}
-        # One fold ledger per agent run, spanning every round below: repeat
-        # calls to change_query/promql_query that add no new information get
-        # merged into their first row instead of stacking (see
-        # _fold_into_prior_row).
-        fold_state: dict[tuple[str, str], dict[str, Any]] = {}
-        system_no_node_query_attempted = False
-        # A TypeDB/YAML probe is executable only through this agent's existing
-        # read-only registry.  Run it before asking the LLM to improvise a
-        # query: the declarative probe is the durable operational knowledge,
-        # while the LLM decides what additional discriminator is worthwhile.
-        for query in _declared_probe_queries(plan, tools, target):
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                return
-            if (
-                result.agent == "system"
-                and not target.node
-                and str(query.get("tool") or "") == "system_log_query"
-            ):
-                if system_no_node_query_attempted:
-                    continue
-                system_no_node_query_attempted = True
-            key = _query_fingerprint(query, target)
-            execution_key = domain_query_key(result.agent, query, target)
-            if key in seen_queries or not memory.claim(execution_key):
-                # The equivalent read already ran in the base pass. Skipping the
-                # probe outright discarded its supports/refutes verdict on exactly
-                # the obvious incidents whose base pass had already fetched the
-                # answer, starving the trace-v3 hypothesis ledger. Assess the
-                # declared signals against the collected observations instead.
-                _replay_declared_probe(result, query, plan, probe_attempts)
-                continue
-            seen_queries.add(key)
-            await _run_query(
-                settings,
-                result,
-                tools,
-                target,
-                plan,
-                query,
-                history,
-                masker,
-                blackboard=blackboard,
-                query_memory=memory,
-                execution_key=execution_key,
-                artifact_type="ontology_probe",
-                probe_attempts=probe_attempts,
-                fold_state=fold_state,
-            )
-        assessments = result.details.get("ontology_probe_assessments", [])
-        declared_probes_settled = not assessments or all(
-            isinstance(item, dict) and item.get("verdict") == "supports"
-            for item in assessments
+        session = _Drilldown.start(
+            settings,
+            result,
+            tools,
+            target,
+            plan,
+            masker,
+            blackboard=blackboard,
+            query_memory=query_memory,
+            deadline_monotonic=deadline_monotonic,
+            external_case_hints=external_case_hints,
         )
-        if skip_optional and declared_probes_settled:
+        if not await session.run_declared_probes():
+            return
+        if skip_optional and session.declared_probes_settled():
             _log.info(
                 "drilldown %s: required probes complete; optional rounds skipped",
                 result.agent,
             )
             return
-        step = 0
-        invalid_query_repair_used = False
-        parser_repair_pending = False
-        parser_repair_used = False
-        decision_round_limit = settings.max_investigation_steps or 3
-        while step < decision_round_limit:
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                _log.info(
-                    "shared evidence budget reached; stopped optional %s drill-down",
-                    result.agent,
-                )
-                break
-            step += 1
-            user_prompt = masker.mask_text(
-                _user_prompt(
-                    result,
-                    target,
-                    plan,
-                    history,
-                    architecture,
-                    blackboard=blackboard,
-                    external_case_hints=external_case_hints,
-                )
-            )
-            decision_system = _system_prompt(result.agent, tools)
-            decision = await complete_json(
-                settings,
-                system=decision_system,
-                user=user_prompt,
-                model=settings.llm_model_drilldown,
-            )
-            if decision is None:
-                # A failed decision is recoverable when the bounded transport
-                # retry returns a usable JSON response. Keep the second call to
-                # one retry; a persistent failure still surfaces its diagnostic.
-                retry_text, decision_error = await complete_with_error(
-                    settings,
-                    system=decision_system,
-                    user=user_prompt,
-                    model=settings.llm_model_drilldown,
-                )
-                retry_decision = parse_json_object(retry_text or "")
-                if isinstance(retry_decision, dict):
-                    decision = retry_decision
-                else:
-                    detail = f": {decision_error}" if decision_error else ""
-                    result.warnings.append(
-                        f"{result.agent} drill-down stopped at step {step}: LLM decision call failed{detail}"
-                    )
-                    break
-            if not isinstance(decision, dict) or decision.get("action") != "query":
-                _log.info(
-                    "drilldown %s: done after %d follow-up quer(ies)",
-                    result.agent,
-                    len(history),
-                )
-                break
-            is_parser_repair = parser_repair_pending
-            if is_parser_repair:
-                parser_repair_pending = False
-                parser_repair_used = True
-            queries: list[tuple[dict[str, Any], str]] = []
-            rejected: list[dict[str, Any]] = []
-            for q in decision.get("queries") or []:
-                if not isinstance(q, dict):
-                    rejected.append(_rejected_query_feedback(q, tools))
-                    continue
-                if str(q.get("tool") or "") not in tools:
-                    rejected.append(_rejected_query_feedback(q, tools))
-                    continue
-                if not _valid_domain_query(q):
-                    # Do not turn a PromQL/LogQL name hallucinated as a
-                    # Kubernetes kind into an unavailable evidence card. The
-                    # tool descriptions already name the valid kinds; keeping
-                    # this out of the history also prevents repeated noise.
-                    rejected.append(_rejected_query_feedback(q, tools))
-                    continue
-                if (
-                    result.agent == "system"
-                    and not target.node
-                    and str(q.get("tool") or "") == "system_log_query"
-                ):
-                    if system_no_node_query_attempted:
-                        continue
-                    system_no_node_query_attempted = True
-                key = _query_fingerprint(q, target)
-                if key in seen_queries:
-                    continue
-                execution_key = domain_query_key(result.agent, q, target)
-                if not memory.claim(execution_key):
-                    continue
-                seen_queries.add(key)
-                queries.append((q, execution_key))
-            if rejected:
-                history.extend(rejected)
-            if not queries:
-                # Give one malformed/unknown-tool decision a correction round.
-                # This remains bounded by both this one-shot allowance and the
-                # normal reasoning-round/deadline limits.  Duplicate valid
-                # queries still stop immediately instead of looping.
-                if (
-                    rejected
-                    and not invalid_query_repair_used
-                    and step < decision_round_limit
-                ):
-                    invalid_query_repair_used = True
-                    continue
-                result.warnings.append(
-                    f"{result.agent} drill-down stopped at step {step}: "
-                    "no new allowed read-only query was returned"
-                )
-                break
-            _log.info(
-                "drilldown %s: step %d running %d quer(ies)",
-                result.agent,
-                step + 1,
-                len(queries),
-            )
-            # The model batches independent read-only discriminators in one
-            # reasoning round. Run that batch concurrently: the round limit is
-            # deliberately small (three), while evidence breadth is not.
-            parser_rejections = await asyncio.gather(
-                *(
-                    _run_query(
-                        settings,
-                        result,
-                        tools,
-                        target,
-                        plan,
-                        q,
-                        history,
-                        masker,
-                        blackboard=blackboard,
-                        query_memory=memory,
-                        execution_key=execution_key,
-                        fold_state=fold_state,
-                    )
-                    for q, execution_key in queries
-                )
-            )
-            if any(parser_rejections):
-                if is_parser_repair:
-                    result.warnings.append(
-                        f"{result.agent} drill-down stopped after one query-syntax repair attempt"
-                    )
-                    break
-                if not parser_repair_used:
-                    # The next LLM turn receives the structured HTTP 400/parse
-                    # feedback in history. One repair is enough; repeated parser
-                    # failures must not consume the drill-down budget.
-                    parser_repair_pending = True
-            if _system_node_scope_unavailable(result, target):
-                break
+        await session.decision_rounds()
     except Exception as exc:  # noqa: BLE001 - drill-down is best-effort; base evidence stands
         result.warnings.append(
             f"{result.agent} drill-down aborted: "
