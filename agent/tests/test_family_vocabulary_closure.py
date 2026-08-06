@@ -144,3 +144,21 @@ def test_new_family_keywords_are_not_bare_identity_tokens() -> None:
         )
         bare = [kw for kw in keywords if _is_bare_identity_token(kw)]
         assert not bare, f"{family} has bare identity-token keyword(s): {bare}"
+
+
+def test_ingest_whitelists_track_families_yaml() -> None:
+    """defect (b), generalized: load_alerts.py froze a stale whitelist and
+    dropped alerts declaring families it had never heard of. Both loaders now
+    derive their whitelist from families.yaml, so adding a family there cannot
+    silently make it un-ingestable — and the two loaders cannot disagree."""
+    from ontology.load_known_issues import FAMILIES as LOAD_KNOWN_ISSUES_FAMILIES
+
+    catalog = load_family_catalog(str(_FAMILIES_FILE))
+    for name, whitelist in (
+        ("load_alerts", LOAD_ALERTS_FAMILIES),
+        ("load_known_issues", LOAD_KNOWN_ISSUES_FAMILIES),
+    ):
+        missing = set(catalog.families) - set(whitelist)
+        assert not missing, f"{name} would drop families.yaml families: {sorted(missing)}"
+        assert _INSUFFICIENT_EVIDENCE in whitelist, f"{name} must keep the ranker sentinel"
+    assert set(LOAD_ALERTS_FAMILIES) == set(LOAD_KNOWN_ISSUES_FAMILIES)

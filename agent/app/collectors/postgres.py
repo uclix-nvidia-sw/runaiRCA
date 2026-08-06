@@ -579,7 +579,15 @@ def _quoted_identifier(value: str) -> str:
     return f'"{value}"'
 
 
-def _history_query(table: dict[str, Any], *, mcp: bool, time_range: dict[str, str] | None) -> str:
+def _history_query_parts(
+    table: dict[str, Any], *, mcp: bool, time_range: dict[str, str] | None
+) -> tuple[str, str, str, str, str]:
+    """Quoted schema/table/timestamp identifiers plus the incident-window bounds.
+
+    MCP has no bind parameters, so its window is inlined as literals and an
+    absent range is refused outright: a history query without one would read the
+    whole table and present it as incident evidence.
+    """
     schema = _quoted_identifier(str(table["schema"]))
     name = _quoted_identifier(str(table["table"]))
     timestamp = _quoted_identifier(str(table["timestamp_column"]))
@@ -590,6 +598,13 @@ def _history_query(table: dict[str, Any], *, mcp: bool, time_range: dict[str, st
         end = f"'{time_range['end']}'::timestamptz"
     else:
         start, end = "$1::timestamptz", "$2::timestamptz"
+    return schema, name, timestamp, start, end
+
+
+def _history_query(table: dict[str, Any], *, mcp: bool, time_range: dict[str, str] | None) -> str:
+    schema, name, timestamp, start, end = _history_query_parts(
+        table, mcp=mcp, time_range=time_range
+    )
     columns = [f"{timestamp} AS event_time"]
     for column in table.get("context_columns", []):
         quoted = _quoted_identifier(str(column))
@@ -607,16 +622,9 @@ def _history_query(table: dict[str, Any], *, mcp: bool, time_range: dict[str, st
 def _history_aggregate_query(
     table: dict[str, Any], *, mcp: bool, time_range: dict[str, str] | None
 ) -> str:
-    schema = _quoted_identifier(str(table["schema"]))
-    name = _quoted_identifier(str(table["table"]))
-    timestamp = _quoted_identifier(str(table["timestamp_column"]))
-    if mcp:
-        if not time_range:
-            raise ValueError("incident time range is required for audit/history queries")
-        start = f"'{time_range['start']}'::timestamptz"
-        end = f"'{time_range['end']}'::timestamptz"
-    else:
-        start, end = "$1::timestamptz", "$2::timestamptz"
+    schema, name, timestamp, start, end = _history_query_parts(
+        table, mcp=mcp, time_range=time_range
+    )
     return f"""
         SELECT count(*) AS matching_rows,
                min({timestamp}) AS first_event_at,
@@ -730,16 +738,9 @@ def _history_target_query(
     if clause is None:
         return None
     target_clause, parameters = clause
-    schema = _quoted_identifier(str(table["schema"]))
-    name = _quoted_identifier(str(table["table"]))
-    timestamp = _quoted_identifier(str(table["timestamp_column"]))
-    if mcp:
-        if not time_range:
-            raise ValueError("incident time range is required for audit/history queries")
-        start = f"'{time_range['start']}'::timestamptz"
-        end = f"'{time_range['end']}'::timestamptz"
-    else:
-        start, end = "$1::timestamptz", "$2::timestamptz"
+    schema, name, timestamp, start, end = _history_query_parts(
+        table, mcp=mcp, time_range=time_range
+    )
     columns = [f"{timestamp} AS event_time"]
     for column in table.get("context_columns", []):
         quoted = _quoted_identifier(str(column))
@@ -768,16 +769,9 @@ def _history_target_aggregate_query(
     if clause is None:
         return None
     target_clause, parameters = clause
-    schema = _quoted_identifier(str(table["schema"]))
-    name = _quoted_identifier(str(table["table"]))
-    timestamp = _quoted_identifier(str(table["timestamp_column"]))
-    if mcp:
-        if not time_range:
-            raise ValueError("incident time range is required for audit/history queries")
-        start = f"'{time_range['start']}'::timestamptz"
-        end = f"'{time_range['end']}'::timestamptz"
-    else:
-        start, end = "$1::timestamptz", "$2::timestamptz"
+    schema, name, timestamp, start, end = _history_query_parts(
+        table, mcp=mcp, time_range=time_range
+    )
     return (
         f"""
         SELECT count(*) AS matching_rows,

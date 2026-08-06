@@ -26,35 +26,11 @@ import yaml
 from app.config import load_settings
 from app.ontology.typedb_client import escape_typeql as esc
 from app.ontology.typedb_client import open_driver
+from ontology.families import ingestable_families
 
 ALERTS_FILE = Path(os.getenv("RUNAI_ALERTS_FILE", "knowledge/runai_alerts_catalog.yaml"))
 
-# Must match the root_cause subtypes in schema.tql. Kept identical to
-# ontology/load_known_issues.py's FAMILIES — this whitelist used to freeze a
-# stale subset of 5, silently dropping any built-in alert declaring a family
-# outside it (2 of 13 alerts, both "NVIDIA Run:ai Container Memory Usage
-# Critical/Warning" -> workload_runtime_error, never became symptoms).
-FAMILIES = {
-    "node_kubelet_pressure",
-    "runai_scheduling_quota",
-    "k8s_scheduling_error",
-    "runai_control_plane_error",
-    "k8s_control_plane_error",
-    "workload_startup_error",
-    "image_pull_error",
-    "gpu_hardware_error",
-    "network_fabric_error",
-    "cluster_network_error",
-    "k8s_storage_error",
-    "storage_backend_error",
-    "workload_runtime_error",
-    "platform_version_bug",
-    "observability_accuracy",
-    "expected_known_behavior",
-    "platform_auth_error",
-    "platform_lifecycle_change",
-    "insufficient_evidence",
-}
+FAMILIES = ingestable_families()
 
 
 def _exists(tx: Any, match: str) -> bool:

@@ -26,33 +26,13 @@ import yaml
 from app.config import load_settings
 from app.ontology.typedb_client import escape_typeql as esc
 from app.ontology.typedb_client import open_driver
+from ontology.families import ingestable_families
 
 KNOWN_ISSUES_FILE = Path(
     os.getenv("RUNAI_KNOWN_ISSUES_FILE", "knowledge/runai_known_issues.yaml")
 )
 
-# Must match the root_cause subtypes in schema.tql.
-FAMILIES = {
-    "node_kubelet_pressure",
-    "runai_scheduling_quota",
-    "k8s_scheduling_error",
-    "runai_control_plane_error",
-    "k8s_control_plane_error",
-    "workload_startup_error",
-    "image_pull_error",
-    "gpu_hardware_error",
-    "network_fabric_error",
-    "cluster_network_error",
-    "k8s_storage_error",
-    "storage_backend_error",
-    "workload_runtime_error",
-    "platform_version_bug",
-    "observability_accuracy",
-    "expected_known_behavior",
-    "platform_auth_error",
-    "platform_lifecycle_change",
-    "insufficient_evidence",
-}
+FAMILIES = ingestable_families()
 
 
 def _exists(tx: Any, match: str) -> bool:
