@@ -27,6 +27,13 @@ from app.config import load_settings
 from app.ontology.typedb_client import escape_typeql as esc
 from app.ontology.typedb_client import open_driver
 from ontology.families import ingestable_families
+from ontology.upsert import (
+    ensure_action,
+    ensure_family,
+    exists,
+    relate_symptom_indicates,
+    relate_symptom_resolved_by,
+)
 
 KNOWN_ISSUES_FILE = Path(
     os.getenv("RUNAI_KNOWN_ISSUES_FILE", "knowledge/runai_known_issues.yaml")
@@ -35,19 +42,10 @@ KNOWN_ISSUES_FILE = Path(
 FAMILIES = ingestable_families()
 
 
-def _exists(tx: Any, match: str) -> bool:
-    return bool(list(tx.query(f"match {match} select $x;").resolve().as_concept_rows()))
-
-
-def _ensure_family(tx: Any, family: str) -> None:
-    if not _exists(tx, f'$x isa {family}, has subtype "{esc(family)}";'):
-        tx.query(f'insert $x isa {family}, has subtype "{esc(family)}";').resolve()
-
-
 def _ensure_symptom(tx: Any, name: str, reason: str, affected: str, fixed: str) -> None:
     # Name-keyed symptom created once with its single-valued attributes attached.
     # Empty version/reason strings are skipped so we don't store blank attributes.
-    if _exists(tx, f'$x isa symptom, has name "{esc(name)}";'):
+    if exists(tx, f'$x isa symptom, has name "{esc(name)}";'):
         return
     parts = [f'has name "{esc(name)}"']
     if reason:
@@ -60,46 +58,13 @@ def _ensure_symptom(tx: Any, name: str, reason: str, affected: str, fixed: str) 
 
 
 def _add_keyword(tx: Any, name: str, keyword: str) -> None:
-    if _exists(
+    if exists(
         tx, f'$x isa symptom, has name "{esc(name)}", has keyword "{esc(keyword)}";'
     ):
         return
     tx.query(
         f'match $s isa symptom, has name "{esc(name)}"; '
         f'insert $s has keyword "{esc(keyword)}";'
-    ).resolve()
-
-
-def _ensure_action(tx: Any, statement: str) -> None:
-    if not _exists(tx, f'$x isa action, has statement "{esc(statement)}";'):
-        tx.query(f'insert $x isa action, has statement "{esc(statement)}";').resolve()
-
-
-def _relate_indicates(tx: Any, name: str, family: str) -> None:
-    if _exists(
-        tx,
-        f'$x isa symptom, has name "{esc(name)}"; $rc isa {family}; '
-        f"(symptom: $x, cause: $rc) isa indicates;",
-    ):
-        return
-    tx.query(
-        f'match $s isa symptom, has name "{esc(name)}"; $rc isa {family}; '
-        f"insert (symptom: $s, cause: $rc) isa indicates;"
-    ).resolve()
-
-
-def _relate_resolved_by(tx: Any, name: str, statement: str) -> None:
-    if _exists(
-        tx,
-        f'$x isa symptom, has name "{esc(name)}"; '
-        f'$a isa action, has statement "{esc(statement)}"; '
-        f"(symptom: $x, remedy: $a) isa resolved_by;",
-    ):
-        return
-    tx.query(
-        f'match $s isa symptom, has name "{esc(name)}"; '
-        f'$a isa action, has statement "{esc(statement)}"; '
-        f"insert (symptom: $s, remedy: $a) isa resolved_by;"
     ).resolve()
 
 
@@ -130,7 +95,7 @@ def main() -> int:
                 if family not in FAMILIES:
                     print(f"skip unknown family: {family!r} ({name})", file=sys.stderr)
                     continue
-                _ensure_family(tx, family)
+                ensure_family(tx, family)
                 _ensure_symptom(
                     tx,
                     name,
@@ -142,13 +107,13 @@ def main() -> int:
                     kw = str(kw).strip()
                     if kw:
                         _add_keyword(tx, name, kw)
-                _relate_indicates(tx, name, family)
+                relate_symptom_indicates(tx, name, family)
                 for action in entry.get("actions") or []:
                     statement = str(action).strip()
                     if not statement:
                         continue
-                    _ensure_action(tx, statement)
-                    _relate_resolved_by(tx, name, statement)
+                    ensure_action(tx, statement)
+                    relate_symptom_resolved_by(tx, name, statement)
                     n_actions += 1
                 n_issues += 1
             tx.commit()

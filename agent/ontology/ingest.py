@@ -36,14 +36,16 @@ from app.masking import build_masker
 from app.ontology.typedb_client import escape_typeql as esc
 from ontology.incident import OntologyIncident
 from ontology.load_knowledge import (
-    _ensure_action,
     _ensure_cause,
     _ensure_symptom,
-    _relate_indicates,
-    _relate_resolved_by,
-    _selected_values,
 )
 from ontology.normalization import confidence_score, workload_uid
+from ontology.upsert import (
+    ensure_action,
+    relate_symptom_indicates,
+    relate_symptom_resolved_by,
+    selected_values,
+)
 
 _log = logging.getLogger(__name__)
 _MASKER = build_masker((r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b",))
@@ -1013,7 +1015,7 @@ def _ensure_resolution(
     outcome = str(action.get("outcome") or "").strip()
     if not statement or outcome not in {"resolved", "mitigated", "ineffective"}:
         return
-    _ensure_action(tx, statement)
+    ensure_action(tx, statement)
     match = (
         f'$r isa analysis_run, has run_id "{esc(inc.run_id)}"; '
         f'$i isa incident, has incident_id "{esc(inc.incident_id)}"; '
@@ -1358,10 +1360,10 @@ def _promote_one(tx: Any, alert_name: str, family: str, actions: list[str]) -> N
     name = f"{_PROMOTED_PREFIX}{alert_name}"
     _ensure_cause(tx, family)
     _ensure_symptom(tx, name, [alert_name.strip().lower()])
-    _relate_indicates(tx, name, family)
+    relate_symptom_indicates(tx, name, family)
     for statement in actions[:_ACTION_CAP]:
-        _ensure_action(tx, statement)
-        _relate_resolved_by(tx, name, statement)
+        ensure_action(tx, statement)
+        relate_symptom_resolved_by(tx, name, statement)
 
 
 def _purge_promoted_one(tx: Any, name: str) -> None:
@@ -1398,7 +1400,7 @@ def _purge_promoted_knowledge() -> int:
         with driver.transaction(settings.typedb_database, TransactionType.READ) as tx:
             names = sorted(
                 name
-                for name in _selected_values(tx, "$s isa symptom, has name $n;", "n")
+                for name in selected_values(tx, "$s isa symptom, has name $n;", "n")
                 if name.startswith(_PROMOTED_PREFIX)
             )
         if not names:

@@ -33,6 +33,10 @@ from app.services.decision_tree import load_tree
 # loader went stale before and hard-raised on every family families.yaml adds.
 from ontology.load_knowledge import FAMILIES
 from ontology.normalization import confidence_score
+from ontology.upsert import (
+    ensure_action,
+    exists,
+)
 
 RUNBOOK_NAME = "k8s-senior-troubleshooting"
 BUNDLED_RUNBOOK_ID = "k8s_troubleshooting"
@@ -73,10 +77,6 @@ _SCOPED_PROBE_ID = re.compile(
 TREE_FILE = Path(
     os.getenv("K8S_TROUBLESHOOTING_TREE_FILE", "knowledge/k8s_troubleshooting_tree.yaml")
 )
-
-
-def _exists(tx: Any, match: str) -> bool:
-    return bool(list(tx.query(f"match {match} select $x;").resolve().as_concept_rows()))
 
 
 def _condition(value: object) -> str:
@@ -258,13 +258,8 @@ def _probe_templates(
 def _ensure_cause(tx: Any, family: str) -> None:
     if family not in FAMILIES:
         raise ValueError(f"unknown root-cause family: {family}")
-    if not _exists(tx, f'$x isa {family}, has subtype "{esc(family)}";'):
+    if not exists(tx, f'$x isa {family}, has subtype "{esc(family)}";'):
         tx.query(f'insert $x isa {family}, has subtype "{esc(family)}";').resolve()
-
-
-def _ensure_action(tx: Any, statement: str) -> None:
-    if not _exists(tx, f'$x isa action, has statement "{esc(statement)}";'):
-        tx.query(f'insert $x isa action, has statement "{esc(statement)}";').resolve()
 
 
 def _insert_outcome(tx: Any, node: dict[str, Any]) -> int:
@@ -299,7 +294,7 @@ def _insert_outcome(tx: Any, node: dict[str, Any]) -> int:
         ).resolve()
     actions = [str(item).strip() for item in conclusion.get("next_steps") or []]
     for index, statement in enumerate(action for action in actions if action):
-        _ensure_action(tx, statement)
+        ensure_action(tx, statement)
         tx.query(
             f'match $s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
             f'$a isa action, has statement "{esc(statement)}"; '
