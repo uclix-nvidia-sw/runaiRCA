@@ -130,6 +130,19 @@ jobs:
         run: |
           ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 TYPEDB_USERNAME=admin TYPEDB_PASSWORD=password TYPEDB_DATABASE=ci_schema_check TYPEDB_TLS_ENABLED=false python -m ontology.load_schema
           ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 TYPEDB_USERNAME=admin TYPEDB_PASSWORD=password TYPEDB_DATABASE=ci_schema_check TYPEDB_TLS_ENABLED=false python -m ontology.load_functions
+      - name: Loader graph behaviour
+        # Skips itself without TYPEDB_ADDRESS. The fake-transaction tests can see
+        # the TypeQL text but not the graph, so a relation that is written and
+        # never retired is invisible to them.
+        working-directory: agent
+        env:
+          ENABLE_TYPEDB: "true"
+          TYPEDB_ADDRESS: localhost:1729
+          TYPEDB_USERNAME: admin
+          TYPEDB_PASSWORD: password
+          TYPEDB_DATABASE: ci_loader_check
+          TYPEDB_TLS_ENABLED: "false"
+        run: python -m pytest tests/test_typedb_integration.py -q
 
   frontend:
     runs-on: ubuntu-latest
