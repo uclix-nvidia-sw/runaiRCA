@@ -2244,7 +2244,10 @@ func TestPostAnalysisSimilarIncidentsSkipsStaleCompletion(t *testing.T) {
 
 	// The run moves on (e.g. a faster subsequent completion) before a slow
 	// refresh for the OLD completion returns.
-	run.UpdatedAt = time.Now().UTC()
+	// Explicit offset, not time.Now(): on a coarse clock both calls can land in
+	// the same tick, the run then still matches the guard, and the "stale" write
+	// lands. That was a 2-in-30 flake at -cpu=1.
+	run.UpdatedAt = t1.Add(time.Millisecond)
 	stale := []SimilarIncident{{IncidentID: "INC-stale-match"}}
 	store.persistPostAnalysisSimilarIncidents(run.RunID, t1, stale)
 

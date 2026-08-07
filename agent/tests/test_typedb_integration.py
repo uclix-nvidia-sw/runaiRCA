@@ -87,15 +87,20 @@ def _run_loader(module: str) -> None:
     assert "skipping" not in done.stderr, f"{module} skipped: {done.stderr.strip()}"
 
 
-def _purge_planted_family() -> None:
-    """The planted family is an entity, not just an edge: leaving it behind
-    accumulates duplicate root_cause rows across runs, which is the very
-    condition the reconciling write exists to prevent."""
+def _restore_planted_family() -> None:
+    """Leave the graph as a plain loader run would.
+
+    The planted family is an entity, not just an edge, so leaving the extras
+    behind accumulates duplicate root_cause rows — the very condition the
+    reconciling write exists to prevent. Deleting them all would go one BELOW a
+    loader run, which legitimately creates one, so re-insert exactly that one.
+    """
     driver_cm, settings, tx_type = _transaction("write")
     with driver_cm as driver, driver.transaction(settings.typedb_database, tx_type) as tx:
         tx.query(
             f'match $x isa {_STALE_FAMILY}, has subtype "{_STALE_FAMILY}"; delete $x;'
         ).resolve()
+        tx.query(f'insert $x isa {_STALE_FAMILY}, has subtype "{_STALE_FAMILY}";').resolve()
         tx.commit()
 
 
@@ -112,7 +117,7 @@ def _loaded_graph():
             continue
         _run_loader(module)
     yield
-    _purge_planted_family()
+    _restore_planted_family()
 
 
 def _first_alert_name() -> str:

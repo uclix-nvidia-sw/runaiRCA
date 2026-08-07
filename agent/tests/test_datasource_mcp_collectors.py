@@ -989,3 +989,54 @@ async def test_kubernetes_shared_deadline_escapes_partial_mcp_sweep_for_fallback
         )
 
     assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_datasource_cache_entries_expire_on_their_own_ttl(monkeypatch) -> None:
+    """The cache's two TTLs are the reason a discovery failure does not become
+    permanent, and nothing exercised their EXPIRY: every other test observes the
+    cache only inside one tick, so a broken clock comparison would look correct.
+
+    Both directions matter. A failure must stop being served after 30s or a
+    transient Grafana blip circuit-breaks the collector for the rest of the run;
+    a success must stop being served after 300s or a re-pointed datasource is
+    never picked up.
+    """
+    clock = 1000.0
+    monkeypatch.setattr(grafana_mcp.time, "monotonic", lambda: clock)
+    clear_grafana_datasource_cache()
+
+    calls = 0
+
+    async def discovery(url, tool, args_list):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("grafana is down")
+        return [{"type": "prometheus", "uid": "prom-live"}]
+
+    monkeypatch.setattr(grafana_mcp, "call_grafana_mcp_json", discovery)
+
+    with pytest.raises(RuntimeError):
+        await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus")
+    assert calls == 1
+
+    # Literal seconds, not the constants: reading them would let a change to a
+    # constant move the assertion with it and prove nothing.
+    clock += 20  # inside the ~30s failure TTL: the cached error is replayed
+    with pytest.raises(RuntimeError):
+        await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus")
+    assert calls == 1, "a cached failure must not re-hit Grafana inside its TTL"
+
+    clock += 20  # 40s in: past it, so discovery is retried and succeeds
+    assert await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus") == "prom-live"
+    assert calls == 2, "a discovery failure must not be cached for 40s"
+
+    # The success is then cached for its own, much longer TTL.
+    clock += 240  # 4 minutes: well past the failure TTL, inside the success one
+    assert await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus") == "prom-live"
+    assert calls == 2, "a cached success must not re-hit Grafana inside its TTL"
+
+    clock += 120  # 6 minutes since the success
+    assert await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus") == "prom-live"
+    assert calls == 3, "a cached success must not outlive ~5 minutes"
