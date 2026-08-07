@@ -259,6 +259,8 @@ func (s *Store) UpsertEvaluationReview(runID string, req EvaluationReviewRequest
 	if err != nil {
 		return EvaluationReview{}, false, err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]

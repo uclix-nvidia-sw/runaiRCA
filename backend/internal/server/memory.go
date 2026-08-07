@@ -376,6 +376,8 @@ func (s *Store) SearchIncidentMemoryExcluding(
 }
 
 func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	alert := s.alerts[alertID]
@@ -411,6 +413,8 @@ func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
 // for the alert since runID — i.e. this run's result is stale and will not be
 // applied. Lets callers distinguish "superseded" from a real persistence failure.
 func (s *Store) IsSupersededAnalysisRun(runID string, alertID string) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.alerts[alertID] != nil && !s.isLatestAnalysisRunForAlertLocked(runID, alertID)
@@ -421,6 +425,8 @@ func (s *Store) IsSupersededAnalysisRun(runID string, alertID string) bool {
 // operator-triggered run; those stale results remain auditable in analysis_runs
 // but must not overwrite the visible RCA.
 func (s *Store) ApplyAnalysisForRun(runID string, alertID string, response AgentAnalysisResponse) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	alert := s.alerts[alertID]
@@ -479,6 +485,8 @@ func (s *Store) applyAnalysisLocked(alert *AlertRecord, response AgentAnalysisRe
 // incident list needs no separate analyzing-first sort branch.
 func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
 	now := time.Now().UTC()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if incident := s.incidents[incidentID]; incident != nil {
@@ -503,6 +511,8 @@ func (s *Store) BeginManualAnalysis(incidentID string, alertID string) {
 // completion. It prevents an older failed run from clearing the analyzing state
 // or surfacing fallback text after a newer run has already started.
 func (s *Store) ApplyFallbackAnalysisIfAbsentForRun(runID string, alertID string, response AgentAnalysisResponse) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	alert := s.alerts[alertID]

@@ -55,7 +55,20 @@ type recurrenceStatsCacheEntry struct {
 }
 
 type Store struct {
-	mu sync.RWMutex
+	// writeMu serializes WRITERS; mu guards the in-memory maps. Every writer
+	// takes writeMu immediately before mu, which is what lets a writer release
+	// mu across its Postgres round trip without a second writer slipping in
+	// between the memory mutation and the persist — the interleaving that made
+	// the earlier off-lock attempt lose updates (see UpsertAlertResult).
+	//
+	// Order is always writeMu -> mu, never the reverse, and writeMu is acquired
+	// at exactly the points mu.Lock() already was. mu.Lock() is not reentrant
+	// and the code does not deadlock today, so no writeMu acquisition can nest
+	// either. TestEveryStoreWriterTakesWriteMu keeps that true.
+	//
+	// Readers take only mu.RLock(), so they never wait on a writer's I/O.
+	writeMu sync.Mutex
+	mu      sync.RWMutex
 	// Dense-score calibration state. Guarded by its own mutex: the centroid is
 	// read on the search path, which must never contend with the store lock.
 	centroidMu           sync.Mutex
@@ -562,6 +575,8 @@ func (s *Store) resolveAlertRecordLocked(
 // defer, not an explicit unlock: nothing in this process recovers a panic, so a
 // leaked write lock here is a permanent outage rather than one failed request.
 func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) AlertUpsertResult {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.upsertAlertResultLocked(webhook, alert)
@@ -923,6 +938,8 @@ func (s *Store) DeleteChatConversation(id string) bool {
 	if id == "" {
 		return false
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.chatConversations[id] == nil {
@@ -955,6 +972,8 @@ func (s *Store) SaveChatExchange(req ChatRequest, answer ChatResponse, userMessa
 		CreatedAt: assistantAt,
 	}
 
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.chatConversations == nil {
@@ -1033,6 +1052,8 @@ func cloneChatConversation(in *ChatConversation) ChatConversation {
 }
 
 func (s *Store) ArchiveIncident(id string, archived bool) (*Incident, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -1053,6 +1074,8 @@ func (s *Store) ArchiveIncident(id string, archived bool) (*Incident, bool) {
 }
 
 func (s *Store) SoftDeleteIncident(id string) (*Incident, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -1075,6 +1098,8 @@ func (s *Store) SoftDeleteIncident(id string) (*Incident, bool) {
 }
 
 func (s *Store) RestoreIncident(id string) (*Incident, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -1092,6 +1117,8 @@ func (s *Store) RestoreIncident(id string) (*Incident, bool) {
 }
 
 func (s *Store) HardDeleteIncident(id string) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -1220,6 +1247,8 @@ func (s *Store) PurgeExpiredTrash(retention time.Duration, now time.Time) int {
 			purged++
 		}
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	for fingerprint, episode := range s.deletedEpisodes {
 		if episode.DeletedAt.Before(now.Add(-deletedEpisodeRetention)) {
@@ -1374,6 +1403,8 @@ func (s *Store) RecurrenceStats(days int, now time.Time) RecurrenceStats {
 	}
 
 	cacheKey := recurrenceStatsCacheKey{days: days, asOf: now.Truncate(time.Minute)}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry, ok := s.recurrenceStatsCache[cacheKey]; ok && now.Before(entry.expiresAt) {
@@ -1889,6 +1920,8 @@ func (s *Store) CreateOperatorRun(incidentID, alertID, baseRunID, family, summar
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.incidents[incidentID] == nil {
@@ -1930,6 +1963,8 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing := s.analyzingAnalysisRunLocked(targetType, targetID, alertID); existing != nil {
@@ -2092,6 +2127,8 @@ func (s *Store) PinnedOperatorRun(incidentID string) (AnalysisRun, bool) {
 // SetLatestOperatorRunPinned toggles the newest operator correction for an
 // incident. A correction remains a historical run after unpinning.
 func (s *Store) SetLatestOperatorRunPinned(incidentID string, pinned bool) (AnalysisRun, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.latestOperatorRunLocked(incidentID, false)
@@ -2127,6 +2164,8 @@ func (s *Store) latestOperatorRunLocked(incidentID string, pinnedOnly bool) *Ana
 }
 
 func (s *Store) AppendAnalysisProgress(runID string, entry map[string]any) (AnalysisRun, map[string]any, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
@@ -2167,6 +2206,8 @@ func (s *Store) CompleteAnalysisRunWithSlackDelivery(runID string, response Agen
 }
 
 func (s *Store) completeAnalysisRun(runID string, response AgentAnalysisResponse, slackIncidentID string) (AnalysisRun, SlackAnalysisDelivery, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
@@ -2265,6 +2306,8 @@ func (s *Store) scheduleSimilarIncidentsRefresh(run AnalysisRun) {
 // slow/late refresh from ever overwriting a better, newer snapshot (or
 // writing one onto a run that no longer represents a good result).
 func (s *Store) persistPostAnalysisSimilarIncidents(runID string, completedAt time.Time, items []SimilarIncident) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
@@ -2322,6 +2365,8 @@ func postAnalysisSimilarIncidentsFromRun(run *AnalysisRun) ([]SimilarIncident, b
 }
 
 func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (AnalysisRun, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
@@ -2378,6 +2423,8 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 // stale is_analyzing flags on alerts/incidents are also cleared when no
 // analyzing run remains for them. It returns the number of runs reaped.
 func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration, manualStaleAfter time.Duration) int {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
@@ -2590,6 +2637,8 @@ func (s *Store) OccurrenceSummaryForTarget(incidentID string, alertID string) ([
 // BumpIncidentAnalysisSeq increments the incident's Slack analysis counter and
 // returns the new value (1 = Initial Analysis, 2 = 2nd Analysis, ...).
 func (s *Store) BumpIncidentAnalysisSeq(id string) (int, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -2605,6 +2654,8 @@ func (s *Store) BumpIncidentAnalysisSeq(id string) (int, bool) {
 // re-analyses reply into the same thread (survives restarts, unlike an
 // in-memory map).
 func (s *Store) SetIncidentSlackThread(id string, ts string) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -2795,6 +2846,14 @@ func (s *Store) AddFeedback(
 	if err := validateStoredText("comment", comment, maxStoredCommentBodyBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
+	if !strings.EqualFold(rawVote, "none") && vote == "" {
+		return FeedbackSummary{}, false, errors.New("vote must be up or down")
+	}
+	// One acquisition for both branches: they are mutually exclusive today, so
+	// two would not deadlock, but writeMu is a plain Mutex and nothing would
+	// stop a later edit from making them reachable in sequence.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if strings.EqualFold(rawVote, "none") {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -2803,9 +2862,6 @@ func (s *Store) AddFeedback(
 		}
 		s.deleteFeedbackForActorLocked(targetType, targetID, actor)
 		return s.feedbackSummaryForActorLocked(targetType, targetID, actor), true, nil
-	}
-	if vote == "" {
-		return FeedbackSummary{}, false, errors.New("vote must be up or down")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2859,6 +2915,8 @@ func (s *Store) AddComment(
 	if err := validateStoredText("author", author, maxFeedbackAuthorBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incidentID, alertID, ok := s.targetIDsLocked(targetType, targetID)
@@ -2897,6 +2955,8 @@ func (s *Store) UpdateComment(
 	if err := validateStoredText("author", author, maxFeedbackAuthorBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, _, ok := s.targetIDsLocked(targetType, targetID); !ok {
@@ -2970,6 +3030,8 @@ func (s *Store) DeleteComment(
 	targetID string,
 	commentID string,
 ) (FeedbackSummary, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, _, ok := s.targetIDsLocked(targetType, targetID); !ok {

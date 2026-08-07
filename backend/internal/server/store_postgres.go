@@ -706,6 +706,8 @@ func (s *Store) loadIncidents(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for rows.Next() {
@@ -747,6 +749,8 @@ func (s *Store) loadAlerts(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for rows.Next() {
@@ -825,6 +829,8 @@ func (s *Store) loadMemories(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for rows.Next() {
@@ -1032,6 +1038,8 @@ func (s *Store) loadFeedback(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for rows.Next() {
@@ -1067,6 +1075,8 @@ func (s *Store) loadComments(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for rows.Next() {
@@ -1102,6 +1112,8 @@ func (s *Store) loadAnalysisRuns(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for rows.Next() {
@@ -1154,6 +1166,8 @@ func (s *Store) loadEvaluationReviews(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for rows.Next() {
@@ -1187,6 +1201,8 @@ func (s *Store) loadCaseSnapshots(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for rows.Next() {
@@ -1219,6 +1235,8 @@ func (s *Store) loadKnowledge(ctx context.Context) {
 		return
 	}
 	defer candidates.Close()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	for candidates.Next() {
 		var candidate KnowledgeCandidate
@@ -1314,6 +1332,8 @@ func (s *Store) loadChatConversations(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for rows.Next() {
@@ -1503,6 +1523,8 @@ func (s *Store) loadDeletedEpisodes(ctx context.Context) {
 		return
 	}
 	defer rows.Close()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for rows.Next() {

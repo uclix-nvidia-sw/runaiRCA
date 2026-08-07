@@ -446,6 +446,8 @@ func (s *Store) EditKnowledgeCandidateActions(id string, actions []string, actor
 	if len(trimmed) == 0 || len(trimmed) > 10 {
 		return KnowledgeCandidate{}, errors.New("between 1 and 10 non-empty actions are required")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -466,6 +468,8 @@ func (s *Store) EditKnowledgeCandidateActions(id string, actions []string, actor
 // a concurrent human edit always wins. Applying an unchanged list still stamps
 // the curation marker so the refiner is never re-invoked for this candidate.
 func (s *Store) RefineKnowledgeCandidateActions(id string, expected, refined []string) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -482,6 +486,8 @@ func (s *Store) RefineKnowledgeCandidateActions(id string, expected, refined []s
 // KnowledgeCandidatesPendingActionRefinement lists ready candidates whose
 // actions have not been curated yet (neither LLM-refined nor human-edited).
 func (s *Store) KnowledgeCandidatesPendingActionRefinement() []KnowledgeCandidate {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := []KnowledgeCandidate{}
@@ -1488,6 +1494,8 @@ func knowledgeCandidateAwaitsValidatorRetry(candidate *KnowledgeCandidate) bool 
 }
 
 func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -1550,6 +1558,8 @@ func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRe
 // exposing it to the active runtime snapshot. A later explicit activation is
 // required, so an approved case cannot change RCA ranking by accident.
 func (s *Store) ShadowKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -1608,6 +1618,8 @@ func (s *Store) shadowPairLocked(id string) (*KnowledgeCandidate, *KnowledgePack
 // ActivateShadowKnowledgeCandidate makes an already validated shadow package
 // visible to the Agent. It is the only shadow -> active transition.
 func (s *Store) ActivateShadowKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate, pkg, err := s.shadowPairLocked(id)
@@ -1654,6 +1666,8 @@ func (s *Store) ActivateShadowKnowledgeCandidate(id string, request KnowledgeDec
 // RejectShadowKnowledgeCandidate retires an observation-only package without
 // ever making it visible to the runtime.
 func (s *Store) RejectShadowKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate, pkg, err := s.shadowPairLocked(id)
@@ -1684,6 +1698,8 @@ func (s *Store) RejectShadowKnowledgeCandidate(id string, request KnowledgeDecis
 // content-derived, so this is housekeeping, not censorship: an evaluation that
 // reproduces the same knowledge regenerates the row.
 func (s *Store) DeleteKnowledgeCandidate(id string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -1714,6 +1730,8 @@ func (s *Store) DeleteKnowledgeCandidate(id string) error {
 }
 
 func (s *Store) RejectKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -1740,6 +1758,8 @@ func (s *Store) RejectKnowledgeCandidate(id string, request KnowledgeDecisionReq
 // rejection. Transport and 5xx failures never call this method, so a candidate
 // remains ready when validation infrastructure is unavailable.
 func (s *Store) FailKnowledgeCandidateValidation(id, reason string) (KnowledgeCandidate, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -1768,6 +1788,8 @@ func (s *Store) FailKnowledgeCandidateValidation(id, reason string) (KnowledgeCa
 }
 
 func (s *Store) RetireKnowledgePackage(id string, request KnowledgeDecisionRequest) (KnowledgePackage, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pkg := s.knowledgePackages[id]
@@ -1799,6 +1821,8 @@ func (s *Store) UpdateKnowledgePackageMirror(id, status, lastError string, updat
 	if status != "pending" && status != "synced" && status != "error" {
 		return KnowledgePackage{}, errors.New("invalid knowledge mirror status")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pkg := s.knowledgePackages[id]

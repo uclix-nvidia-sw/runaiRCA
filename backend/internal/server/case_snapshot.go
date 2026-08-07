@@ -576,6 +576,8 @@ func (s *Store) revokeCaseSnapshotsLocked(incidentID string, revokedAt time.Time
 // run's evaluation reviews are deleted (they scored text that no longer
 // exists) and knowledge derived from them is withdrawn.
 func (s *Store) AutoRevokeSupersededApproval(incidentID, newAnalysisHash string) (string, *time.Time, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[incidentID]
