@@ -257,16 +257,18 @@ func TestPostgresReactivationAfterRetirementPersists(t *testing.T) {
 	}
 }
 
-// The alert webhook's writes now run AFTER the store lock is released
-// (commitAfterUnlock). Against the fake driver that is invisible: it accepts
-// anything. Against a real Postgres, prove both halves of the contract.
+// Concurrent webhooks for the same alert must leave Postgres agreeing with
+// memory. Each firing here carries a strictly newer StartsAt, so every one is a
+// NEW episode that bumps FiredAt and the occurrence count — which is what makes
+// a lost update visible at all.
 //
-// Each firing carries a strictly newer StartsAt, so every one is a NEW episode
-// that bumps FiredAt and the occurrence count — which is what makes commit
-// ORDER observable. dbMu is taken while s.mu is still held precisely so the
-// last writer to hold the store lock is also the last to commit; drop that and
-// a slow early writer can overwrite a fast later one, leaving the row stale.
-func TestPostgresWebhookWritesLandAfterUnlockInLockOrder(t *testing.T) {
+// This started as a test for an off-lock write path that has since been
+// withdrawn (see UpsertAlertResult). It is kept because it is the only place
+// that checks the webhook's rows survive a reload from Postgres alone, and
+// because it is exactly the test that would catch that design coming back
+// without the ordering it needs: with the writes moved off the store lock and
+// unordered, it fails 5 runs out of 5 with "a later writer committed first".
+func TestPostgresConcurrentWebhooksLeaveNoStaleRow(t *testing.T) {
 	store := postgresTestStore(t)
 	webhook := AlertmanagerWebhook{}
 	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
