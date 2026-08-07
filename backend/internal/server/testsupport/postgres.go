@@ -25,6 +25,7 @@ type PostgresState struct {
 	mu                       sync.Mutex
 	execLatency              time.Duration
 	execLatencyFor           map[string]time.Duration
+	execTimings              []ExecTiming
 	failCreateVector         bool
 	failAnalysisRuns         bool
 	failAnalysisRunExecAfter int
@@ -98,6 +99,23 @@ func (s *PostgresState) latencyFor(query string) time.Duration {
 		}
 	}
 	return s.execLatency
+}
+
+// ExecTiming is when one statement was issued and when it came back. Statement
+// ORDER cannot show that a second writer ran inside a first writer's window
+// when both issue the same slow statement — the later one simply finishes
+// later either way. Overlap is a property of the intervals, so the intervals
+// are recorded.
+type ExecTiming struct {
+	Query string
+	Start time.Time
+	End   time.Time
+}
+
+func (s *PostgresState) ExecTimings() []ExecTiming {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ExecTiming(nil), s.execTimings...)
 }
 
 func (s *PostgresState) SetFailAnalysisRuns(value bool) {
@@ -256,9 +274,13 @@ func maxDollarPlaceholder(query string) int {
 }
 
 func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	started := time.Now()
 	if d := c.state.latencyFor(query); d > 0 {
 		time.Sleep(d)
 	}
+	c.state.mu.Lock()
+	c.state.execTimings = append(c.state.execTimings, ExecTiming{Query: query, Start: started, End: time.Now()})
+	c.state.mu.Unlock()
 	// Mimic Postgres bind semantics: it binds exactly the number of $N params the
 	// statement references. Passing extra args (a real bug that fails at runtime)
 	// used to silently "work" against this fake driver.

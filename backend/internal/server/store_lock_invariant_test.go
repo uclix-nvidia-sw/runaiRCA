@@ -53,8 +53,26 @@ func storeSourceFuncs(t *testing.T) map[string]*ast.FuncDecl {
 	return funcs
 }
 
-// countLocks reports how often fn calls s.<field>.Lock().
+// countLocks reports how often fn locks the STORE's <field>, written either as
+// s.<field> from a Store method or s.store.<field> from a Server one.
+//
+// Both spellings matter. An earlier version accepted only the bare identifier
+// `s`, which silently exempted every caller reaching past the Store's own
+// methods — and incidentResolve does exactly that with s.store.mu.Lock(),
+// persisting an incident with no writeMu at all. The test reported a clean bill
+// of health on a writer that could still lose an update. Accepting ANY receiver
+// is the other failure: Hub.mu and slackState.mu are unrelated mutexes and get
+// reported as violations.
 func countLocks(fn *ast.FuncDecl, field string) int {
+	storeLock := func(expr ast.Expr) bool {
+		switch base := expr.(type) {
+		case *ast.Ident: // s.<field>, inside a Store method
+			return base.Name == "s" && isStoreMethod(fn)
+		case *ast.SelectorExpr: // s.store.<field>, from a Server
+			return base.Sel.Name == "store"
+		}
+		return false
+	}
 	n := 0
 	ast.Inspect(fn.Body, func(node ast.Node) bool {
 		call, ok := node.(*ast.CallExpr)
@@ -65,17 +83,28 @@ func countLocks(fn *ast.FuncDecl, field string) int {
 		if !ok || outer.Sel.Name != "Lock" {
 			return true
 		}
-		inner, ok := outer.X.(*ast.SelectorExpr) // s.<field>
-		if !ok || inner.Sel.Name != field {
-			return true
-		}
-		if ident, ok := inner.X.(*ast.Ident); !ok || ident.Name != "s" {
+		inner, ok := outer.X.(*ast.SelectorExpr) // ....<field>
+		if !ok || inner.Sel.Name != field || !storeLock(inner.X) {
 			return true
 		}
 		n++
 		return true
 	})
 	return n
+}
+
+// isStoreMethod reports whether fn is a method on *Store, so that a bare `s.mu`
+// in some other type's method is not mistaken for the store lock.
+func isStoreMethod(fn *ast.FuncDecl) bool {
+	if fn.Recv == nil || len(fn.Recv.List) != 1 {
+		return false
+	}
+	star, ok := fn.Recv.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	ident, ok := star.X.(*ast.Ident)
+	return ok && ident.Name == "Store"
 }
 
 func TestEveryStoreWriterTakesWriteMu(t *testing.T) {

@@ -446,6 +446,12 @@ func (s *Server) incidentCancelAnalysis(w http.ResponseWriter, r *http.Request, 
 // Toggle operator approval, which binds (or revokes) the CaseSnapshot.
 func (s *Server) incidentResolve(w http.ResponseWriter, r *http.Request, id string) {
 	now := time.Now().UTC()
+	// This handler reaches past the Store's methods and takes the store lock
+	// itself, so it has to honour the same order: writeMu, then mu. It persists
+	// an incident, which means without writeMu it can land inside a webhook's
+	// persist window and have its user_approved_at overwritten by the older row.
+	s.store.writeMu.Lock()
+	defer s.store.writeMu.Unlock()
 	s.store.mu.Lock()
 	incident := s.store.incidents[id]
 	if incident == nil {

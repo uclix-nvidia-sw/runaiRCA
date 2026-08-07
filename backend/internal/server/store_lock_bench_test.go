@@ -1,6 +1,8 @@
 package server
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"runtime"
 	"strings"
 	"sync"
@@ -115,71 +117,158 @@ func TestWebhookWriteOverlapsItsTwoRoundTripsUnderTheStoreLock(t *testing.T) {
 // withdrawn optimisation needed and did not have.
 //
 // UpsertAlertResult writes its two rows with s.mu released. The hazard that
-// forced the first revert is a SECOND writer — SoftDeleteIncident here, but
-// ArchiveIncident, RestoreIncident, incidentResolve and ApplyAnalysisForRun are
-// the same shape — mutating and persisting the same incident inside that
-// window. Its row lands first, the webhook's older row lands on top, and
-// deleted_at is silently reverted in Postgres with nothing wrong in memory.
+// forced the first revert is a SECOND writer mutating and persisting the same
+// incident inside that window: its row lands first, the webhook's older row
+// lands on top, and deleted_at / archived_at / user_approved_at is silently
+// reverted in Postgres with nothing wrong in memory.
+//
+// Every writer of the incident row is covered, not just the soft delete that
+// was named in the revert. incidentResolve is here because it is a Server
+// method that reaches past the Store and takes the store lock itself — it was
+// the one writer with no writeMu at all, and the invariant test's first version
+// could not see it.
 //
 // The latencies are deliberately lopsided. With both statements equally slow
-// the delete cannot interleave no matter what the locking does — it is issued
-// later and therefore finishes later — and the test passes with writeMu
-// removed, which is exactly how the first version of it was vacuous. A short
-// incidents write and a long alerts write open a real window between the
-// webhook's two statements for the delete to fall into.
+// the second writer cannot interleave no matter what the locking does — it is
+// issued later and therefore finishes later — and the test passes with writeMu
+// removed, which is exactly how the first version of this was vacuous. A short
+// incidents write and a long alerts write open a real window to fall into.
 func TestConcurrentWriterCannotLandInsideAWebhooksPersistWindow(t *testing.T) {
-	store, state := storeWithSlowPostgres(t)
-	state.SetExecLatencyFor("INSERT INTO incidents", 50*time.Millisecond)
-	state.SetExecLatencyFor("INSERT INTO alerts", 400*time.Millisecond)
-
 	firing := Alert{
 		Status:      "firing",
 		Labels:      map[string]string{"alertname": "KubePodNotReady", "namespace": "runai", "pod": "p1"},
 		Annotations: map[string]string{"summary": "pod not ready"},
 		StartsAt:    time.Now().UTC().Format(time.RFC3339),
 	}
-	seeded := store.UpsertAlertResult(AlertmanagerWebhook{}, firing)
-	incidentID := seeded.Incident.IncidentID
-	before := len(state.Execs())
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		store.UpsertAlertResult(AlertmanagerWebhook{}, firing)
-	}()
+	// Stashed by the ApplyAnalysisForRun case: creating and completing the run
+	// are writers themselves, so doing them inside act would take writeMu, wait
+	// out the whole webhook, and leave nothing for act's own writeMu to guard.
+	var preparedRun string
 
-	// Past the webhook's incidents write (50ms), well inside its alerts write
-	// (400ms) — the gap the delete would fall into.
-	time.Sleep(120 * time.Millisecond)
-	if _, ok := store.SoftDeleteIncident(incidentID); !ok {
-		t.Fatal("soft delete did not apply")
+	cases := []struct {
+		name string
+		// prepare runs before the webhook starts; act is the competing writer.
+		prepare func(t *testing.T, store *Store, incidentID, alertID string)
+		act     func(t *testing.T, store *Store, incidentID, alertID string)
+	}{
+		{
+			name: "SoftDeleteIncident",
+			act: func(t *testing.T, store *Store, incidentID, _ string) {
+				if _, ok := store.SoftDeleteIncident(incidentID); !ok {
+					t.Error("soft delete did not apply")
+				}
+			},
+		},
+		{
+			name: "ArchiveIncident",
+			act: func(t *testing.T, store *Store, incidentID, _ string) {
+				if _, ok := store.ArchiveIncident(incidentID, true); !ok {
+					t.Error("archive did not apply")
+				}
+			},
+		},
+		{
+			name: "RestoreIncident",
+			prepare: func(t *testing.T, store *Store, incidentID, _ string) {
+				if _, ok := store.ArchiveIncident(incidentID, true); !ok {
+					t.Fatal("could not archive before restoring")
+				}
+			},
+			act: func(t *testing.T, store *Store, incidentID, _ string) {
+				if _, ok := store.RestoreIncident(incidentID); !ok {
+					t.Error("restore did not apply")
+				}
+			},
+		},
+		{
+			name: "ApplyAnalysisForRun",
+			prepare: func(t *testing.T, store *Store, incidentID, alertID string) {
+				run := store.CreateAnalysisRun("manual", "alert", alertID, incidentID, alertID, "x", "")
+				store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{AnalysisSummary: "s", AnalysisDetail: "d"})
+				preparedRun = run.RunID
+			},
+			act: func(t *testing.T, store *Store, _, alertID string) {
+				response := AgentAnalysisResponse{AnalysisSummary: "s", AnalysisDetail: "d"}
+				if !store.ApplyAnalysisForRun(preparedRun, alertID, response) {
+					t.Error("apply did not land")
+				}
+			},
+		},
+		{
+			name: "incidentResolve",
+			act: func(t *testing.T, store *Store, incidentID, _ string) {
+				server := &Server{store: store, hub: NewHub()}
+				recorder := httptest.NewRecorder()
+				server.incidentResolve(recorder, httptest.NewRequest(http.MethodPost, "/", nil), incidentID)
+				if recorder.Code != http.StatusOK && recorder.Code != http.StatusNoContent {
+					t.Errorf("resolve returned %d: %s", recorder.Code, recorder.Body.String())
+				}
+			},
+		},
 	}
-	<-done
 
-	// Required order: the webhook's incidents row, the webhook's alerts row,
-	// then the delete's incidents row. Without writeMu the delete's write lands
-	// second, and the webhook is still holding a pre-delete copy of the incident
-	// — nothing rewrites deleted_at after that.
-	var incidents, alerts []int
-	for i, statement := range state.Execs()[before:] {
-		switch {
-		case strings.Contains(statement, "INSERT INTO incidents"):
-			incidents = append(incidents, i)
-		case strings.Contains(statement, "INSERT INTO alerts"):
-			alerts = append(alerts, i)
-		}
-	}
-	if len(incidents) != 2 || len(alerts) != 1 {
-		t.Fatalf("expected two incident writes and one alert write, got %d/%d: %v",
-			len(incidents), len(alerts), state.Execs()[before:])
-	}
-	if alerts[0] > incidents[1] {
-		t.Fatalf("the delete's incident write landed INSIDE the webhook's persist window "+
-			"(incidents at %v, alerts at %v) — the webhook is holding a pre-delete copy, "+
-			"so deleted_at is reverted in Postgres", incidents, alerts)
-	}
-	incident, ok := store.IncidentDetail(incidentID)
-	if ok && incident != nil && !incidentDeleted(&incident.Incident) {
-		t.Fatal("incident is not deleted in memory either")
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			store, state := storeWithSlowPostgres(t)
+			seeded := store.UpsertAlertResult(AlertmanagerWebhook{}, firing)
+			incidentID, alertID := seeded.Incident.IncidentID, seeded.Alert.AlertID
+			if testCase.prepare != nil {
+				testCase.prepare(t, store, incidentID, alertID)
+			}
+			// Set the latencies only now: the setup above would pay them too.
+			state.SetExecLatencyFor("INSERT INTO incidents", 50*time.Millisecond)
+			state.SetExecLatencyFor("INSERT INTO alerts", 400*time.Millisecond)
+			before := len(state.ExecTimings())
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				store.UpsertAlertResult(AlertmanagerWebhook{}, firing)
+			}()
+
+			// Past the webhook's incidents write (50ms), well inside its alerts
+			// write (400ms) — the gap the competing writer would fall into.
+			time.Sleep(120 * time.Millisecond)
+			testCase.act(t, store, incidentID, alertID)
+			<-done
+
+			// Required order: the webhook's incidents row, the webhook's alerts
+			// row, then anything the competing writer wrote. If its write lands
+			// second, the webhook is still holding a pre-change copy of the
+			// incident and nothing rewrites the column after that.
+			var incidents, alerts []int
+			for i, statement := range state.Execs()[before:] {
+				switch {
+				case strings.Contains(statement, "INSERT INTO incidents"):
+					incidents = append(incidents, i)
+				case strings.Contains(statement, "INSERT INTO alerts"):
+					alerts = append(alerts, i)
+				}
+			}
+			// The webhook issues exactly two statements, and they are the first
+			// two to start. Everything after them is the competing writer's, and
+			// none of it may OVERLAP the webhook's pair: writeMu is what makes
+			// its first statement start only once both of the webhook's have
+			// come back.
+			//
+			// Intervals, not positions. ApplyAnalysisForRun's first write is the
+			// same slow alerts insert the webhook is running, so it can never
+			// finish earlier no matter what the locking does, and an
+			// order-based assertion passes on it with writeMu removed.
+			timings := state.ExecTimings()[before:]
+			if len(timings) < 3 {
+				t.Fatalf("expected the webhook's two writes plus the competing one, got %d", len(timings))
+			}
+			webhookDone := timings[0].End
+			if timings[1].End.After(webhookDone) {
+				webhookDone = timings[1].End
+			}
+			if timings[2].Start.Before(webhookDone) {
+				t.Fatalf("%s started a write %v BEFORE the webhook's persists finished — it is inside the "+
+					"window, so the webhook is holding a pre-change copy and its older row reverts the "+
+					"column in Postgres", testCase.name, webhookDone.Sub(timings[2].Start))
+			}
+		})
 	}
 }
