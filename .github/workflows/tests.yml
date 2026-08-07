@@ -41,6 +41,14 @@ jobs:
         env:
           RCA_TEST_POSTGRES_DSN: postgres://rca:rca@localhost:5432/rcatest?sslmode=disable
         run: go test ./...
+      # The store's writers release the memory lock across their Postgres round
+      # trips, so a mistake there is a data race rather than a failed assertion
+      # and the plain run above cannot see it. Runs without the Postgres DSN:
+      # this step is here for the concurrency, and the integration tests already
+      # had their turn.
+      - name: Test (race)
+        working-directory: backend
+        run: go test -race ./...
 
   agent:
     runs-on: ubuntu-latest
