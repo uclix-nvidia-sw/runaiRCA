@@ -8,6 +8,10 @@ from typing import Any
 
 from app.mcp_client import mcp_call, mcp_error, mcp_tool_json
 
+# Module-local clock so a test can freeze THIS module's notion of time without
+# patching the stdlib object, which is also the asyncio event loop's clock.
+_now = time.monotonic
+
 _GRAFANA_UID = re.compile(r"^[a-zA-Z0-9\-_]{1,40}$")
 _SUCCESS_TTL_SECONDS = 300.0
 _FAILURE_TTL_SECONDS = 30.0
@@ -39,7 +43,7 @@ async def resolve_grafana_datasource_uid(
     dtype = datasource_type.strip().lower()
     configured = configured_uid.strip()
     key = (url, dtype, configured)
-    now = time.monotonic()
+    now = _now()
     cached = _DATASOURCE_CACHE.get(key)
     if cached and cached.expires_at > now:
         if cached.error:
@@ -117,7 +121,7 @@ def mark_grafana_datasource_failure(
         return
     key = (url, datasource_type.strip().lower(), configured_uid.strip())
     _DATASOURCE_CACHE[key] = _DatasourceCacheEntry(
-        expires_at=time.monotonic() + _FAILURE_TTL_SECONDS,
+        expires_at=_now() + _FAILURE_TTL_SECONDS,
         error=_resolution_error(datasource_type, exc),
     )
 

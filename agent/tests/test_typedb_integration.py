@@ -28,8 +28,8 @@ import pytest
 import yaml
 
 from app.config import load_settings
+from app.ontology.typedb_client import _concept_value, open_driver
 from app.ontology.typedb_client import escape_typeql as esc
-from app.ontology.typedb_client import open_driver
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("RCA_TEST_TYPEDB"), reason="RCA_TEST_TYPEDB not set (destructive)"
@@ -60,11 +60,7 @@ def _families_for(symptom: str) -> set[str]:
             .resolve()
             .as_concept_rows()
         )
-    values = set()
-    for row in rows:
-        concept = row.get("f")
-        values.add(str(getattr(concept, "get_value", lambda: concept)()))
-    return values
+    return {str(_concept_value(row.get("f"))) for row in rows}
 
 
 def _plant_stale_edge(symptom: str) -> None:

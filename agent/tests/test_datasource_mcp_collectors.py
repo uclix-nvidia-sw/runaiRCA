@@ -1003,7 +1003,9 @@ async def test_datasource_cache_entries_expire_on_their_own_ttl(monkeypatch) -> 
     never picked up.
     """
     clock = 1000.0
-    monkeypatch.setattr(grafana_mcp.time, "monotonic", lambda: clock)
+    # grafana_mcp._now, not time.monotonic: patching the stdlib object would also
+    # freeze the asyncio event loop's clock, and this test is async.
+    monkeypatch.setattr(grafana_mcp, "_now", lambda: clock)
     clear_grafana_datasource_cache()
 
     calls = 0
@@ -1040,3 +1042,17 @@ async def test_datasource_cache_entries_expire_on_their_own_ttl(monkeypatch) -> 
     clock += 120  # 6 minutes since the success
     assert await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus") == "prom-live"
     assert calls == 3, "a cached success must not outlive ~5 minutes"
+
+    # The OTHER writer into the failure cache: a UID Grafana rejected mid-query.
+    # It must expire on the failure TTL too, or one rejection blinds the
+    # collector for five minutes of a run instead of thirty seconds.
+    grafana_mcp.mark_grafana_datasource_failure(
+        "http://mcp", "prometheus", "", RuntimeError("id is invalid")
+    )
+    with pytest.raises(RuntimeError):
+        await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus")
+    assert calls == 3, "a circuit-broken UID must not re-hit Grafana inside its TTL"
+
+    clock += 40
+    assert await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus") == "prom-live"
+    assert calls == 4, "a rejected-UID circuit break must not be cached for 40s"

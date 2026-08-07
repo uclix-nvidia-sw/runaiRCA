@@ -1950,6 +1950,15 @@ func TestReusedManualRunBecomesLatestSoItsResultApplies(t *testing.T) {
 	}
 	store.CompleteAnalysisRun(runB.RunID, AgentAnalysisResponse{AnalysisSummary: "b", AnalysisDetail: "b"})
 
+	// Explicit offsets, not the clock: all three calls can land in one tick, and
+	// the CreatedAt tie then falls to the `other.RunID > current.RunID` tie-break
+	// — which runB wins, because reuse keeps the OLD (smaller) run id on purpose.
+	// The reused run is then judged stale and step 4 fails. That was 2-in-90 at
+	// -cpu=1 on origin/main, i.e. older than this branch. Production spends an
+	// agent round trip between these calls, so only the test can tie.
+	store.analysisRuns[runA.RunID].CreatedAt = runA.CreatedAt.Add(-2 * time.Millisecond)
+	store.analysisRuns[runB.RunID].CreatedAt = runA.CreatedAt.Add(-time.Millisecond)
+
 	// 3) The operator clicks Analyze on the alert again: the manual row is reused.
 	reused, created := store.CreateAnalysisRunIfAllowed(
 		"manual", "alert", alertID, incidentID, alertID, "manual again", "")
