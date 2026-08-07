@@ -18,6 +18,33 @@ from app.services.orchestrator import AnalysisOrchestrator
 from tests.test_orchestrator import make_settings
 
 
+def _analyze_impl_calling_llm(settings):
+    """An orchestrator body whose only job is to make exactly one LLM call.
+
+    Four usage tests need the same stub; what differs between them is the fake
+    transport, not this.
+    """
+
+    async def fake_impl(request: AlertAnalysisRequest) -> AlertAnalysisResponse:
+        await complete(settings, system="s", user="u")
+        return AlertAnalysisResponse(
+            status="ok",
+            thread_ts=request.thread_ts,
+            analysis="a",
+            analysis_summary="s",
+            analysis_detail="d",
+            analysis_type="firing",
+            analysis_quality="high",
+            missing_data=[],
+            warnings=[],
+            capabilities={},
+            context={},
+            artifacts=[],
+        )
+
+    return fake_impl
+
+
 @pytest.mark.asyncio
 async def test_llm_usage_is_injected_by_analyze(monkeypatch) -> None:
     settings = replace(
@@ -38,26 +65,9 @@ async def test_llm_usage_is_injected_by_analyze(monkeypatch) -> None:
             },
         )
 
-    async def fake_impl(request: AlertAnalysisRequest) -> AlertAnalysisResponse:
-        await complete(settings, system="s", user="u")
-        return AlertAnalysisResponse(
-            status="ok",
-            thread_ts=request.thread_ts,
-            analysis="a",
-            analysis_summary="s",
-            analysis_detail="d",
-            analysis_type="firing",
-            analysis_quality="high",
-            missing_data=[],
-            warnings=[],
-            capabilities={},
-            context={},
-            artifacts=[],
-        )
-
     monkeypatch.setattr("app.llm.post_json", fake_post_json)
     orch = AnalysisOrchestrator(settings)
-    orch._analyze_impl = fake_impl  # type: ignore[assignment]
+    orch._analyze_impl = _analyze_impl_calling_llm(settings)  # type: ignore[assignment]
 
     response = await orch.analyze(
         AlertAnalysisRequest(alert=Alert(labels={"alertname": "x"}, annotations={}))
@@ -102,26 +112,9 @@ async def test_llm_usage_counts_missing_usage(monkeypatch) -> None:
             data={"choices": [{"message": {"content": "done"}}]},
         )
 
-    async def fake_impl(request: AlertAnalysisRequest) -> AlertAnalysisResponse:
-        await complete(settings, system="s", user="u")
-        return AlertAnalysisResponse(
-            status="ok",
-            thread_ts=request.thread_ts,
-            analysis="a",
-            analysis_summary="s",
-            analysis_detail="d",
-            analysis_type="firing",
-            analysis_quality="high",
-            missing_data=[],
-            warnings=[],
-            capabilities={},
-            context={},
-            artifacts=[],
-        )
-
     monkeypatch.setattr("app.llm.post_json", fake_post_json)
     orch = AnalysisOrchestrator(settings)
-    orch._analyze_impl = fake_impl  # type: ignore[assignment]
+    orch._analyze_impl = _analyze_impl_calling_llm(settings)  # type: ignore[assignment]
 
     response = await orch.analyze(
         AlertAnalysisRequest(alert=Alert(labels={"alertname": "x"}, annotations={}))
@@ -148,28 +141,11 @@ async def test_llm_usage_counts_exhausted_retry(monkeypatch) -> None:
     async def fake_sleep(_seconds: float) -> None:
         return None
 
-    async def fake_impl(request: AlertAnalysisRequest) -> AlertAnalysisResponse:
-        await complete(settings, system="s", user="u")
-        return AlertAnalysisResponse(
-            status="ok",
-            thread_ts=request.thread_ts,
-            analysis="a",
-            analysis_summary="s",
-            analysis_detail="d",
-            analysis_type="firing",
-            analysis_quality="high",
-            missing_data=[],
-            warnings=[],
-            capabilities={},
-            context={},
-            artifacts=[],
-        )
-
     monkeypatch.setattr("app.llm.post_json", fake_post_json)
     monkeypatch.setattr("app.llm.asyncio.sleep", fake_sleep)
     monkeypatch.setattr("app.llm.random.uniform", lambda *_args: 0)
     orch = AnalysisOrchestrator(settings)
-    orch._analyze_impl = fake_impl  # type: ignore[assignment]
+    orch._analyze_impl = _analyze_impl_calling_llm(settings)  # type: ignore[assignment]
 
     response = await orch.analyze(
         AlertAnalysisRequest(alert=Alert(labels={"alertname": "x"}, annotations={}))
@@ -297,26 +273,9 @@ async def test_llm_usage_reads_anthropic_style_token_names(monkeypatch) -> None:
             },
         )
 
-    async def fake_impl(request: AlertAnalysisRequest) -> AlertAnalysisResponse:
-        await complete(settings, system="s", user="u")
-        return AlertAnalysisResponse(
-            status="ok",
-            thread_ts=request.thread_ts,
-            analysis="a",
-            analysis_summary="s",
-            analysis_detail="d",
-            analysis_type="firing",
-            analysis_quality="high",
-            missing_data=[],
-            warnings=[],
-            capabilities={},
-            context={},
-            artifacts=[],
-        )
-
     monkeypatch.setattr("app.llm.post_json", fake_post_json)
     orch = AnalysisOrchestrator(settings)
-    orch._analyze_impl = fake_impl  # type: ignore[assignment]
+    orch._analyze_impl = _analyze_impl_calling_llm(settings)  # type: ignore[assignment]
 
     response = await orch.analyze(
         AlertAnalysisRequest(alert=Alert(labels={"alertname": "x"}, annotations={}))

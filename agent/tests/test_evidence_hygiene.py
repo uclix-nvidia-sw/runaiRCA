@@ -9,13 +9,14 @@ from dataclasses import replace
 import pytest
 
 from app.collectors.base import NO_EVIDENCE, CollectorResult, artifact
-from app.collectors.kubernetes import best_matching_pod, pod_name_stem
+from app.collectors.kubernetes import _best_live_target_pod, pod_name_stem
 from app.collectors.postgres import _postgres_result
 from app.plan import InvestigationPlan
 from app.schemas import Alert, AlertAnalysisRequest, SimilarIncidentContext
 from app.services import pipeline
 from app.services.evidence_blackboard import Blackboard
 from app.services.kg_enrichment import GraphRemediation
+from app.services.pipeline import ReportKnowledge
 from app.services.root_cause_ranking import RankedCause
 from tests.test_orchestrator import make_settings, make_target
 
@@ -51,20 +52,20 @@ def test_best_matching_pod_prefers_the_unhealthy_replacement() -> None:
         _pod("runai-container-toolkit-fresh", "dgx05", "2026-07-07T00:00:00Z"),
         _pod("unrelated-abc12", "dgx03", "2026-07-08T00:00:00Z", restarts=9),
     ]
-    match = best_matching_pod(items, [pod_name_stem("runai-container-toolkit-vttmr")])
+    match = _best_live_target_pod(items, ["runai-container-toolkit-vttmr"])
     assert match is not None
     assert match["spec"]["nodeName"] == "dgx01"
 
 
 def test_best_matching_pod_all_healthy_needs_unambiguous_match() -> None:
-    stem = [pod_name_stem("runai-container-toolkit-vttmr")]
+    stem = ["runai-container-toolkit-vttmr"]
     many_healthy = [
         _pod("runai-container-toolkit-aaa11", "dgx01", "2026-07-01T00:00:00Z"),
         _pod("runai-container-toolkit-bbb22", "dgx02", "2026-07-02T00:00:00Z"),
     ]
-    assert best_matching_pod(many_healthy, stem) is None  # guessing = wrong-node evidence
-    assert best_matching_pod(many_healthy[:1], stem) is not None  # unambiguous is safe
-    assert best_matching_pod(many_healthy, [""]) is None
+    assert _best_live_target_pod(many_healthy, stem) is None  # guessing = wrong-node evidence
+    assert _best_live_target_pod(many_healthy[:1], stem) is not None  # unambiguous is safe
+    assert _best_live_target_pod(many_healthy, [""]) is None
 
 
 def test_workload_prefix_node_resolution_rejects_multi_node_replicas() -> None:
@@ -93,7 +94,11 @@ def test_insufficient_evidence_gets_a_separate_general_guidance_section() -> Non
         ),
         [],
         [],
-        failure_modes={
+        root_cause_candidates=[
+            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
+        ],
+        eligible_support_ids=set(),
+        knowledge=ReportKnowledge(failure_modes={
             "workload_startup_error": [
                 {
                     "symptom": "OOMKilled",
@@ -101,11 +106,7 @@ def test_insufficient_evidence_gets_a_separate_general_guidance_section() -> Non
                     "actions": ["GENERAL-GUIDANCE raise the memory limit after validation."],
                 }
             ]
-        },
-        root_cause_candidates=[
-            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
-        ],
-        eligible_support_ids=set(),
+        }),
     )
 
     actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
@@ -221,6 +222,8 @@ def test_appendix_omits_drilldown_artifact_dump() -> None:
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
+
+        knowledge=ReportKnowledge(),
     )
 
     assert "### Evidence" not in detail
@@ -251,6 +254,8 @@ def test_root_cause_supporting_evidence_uses_drilldown_after_no_evidence_base() 
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
+
+        knowledge=ReportKnowledge(),
     )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
@@ -280,6 +285,8 @@ def test_context_only_artifact_stays_out_of_root_cause_evidence() -> None:
         root_cause_candidates=[
             RankedCause(family="node_kubelet_pressure", confidence="medium", score=7.0)
         ],
+
+        knowledge=ReportKnowledge(),
     )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
@@ -313,6 +320,8 @@ def test_contextual_eligibility_blocks_scoped_artifact_from_report() -> None:
         # The blackboard rejected E01 because it belongs to a different target
         # or incident window. It remains available in Collector Evidence Trail.
         eligible_support_ids=set(),
+
+        knowledge=ReportKnowledge(),
     )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
@@ -352,6 +361,8 @@ def test_context_only_artifact_cannot_emit_graph_remediation_actions() -> None:
         ),
         # The blackboard rejected every artifact as context/out-of-scope.
         eligible_support_ids=set(),
+
+        knowledge=ReportKnowledge(),
     )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
@@ -397,17 +408,17 @@ def test_context_only_artifacts_cannot_emit_catalog_or_historical_actions() -> N
         request,
         [CollectorResult(agent="kubernetes", status="ok", summary="current snapshot")],
         [],
-        failure_modes=modes,
         root_cause_candidates=[
             RankedCause(family="node_kubelet_pressure", confidence="medium", score=7.0)
         ],
         kg_context={"enabled": True, "available": True, "knowledge": modes},
         plan=plan,
         graph_fixes=GraphRemediation(family_fixes=["GRAPH-REMEDY reset the node"]),
-        components={"component-a": {"checks": ["COMPONENT-REMEDY restart it"]}},
-        # A typed artifact existed but was another target/window, so this is an
-        # explicit production-style no-support verdict rather than a legacy call.
         eligible_support_ids=set(),
+        knowledge=ReportKnowledge(
+            failure_modes=modes,
+            components={"component-a": {"checks": ["COMPONENT-REMEDY restart it"]}},
+        ),
     )
 
     actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
@@ -422,97 +433,6 @@ def test_context_only_artifacts_cannot_emit_catalog_or_historical_actions() -> N
         assert forbidden not in actions
     assert "Knowledge-base remediation is withheld" in detail
     assert "Specific playbook remediation is withheld" in detail
-
-
-def test_synthesis_input_separates_support_contradiction_and_context() -> None:
-    result = CollectorResult(agent="prometheus", status="ok", summary="all metrics queried")
-    for name, polarity, coverage in (
-        ("capacity gap", "present", "scoped"),
-        ("restart unchanged", "absent", "scoped"),
-        ("memory snapshot", "unknown", "partial"),
-    ):
-        result.artifacts.append(
-            artifact(
-                agent="prometheus",
-                source="prometheus",
-                type="promql_signal",
-                status="ok",
-                confidence="medium",
-                summary=name,
-                result={"observation": {"polarity": polarity, "coverage": coverage}},
-            )
-        )
-
-    finding = pipeline._synthesis_collector_findings([result])[0]
-
-    assert finding["collection_summary"] == "all metrics queried"
-    assert [item["summary"] for item in finding["supporting_artifacts"]] == ["capacity gap"]
-    assert [item["summary"] for item in finding["contradicting_artifacts"]] == [
-        "restart unchanged"
-    ]
-    assert [item["summary"] for item in finding["context_artifacts"]] == ["memory snapshot"]
-    assert finding["context_artifacts"][0]["evidence_role"] == "context"
-
-
-def test_synthesis_input_uses_contextual_eligibility_over_raw_scoped_role() -> None:
-    result = CollectorResult(agent="loki", status="ok", summary="logs queried")
-    finding = artifact(
-        agent="loki",
-        source="loki",
-        type="logql_signal",
-        status="ok",
-        confidence="high",
-        summary="unrelated workload OOMKilled",
-        result={"observation": {"polarity": "present", "coverage": "scoped"}},
-    )
-    finding.evidence_id = "E01"
-    result.artifacts.append(finding)
-
-    projected = pipeline._synthesis_collector_findings(
-        [result], evidence_eligibility={"E01": object()}
-    )[0]
-
-    assert projected["supporting_artifacts"] == []
-    assert projected["contradicting_artifacts"] == []
-    assert [item["summary"] for item in projected["context_artifacts"]] == [
-        "unrelated workload OOMKilled"
-    ]
-
-
-def test_synthesis_context_excludes_query_and_mcp_diagnostic_suggestions() -> None:
-    query = '{pod="imagepull-0"} |~ "ImagePullBackOff|ErrImagePull"'
-    result = CollectorResult(agent="loki", status="ok", summary="logs queried")
-    result.artifacts.append(
-        artifact(
-            agent="loki",
-            source="loki",
-            type="drilldown_query",
-            status="ok",
-            confidence="low",
-            summary="0 MCP log line(s)",
-            query=query,
-            result={
-                "query": query,
-                "line_count": 0,
-                "sample": {
-                    "data": [],
-                    "hints": {
-                        "debug": "ImagePullBackOff",
-                        "possibleCauses": ["ErrImagePull"],
-                    },
-                },
-                "observation": {"polarity": "unknown", "coverage": "partial"},
-            },
-        )
-    )
-
-    projected = pipeline._synthesis_collector_findings([result])[0]["context_artifacts"][0]
-    serialized = json.dumps(projected, ensure_ascii=False)
-
-    assert "query" not in projected
-    assert "ImagePullBackOff" not in serialized
-    assert "ErrImagePull" not in serialized
-    assert "possibleCauses" not in serialized
 
 
 def test_runai_raw_api_data_is_not_ranked_as_observed_failure_text() -> None:
@@ -581,6 +501,38 @@ def test_query_intent_is_excluded_from_drilldown_and_self_check_prompts() -> Non
     assert "ErrImagePull" not in digest
 
 
+def test_newest_artifact_always_gets_a_digest_slot() -> None:
+    """The digest ranks by usefulness and caps at six, but the NEWEST artifact
+    is appended unconditionally — a collector's latest observation must reach
+    the refuting model even when six older ranked ones fill the cap.
+
+    This half of a test deleted with the generative-synthesis projection was the
+    only coverage of that guarantee: replacing the "newest first, then rank the
+    rest" term with a plain top-6 leaves all other tests green.
+    """
+    from app.masking import build_masker
+    from app.services import self_check
+
+    result = CollectorResult(agent="loki", status="ok", summary="headline")
+    for index in range(6):
+        result.artifacts.append(
+            artifact(
+                agent="loki", source="loki", type="logs", status="ok", confidence="high",
+                summary=f"old-{index}", highlights=["signal"],
+                result={"observation": {"polarity": "unknown", "coverage": "partial"}},
+            )
+        )
+    result.artifacts.append(
+        artifact(
+            agent="loki", source="loki", type="logs", status="partial", confidence="low",
+            summary="newest",
+            result={"observation": {"polarity": "unknown", "coverage": "partial"}},
+        )
+    )
+
+    assert "newest" in self_check._evidence_digest([result], build_masker(()))
+
+
 def test_ontology_probe_ignores_debug_and_possible_cause_metadata() -> None:
     from app.services import probe_evaluation
 
@@ -619,6 +571,8 @@ def test_unavailable_drilldown_artifact_is_not_report_evidence() -> None:
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
+
+        knowledge=ReportKnowledge(),
     )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
@@ -657,6 +611,8 @@ def test_appendix_omits_successful_and_failed_artifact_details() -> None:
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
+
+        knowledge=ReportKnowledge(),
     )
 
     assert "### Evidence" not in detail
@@ -742,19 +698,19 @@ async def test_drilldown_uses_one_recoverable_decision_retry(monkeypatch) -> Non
 def test_best_matching_pod_multiple_unhealthy_nodes_is_ambiguous() -> None:
     # A DaemonSet broken on SEVERAL nodes: per-pod attribution is impossible
     # from stems alone — guessing would read kernel logs from the wrong node.
-    stem = [pod_name_stem("runai-container-toolkit-vttmr")]
+    stem = ["runai-container-toolkit-vttmr"]
     spread = [
         _pod("runai-container-toolkit-aa111", "dgx01", "2026-07-06T00:00:00Z", restarts=3),
         _pod("runai-container-toolkit-bb222", "dgx07", "2026-07-07T00:00:00Z", restarts=5),
     ]
-    assert best_matching_pod(spread, stem) is None
+    assert _best_live_target_pod(spread, stem) is None
 
     # Successive incarnations on the SAME node stay resolvable (newest wins).
     same_node = [
         _pod("runai-container-toolkit-aa111", "dgx01", "2026-07-06T00:00:00Z", restarts=3),
         _pod("runai-container-toolkit-bb222", "dgx01", "2026-07-07T00:00:00Z", restarts=5),
     ]
-    match = best_matching_pod(same_node, stem)
+    match = _best_live_target_pod(same_node, stem)
     assert match is not None
     assert match["metadata"]["name"] == "runai-container-toolkit-bb222"
 
@@ -1166,7 +1122,7 @@ async def test_evidence_stage_accepts_sufficient_subset_and_skips_optional_work(
                             "observed_entity": f"pod:{target.pod}",
                         },
                     },
-                )
+    )
             ],
         )
 
@@ -1283,7 +1239,7 @@ async def test_re_resolved_live_target_drives_blackboard_eligibility(monkeypatch
                                 },
                             },
                         },
-                    )
+    )
                 ],
             )
 
@@ -1495,7 +1451,7 @@ async def test_alert_only_known_issue_is_auditable_harness_support(monkeypatch) 
                 "summary": (
                     "runai-scheduler-default panic: reclaim.go runtime/panic.go "
                     "reclaim] attempting to reclaim large GPU job"
-                )
+    )
             },
         ),
     )
@@ -1567,7 +1523,7 @@ async def test_rank_stage_approved_match_seed_without_current_evidence_is_not_fo
                     similarity=0.91,
                     approved=True,
                     root_cause_family="gpu_hardware_error",
-                )
+    )
             ],
         ),
         collectors=[],

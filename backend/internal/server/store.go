@@ -55,7 +55,20 @@ type recurrenceStatsCacheEntry struct {
 }
 
 type Store struct {
-	mu sync.RWMutex
+	// writeMu serializes WRITERS; mu guards the in-memory maps. Every writer
+	// takes writeMu immediately before mu, which is what lets a writer release
+	// mu across its Postgres round trip without a second writer slipping in
+	// between the memory mutation and the persist — the interleaving that made
+	// the earlier off-lock attempt lose updates (see UpsertAlertResult).
+	//
+	// Order is always writeMu -> mu, never the reverse, and writeMu is acquired
+	// at exactly the points mu.Lock() already was. mu.Lock() is not reentrant
+	// and the code does not deadlock today, so no writeMu acquisition can nest
+	// either. TestEveryStoreWriterTakesWriteMu keeps that true.
+	//
+	// Readers take only mu.RLock(), so they never wait on a writer's I/O.
+	writeMu sync.Mutex
+	mu      sync.RWMutex
 	// Dense-score calibration state. Guarded by its own mutex: the centroid is
 	// read on the search path, which must never contend with the store lock.
 	centroidMu           sync.Mutex
@@ -462,47 +475,42 @@ func (s *Store) UpsertAlert(webhook AlertmanagerWebhook, alert Alert) (*Incident
 	return result.Incident, result.Alert
 }
 
-func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) AlertUpsertResult {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if alert.Labels == nil {
-		alert.Labels = map[string]string{}
+// episodeTombstoneDropsLocked reports whether a purged episode should swallow
+// this webhook. The tombstone is cleared once its episode ends (the resolve) or
+// a strictly newer firing arrives; see clearEpisodeTombstoneLocked.
+func (s *Store) episodeTombstoneDropsLocked(fingerprint, alertStatus string, alertFiredAt time.Time) bool {
+	tombstone, ok := s.deletedEpisodes[fingerprint]
+	if !ok {
+		return false
 	}
-	if alert.Annotations == nil {
-		alert.Annotations = map[string]string{}
-	}
-	key := correlationKey(webhook, alert)
-	fingerprint := alertIdentity(alert)
-	storageKey := alertStorageKey(webhook, alert, key)
-	alertStatus := status(alert.Status)
-	now := time.Now().UTC()
-	alertFiredAt := firstTime(alert.StartsAt, now)
-	if tombstone, ok := s.deletedEpisodes[fingerprint]; ok {
-		if tombstone.FiredAt.Equal(alertFiredAt) {
-			// The operator purged this exact firing; its resolve notification
-			// ends the episode, so the tombstone has done its job.
-			if alertStatus == "resolved" {
-				s.clearEpisodeTombstoneLocked(fingerprint)
-			}
-			return AlertUpsertResult{CorrelationKey: key, Dropped: true}
-		}
-		if alertFiredAt.After(tombstone.FiredAt) {
+	if tombstone.FiredAt.Equal(alertFiredAt) {
+		// The operator purged this exact firing; its resolve notification
+		// ends the episode, so the tombstone has done its job.
+		if alertStatus == "resolved" {
 			s.clearEpisodeTombstoneLocked(fingerprint)
 		}
+		return true
 	}
-	alertID := ""
+	if alertFiredAt.After(tombstone.FiredAt) {
+		s.clearEpisodeTombstoneLocked(fingerprint)
+	}
+	return false
+}
+
+// resolveAlertRecordLocked finds the alert row and incident this webhook belongs
+// to. dropped is true when the episode was trashed and must not be resurrected.
+func (s *Store) resolveAlertRecordLocked(
+	key, storageKey, fingerprint string, alertFiredAt time.Time,
+) (alertID, existingIDForFingerprint, incidentID string, dropped bool) {
 	if storageKey != "" {
 		alertID = s.alertByGroup[storageKey]
 	}
-	existingIDForFingerprint := ""
 	if fingerprint != "" {
 		existingIDForFingerprint = s.alertByFinger[fingerprint]
 	}
 	if alertID == "" && existingIDForFingerprint != "" {
 		alertID = existingIDForFingerprint
 	}
-	incidentID := ""
 	if alertID != "" {
 		if existing := s.alerts[alertID]; existing != nil {
 			existingIncident := s.incidents[existing.IncidentID]
@@ -519,7 +527,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 				if sameEpisode {
 					// The operator trashed this episode; don't resurrect it as a
 					// fresh active row on every resend.
-					return AlertUpsertResult{CorrelationKey: key, Dropped: true}
+					return "", "", "", true
 				}
 				alertID = ""
 			case sameEpisode || s.shouldReuseIncidentForAlertLocked(key, existingIncident, alertFiredAt):
@@ -534,6 +542,85 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		if incidentID != "" && !s.shouldReuseIncidentForAlertLocked(key, s.incidents[incidentID], alertFiredAt) {
 			incidentID = ""
 		}
+	}
+	return alertID, existingIDForFingerprint, incidentID, false
+}
+
+// The webhook's Postgres writes run with s.mu RELEASED and writeMu still held.
+//
+// An earlier version released s.mu and had nothing in its place. It cut reader
+// latency and introduced a lost update: incidents and alerts are also written
+// by SoftDeleteIncident, ArchiveIncident, RestoreIncident, incidentResolve and
+// ApplyAnalysisForRun. A row read before one of those and committed after it
+// silently reverted deleted_at / user_approved_at in Postgres — unconditionally,
+// since persistIncidentLocked is an ON CONFLICT DO UPDATE of every column — with
+// no rollback and no trace in memory. loadIncidents reads those columns straight
+// back on restart, so the revert survived one.
+//
+// writeMu is what was missing. Every one of those writers now holds it for the
+// whole of its own mutate-then-persist, so none of them can run inside this
+// window; the DB write order still matches the memory mutation order. What
+// changes is only that readers, which take neither writeMu nor the write side
+// of mu, no longer queue behind two Postgres round trips.
+// TestEveryStoreWriterTakesWriteMu fails if a writer ever skips it.
+//
+// The two statements also overlap each other — separate tables, no foreign key,
+// each a self-contained upsert. BenchmarkContentionReadDuringWebhooks measured
+// the pair: a concurrent reader of the incident list went from 1.66ms to 41us.
+//
+// defer, not an explicit unlock: nothing in this process recovers a panic, so a
+// leaked write lock here is a permanent outage rather than one failed request.
+func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) AlertUpsertResult {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
+	result, incident, record := func() (AlertUpsertResult, *Incident, *AlertRecord) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.upsertAlertResultLocked(webhook, alert)
+	}()
+
+	if incident == nil && record == nil { // dropped: tombstoned or deduped
+		return result
+	}
+
+	// s.mu is released and writeMu is still held, so no other writer can read or
+	// mutate these two rows and no reader is waiting on the round trips. The two
+	// statements also overlap each other.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.persistAlertLocked(record)
+	}()
+	s.persistIncidentLocked(incident)
+	wg.Wait()
+	return result
+}
+
+func (s *Store) upsertAlertResultLocked(
+	webhook AlertmanagerWebhook, alert Alert,
+) (_ AlertUpsertResult, persistIncident *Incident, persistAlert *AlertRecord) {
+	if alert.Labels == nil {
+		alert.Labels = map[string]string{}
+	}
+	if alert.Annotations == nil {
+		alert.Annotations = map[string]string{}
+	}
+	key := correlationKey(webhook, alert)
+	fingerprint := alertIdentity(alert)
+	storageKey := alertStorageKey(webhook, alert, key)
+	alertStatus := status(alert.Status)
+	now := time.Now().UTC()
+	alertFiredAt := firstTime(alert.StartsAt, now)
+	if s.episodeTombstoneDropsLocked(fingerprint, alertStatus, alertFiredAt) {
+		return AlertUpsertResult{CorrelationKey: key, Dropped: true}, nil, nil
+	}
+	alertID, existingIDForFingerprint, incidentID, dropped := s.resolveAlertRecordLocked(
+		key, storageKey, fingerprint, alertFiredAt,
+	)
+	if dropped {
+		return AlertUpsertResult{CorrelationKey: key, Dropped: true}, nil, nil
 	}
 	newIncident := false
 	if incidentID == "" {
@@ -644,9 +731,10 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		!previousFiredAt.Equal(record.FiredAt) ||
 		previousOccurrenceCount != record.OccurrenceCount ||
 		!sameTimePtr(previousResolvedAt, record.ResolvedAt)
-	s.persistIncidentLocked(incident)
-	s.persistAlertLocked(record)
 	s.invalidateRecurrenceStatsLocked()
+	// No persist here: UpsertAlertResult writes these two rows after releasing
+	// s.mu, so readers do not queue behind the round trips. They are returned
+	// for exactly that.
 	return AlertUpsertResult{
 		Incident:         cloneIncident(incident),
 		Alert:            cloneAlert(record),
@@ -655,7 +743,7 @@ func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) Aler
 		NewAlert:         newAlert,
 		Changed:          changed,
 		IncidentResolved: previousIncidentStatus != "resolved" && incident.Status == "resolved",
-	}
+	}, incident, record
 }
 
 func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident, firedAt time.Time) bool {
@@ -851,6 +939,8 @@ func (s *Store) DeleteChatConversation(id string) bool {
 	if id == "" {
 		return false
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.chatConversations[id] == nil {
@@ -883,6 +973,8 @@ func (s *Store) SaveChatExchange(req ChatRequest, answer ChatResponse, userMessa
 		CreatedAt: assistantAt,
 	}
 
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.chatConversations == nil {
@@ -961,6 +1053,8 @@ func cloneChatConversation(in *ChatConversation) ChatConversation {
 }
 
 func (s *Store) ArchiveIncident(id string, archived bool) (*Incident, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -981,6 +1075,8 @@ func (s *Store) ArchiveIncident(id string, archived bool) (*Incident, bool) {
 }
 
 func (s *Store) SoftDeleteIncident(id string) (*Incident, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -1003,6 +1099,8 @@ func (s *Store) SoftDeleteIncident(id string) (*Incident, bool) {
 }
 
 func (s *Store) RestoreIncident(id string) (*Incident, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -1020,6 +1118,8 @@ func (s *Store) RestoreIncident(id string) (*Incident, bool) {
 }
 
 func (s *Store) HardDeleteIncident(id string) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -1065,41 +1165,41 @@ func (s *Store) HardDeleteIncident(id string) bool {
 		}
 	}
 	for key, record := range s.feedback {
-		if record == nil {
-			continue
-		}
-		if record.IncidentID == id || (record.TargetType == "incident" && record.TargetID == id) {
+		if record != nil && hangsOffIncident(id, alertIDs, record.IncidentID, record.AlertID, record.TargetType, record.TargetID) {
 			delete(s.feedback, key)
-			continue
-		}
-		if _, ok := alertIDs[record.AlertID]; ok {
-			delete(s.feedback, key)
-			continue
-		}
-		if record.TargetType == "alert" {
-			if _, ok := alertIDs[record.TargetID]; ok {
-				delete(s.feedback, key)
-			}
 		}
 	}
 	for key, record := range s.comments {
-		if record == nil {
-			continue
-		}
-		if record.IncidentID == id || (record.TargetType == "incident" && record.TargetID == id) {
+		if record != nil && hangsOffIncident(id, alertIDs, record.IncidentID, record.AlertID, record.TargetType, record.TargetID) {
 			delete(s.comments, key)
-			continue
-		}
-		if _, ok := alertIDs[record.AlertID]; ok {
-			delete(s.comments, key)
-			continue
-		}
-		if record.TargetType == "alert" {
-			if _, ok := alertIDs[record.TargetID]; ok {
-				delete(s.comments, key)
-			}
 		}
 	}
+	s.purgeAnalysisRunsForIncidentLocked(id, alertIDs)
+	s.invalidateRecurrenceStatsLocked()
+	return true
+}
+
+// hangsOffIncident reports whether a feedback/comment row belongs to the
+// incident being purged, either directly or through one of its alerts.
+func hangsOffIncident(
+	id string, alertIDs map[string]struct{}, rowIncidentID, rowAlertID, targetType, targetID string,
+) bool {
+	if rowIncidentID == id || (targetType == "incident" && targetID == id) {
+		return true
+	}
+	if _, ok := alertIDs[rowAlertID]; ok {
+		return true
+	}
+	if targetType == "alert" {
+		_, ok := alertIDs[targetID]
+		return ok
+	}
+	return false
+}
+
+// purgeAnalysisRunsForIncidentLocked drops the incident's runs and every
+// evaluation review that pointed at them.
+func (s *Store) purgeAnalysisRunsForIncidentLocked(id string, alertIDs map[string]struct{}) {
 	for key, run := range s.analysisRuns {
 		if run == nil {
 			continue
@@ -1108,17 +1208,16 @@ func (s *Store) HardDeleteIncident(id string) bool {
 		if !remove {
 			_, remove = alertIDs[run.AlertID]
 		}
-		if remove {
-			for reviewKey, review := range s.evaluationReviews {
-				if review != nil && review.RunID == run.RunID {
-					delete(s.evaluationReviews, reviewKey)
-				}
-			}
-			delete(s.analysisRuns, key)
+		if !remove {
+			continue
 		}
+		for reviewKey, review := range s.evaluationReviews {
+			if review != nil && review.RunID == run.RunID {
+				delete(s.evaluationReviews, reviewKey)
+			}
+		}
+		delete(s.analysisRuns, key)
 	}
-	s.invalidateRecurrenceStatsLocked()
-	return true
 }
 
 // deletedEpisodeRetention bounds how long a purged episode's tombstone keeps
@@ -1149,6 +1248,8 @@ func (s *Store) PurgeExpiredTrash(retention time.Duration, now time.Time) int {
 			purged++
 		}
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	for fingerprint, episode := range s.deletedEpisodes {
 		if episode.DeletedAt.Before(now.Add(-deletedEpisodeRetention)) {
@@ -1303,6 +1404,8 @@ func (s *Store) RecurrenceStats(days int, now time.Time) RecurrenceStats {
 	}
 
 	cacheKey := recurrenceStatsCacheKey{days: days, asOf: now.Truncate(time.Minute)}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if entry, ok := s.recurrenceStatsCache[cacheKey]; ok && now.Before(entry.expiresAt) {
@@ -1818,6 +1921,8 @@ func (s *Store) CreateOperatorRun(incidentID, alertID, baseRunID, family, summar
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.incidents[incidentID] == nil {
@@ -1859,6 +1964,8 @@ func (s *Store) CreateAnalysisRunIfAllowed(
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if existing := s.analyzingAnalysisRunLocked(targetType, targetID, alertID); existing != nil {
@@ -1950,16 +2057,6 @@ func (s *Store) analyzingAnalysisRunLocked(targetType string, targetID string, a
 	return selected
 }
 
-func (s *Store) ExistingAutoAnalysisRun(alertID string) (AnalysisRun, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	selected := s.latestAutoAnalysisRunLocked(alertID)
-	if selected == nil {
-		return AnalysisRun{}, false
-	}
-	return cloneAnalysisRun(selected), true
-}
-
 func (s *Store) latestAutoAnalysisRunLocked(alertID string) *AnalysisRun {
 	var selected *AnalysisRun
 	for _, run := range s.analysisRuns {
@@ -2031,6 +2128,8 @@ func (s *Store) PinnedOperatorRun(incidentID string) (AnalysisRun, bool) {
 // SetLatestOperatorRunPinned toggles the newest operator correction for an
 // incident. A correction remains a historical run after unpinning.
 func (s *Store) SetLatestOperatorRunPinned(incidentID string, pinned bool) (AnalysisRun, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.latestOperatorRunLocked(incidentID, false)
@@ -2066,6 +2165,8 @@ func (s *Store) latestOperatorRunLocked(incidentID string, pinnedOnly bool) *Ana
 }
 
 func (s *Store) AppendAnalysisProgress(runID string, entry map[string]any) (AnalysisRun, map[string]any, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
@@ -2106,6 +2207,8 @@ func (s *Store) CompleteAnalysisRunWithSlackDelivery(runID string, response Agen
 }
 
 func (s *Store) completeAnalysisRun(runID string, response AgentAnalysisResponse, slackIncidentID string) (AnalysisRun, SlackAnalysisDelivery, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
@@ -2204,6 +2307,8 @@ func (s *Store) scheduleSimilarIncidentsRefresh(run AnalysisRun) {
 // slow/late refresh from ever overwriting a better, newer snapshot (or
 // writing one onto a run that no longer represents a good result).
 func (s *Store) persistPostAnalysisSimilarIncidents(runID string, completedAt time.Time, items []SimilarIncident) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
@@ -2261,6 +2366,8 @@ func postAnalysisSimilarIncidentsFromRun(run *AnalysisRun) ([]SimilarIncident, b
 }
 
 func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (AnalysisRun, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
@@ -2317,6 +2424,8 @@ func (s *Store) FailAnalysisRun(runID string, response AgentAnalysisResponse) (A
 // stale is_analyzing flags on alerts/incidents are also cleared when no
 // analyzing run remains for them. It returns the number of runs reaped.
 func (s *Store) ReapStaleAnalyzingRuns(staleAfter time.Duration, manualStaleAfter time.Duration) int {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().UTC()
@@ -2529,6 +2638,8 @@ func (s *Store) OccurrenceSummaryForTarget(incidentID string, alertID string) ([
 // BumpIncidentAnalysisSeq increments the incident's Slack analysis counter and
 // returns the new value (1 = Initial Analysis, 2 = 2nd Analysis, ...).
 func (s *Store) BumpIncidentAnalysisSeq(id string) (int, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -2544,6 +2655,8 @@ func (s *Store) BumpIncidentAnalysisSeq(id string) (int, bool) {
 // re-analyses reply into the same thread (survives restarts, unlike an
 // in-memory map).
 func (s *Store) SetIncidentSlackThread(id string, ts string) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[id]
@@ -2734,6 +2847,14 @@ func (s *Store) AddFeedback(
 	if err := validateStoredText("comment", comment, maxStoredCommentBodyBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
+	if !strings.EqualFold(rawVote, "none") && vote == "" {
+		return FeedbackSummary{}, false, errors.New("vote must be up or down")
+	}
+	// One acquisition for both branches: they are mutually exclusive today, so
+	// two would not deadlock, but writeMu is a plain Mutex and nothing would
+	// stop a later edit from making them reachable in sequence.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if strings.EqualFold(rawVote, "none") {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -2742,9 +2863,6 @@ func (s *Store) AddFeedback(
 		}
 		s.deleteFeedbackForActorLocked(targetType, targetID, actor)
 		return s.feedbackSummaryForActorLocked(targetType, targetID, actor), true, nil
-	}
-	if vote == "" {
-		return FeedbackSummary{}, false, errors.New("vote must be up or down")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -2798,6 +2916,8 @@ func (s *Store) AddComment(
 	if err := validateStoredText("author", author, maxFeedbackAuthorBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incidentID, alertID, ok := s.targetIDsLocked(targetType, targetID)
@@ -2836,6 +2956,8 @@ func (s *Store) UpdateComment(
 	if err := validateStoredText("author", author, maxFeedbackAuthorBytes); err != nil {
 		return FeedbackSummary{}, false, err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, _, ok := s.targetIDsLocked(targetType, targetID); !ok {
@@ -2909,6 +3031,8 @@ func (s *Store) DeleteComment(
 	targetID string,
 	commentID string,
 ) (FeedbackSummary, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, _, ok := s.targetIDsLocked(targetType, targetID); !ok {

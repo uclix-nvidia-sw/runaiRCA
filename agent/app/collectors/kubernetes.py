@@ -5,7 +5,8 @@ import json
 import logging
 import re
 import shlex
-from dataclasses import replace
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import quote
@@ -1148,11 +1149,6 @@ def _mcp_pod_log_observed_entity(
     return _pod_log_entity(observed_namespace, observed_name)
 
 
-def _mcp_pod_log_source_verified(data: object, namespace: str, pod: str) -> bool:
-    """Compatibility predicate for callers that only need source verification."""
-    return _mcp_pod_log_observed_entity(data, namespace, pod) is not None
-
-
 def _pod_log_entity(namespace: str, pod: str) -> dict[str, str]:
     """The concrete namespaced Pod provenance required for log causality."""
     return {"kind": "pod", "name": pod, "namespace": namespace}
@@ -1330,13 +1326,329 @@ def _kubernetes_exact_absence(item: dict[str, object]) -> bool:
     }
 
 
+def _collection_status(
+    settings: Settings,
+    target: AnalysisTarget,
+    *,
+    successful: list[dict[str, object]],
+    required_completed: list[dict[str, object]],
+    required_failures: list[dict[str, object]],
+    missing: list[str],
+) -> tuple[str, str, str]:
+    """Collector status/summary/confidence for what the target queries returned."""
+    if required_completed and not required_failures and not missing:
+        status = "ok"
+        confidence = "high"
+        summary = ko_en(
+            settings,
+            "알림 대상에 대한 Kubernetes 조회를 완료했습니다.",
+            "Kubernetes API queries completed for the resolved alert target.",
+        )
+    elif successful or required_completed:
+        status = "partial"
+        confidence = "medium"
+        if required_failures:
+            failed_names = ", ".join(
+                str(item.get("name") or "query") for item in required_failures
+            )
+            summary = ko_en(
+                settings,
+                "Kubernetes 대상 쿼리 일부가 실패했습니다. 성공한 쿼리 증거는 "
+                f"유지했습니다. 실패: {failed_names}.",
+                "Kubernetes target queries were incomplete; usable per-query "
+                f"evidence was retained. Failed: {failed_names}.",
+            )
+        else:
+            summary = ko_en(
+                settings,
+                "Kubernetes API에는 접속했지만 알림 대상 정보가 불완전합니다. "
+                "네임스페이스/파드/워크로드/노드 레이블이 없을 수 있습니다.",
+                "Kubernetes API is reachable, but the alert target is incomplete. "
+                "Namespace, pod, workload, or node labels may be missing.",
+            )
+    else:
+        status = "unavailable"
+        confidence = "low"
+        summary = f"{NO_EVIDENCE} " + ko_en(
+            settings,
+            "네임스페이스가 범위 설정에서 제외되어 Kubernetes 조회를 건너뛰었습니다."
+            if target.namespace and not target.node and not _namespace_allowed(settings, target.namespace)
+            else "Kubernetes API 조회가 실패했습니다.",
+            "Kubernetes queries were skipped because the namespace is excluded by scope configuration."
+            if target.namespace and not target.node and not _namespace_allowed(settings, target.namespace)
+            else "Kubernetes API direct queries failed.",
+        )
+    return status, summary, confidence
+
+
+async def _pod_inspection_artifacts(
+    name: str,
+    settings: Settings,
+    target: AnalysisTarget,
+    target_pod_describe: dict[str, object],
+    *,
+    event_time_range: dict[str, str] | None,
+) -> list:
+    """Pod YAML/describe, the workload topology it names, and its PVC claims."""
+    if not target_pod_describe:
+        return []
+    out: list = []
+    describe_error = target_pod_describe.get("error")
+    describe_events_error = target_pod_describe.get("events_error")
+    describe_events = target_pod_describe.get("events")
+    event_count = len(describe_events) if isinstance(describe_events, list) else 0
+    snapshot_observation: dict[str, object] = {
+        "kind": "kubernetes_pod_snapshot",
+        "predicate": "kubernetes_pod_snapshot",
+        # YAML/describe is a live snapshot. Do not let the pipeline's
+        # broad incident window stand in for an occurrence time.
+        "polarity": "unknown",
+        "coverage": "partial",
+        "observation_window": {},
+    }
+    described_entity = _pod_log_observed_entity(
+        {"observed_entity": target_pod_describe.get("observed_entity")}
+    )
+    if described_entity:
+        snapshot_observation["observed_entity"] = described_entity
+    out.append(
+        artifact(
+            agent=name,
+            source="kubernetes",
+            type="pod_inspection",
+            # A failed events read must not discard the successfully
+            # collected Pod YAML from the usable evidence set.
+            status=(
+                "unavailable"
+                if describe_error
+                else "partial"
+                if describe_events_error
+                else "ok"
+            ),
+            confidence=(
+                "high" if not describe_error and not describe_events_error else "low"
+            ),
+            title=ko_en(settings, "Pod YAML + 상세 점검", "Pod YAML + describe"),
+            query=pod_inspection_repr(target.namespace, target.pod),
+            summary=(
+                str(describe_error)
+                if describe_error
+                else (
+                    ko_en(
+                        settings,
+                        "Pod 전체 YAML을 수집했지만 incident 시간창 이벤트 조회를 "
+                        f"완료하지 못했습니다: {describe_events_error}",
+                        "Collected full Pod YAML, but the incident-window events read was "
+                        f"unavailable: {describe_events_error}",
+                    )
+                    if describe_events_error
+                    else ko_en(
+                    settings,
+                    (
+                        "Pod 전체 YAML과 incident 시간창 이벤트 "
+                        f"{event_count}건을 확인했습니다."
+                    ),
+                    f"Collected full Pod YAML and {event_count} incident-window event(s).",
+                    )
+                )
+            ),
+            # YAML is a live inspection; its filtered events are
+            # represented by the dedicated historical event artifact.
+            result={
+                **target_pod_describe,
+                "observation": snapshot_observation,
+            },
+        )
+    )
+    # Stable-identity topology: the PVC claims this pod mounts and the
+    # Services whose selector matches its labels. Ingest projects these
+    # under the STEM workload identity so the graph answers "workloads
+    # with this name expose these Services / use this PVC" — the live
+    # binding itself is never evidence (polarity stays unknown).
+    services_items: list[dict] = []
+    try:
+        services_response = await k8s_read(
+            settings, "services", namespace=target.namespace
+        )
+        data = services_response.get("data")
+        if isinstance(data, dict) and isinstance(data.get("items"), list):
+            services_items = [item for item in data["items"] if isinstance(item, dict)]
+    except Exception:  # noqa: BLE001 - topology is optional context
+        _log.warning("service listing for workload topology failed", exc_info=True)
+    topology = _workload_topology(target_pod_describe.get("object"), services_items)
+    if topology["services"] or topology["pvcs"]:
+        out.append(
+            artifact(
+                agent=name,
+                source="kubernetes",
+                type="workload_topology",
+                status="ok",
+                confidence="low",
+                title=ko_en(settings, "워크로드 토폴로지", "Workload topology"),
+                query=f"kubectl get svc,pvc -n {target.namespace}",
+                summary=ko_en(
+                    settings,
+                    f"대상 워크로드에 연결된 Service {len(topology['services'])}개, "
+                    f"PVC {len(topology['pvcs'])}개를 확인했습니다.",
+                    f"Observed {len(topology['services'])} Service(s) and "
+                    f"{len(topology['pvcs'])} PVC(s) attached to the target workload.",
+                ),
+                result={
+                    "observation": {
+                        "kind": "workload_topology",
+                        "predicate": "workload_topology",
+                        "polarity": "unknown",
+                        "coverage": "partial",
+                        "observation_window": {},
+                    },
+                    **topology,
+                },
+            )
+        )
+    # The claims this Pod mounts are named in its own spec, so their
+    # size/class/phase is target-verified configuration — the thing an
+    # operator has to change on a storage failure.
+    out.extend(
+        await _storage_claim_artifacts(
+            name,
+            settings,
+            target,
+            topology["pvcs"],
+            time_range=event_time_range,
+        )
+    )
+    return out
+
+
+def _exec_probe_artifacts(
+    name: str, settings: Settings, target: AnalysisTarget, exec_probes: list[dict[str, object]]
+) -> list:
+    """The read-only in-container probes, as one never-past-window artifact."""
+    if not exec_probes:
+        return []
+    exec_successes = [probe for probe in exec_probes if not probe.get("error")]
+    # A probe that couldn't START (binary absent, exec subresource down) is
+    # not a finding — exclude it so "command not found" never becomes a
+    # medium card (owner rule: a probe that can't run is not evidence).
+    real_errors = [
+        str(probe.get("error"))
+        for probe in exec_probes
+        if probe.get("error")
+        and not probe.get("transport_error")
+        and not _exec_probe_unusable(str(probe.get("error")))
+    ]
+    # Nothing usable ran: no successful probe and no real error to report.
+    exec_unavailable = not exec_successes and not real_errors
+    exec_observation: dict[str, object] = {
+        "kind": "kubernetes_live_exec",
+        "predicate": "kubernetes_live_exec",
+        # Exec output has exact Pod provenance but is sampled now; it
+        # cannot establish a condition during a past incident.
+        "polarity": "unavailable" if exec_unavailable else "unknown",
+        "coverage": "unknown" if exec_unavailable else "partial",
+        "observation_window": {},
+    }
+    exec_entity = _exec_probes_observed_entity(exec_probes)
+    if exec_entity:
+        exec_observation["observed_entity"] = exec_entity
+    if exec_unavailable:
+        # Probes couldn't run (e.g. the binaries aren't in a minimal image);
+        # mark no-evidence so the trail hides it instead of showing errors.
+        exec_summary = f"{NO_EVIDENCE} " + ko_en(
+            settings,
+            "컨테이너에서 진단 명령을 실행할 수 없었습니다 (해당 바이너리 없음 또는 exec 불가).",
+            "Diagnostic commands could not run in the container (binaries absent or exec unavailable).",
+        )
+    elif real_errors:
+        exec_summary = "; ".join(real_errors)
+    else:
+        exec_summary = ko_en(
+            settings,
+            f"읽기 전용 진단 명령 {len(exec_successes)}개를 실행했습니다.",
+            f"Executed {len(exec_successes)} read-only diagnostic command(s).",
+        )
+    return [
+        artifact(
+            agent=name,
+            source="kubernetes",
+            type="pod_exec",
+            status=(
+                "unavailable" if exec_unavailable else "partial" if real_errors else "ok"
+            ),
+            confidence=("low" if exec_unavailable else "medium" if real_errors else "high"),
+            title=ko_en(
+                settings, "컨테이너 읽기 전용 exec", "Read-only container exec"
+            ),
+            query="; ".join(
+                f"kubectl exec {target.pod} -n {target.namespace} -- {probe['command']}"
+                for probe in exec_probes
+            ),
+            summary=exec_summary,
+            result={
+                "probes": exec_probes,
+                "observation": exec_observation,
+            },
+        )
+    ]
+
+
+@dataclass
+class _K8sReads:
+    """Everything one Kubernetes pass fetched, before any interpretation.
+
+    The collector reads through MCP or the direct API, resolves a live Pod for a
+    stale alert, and describes it; every later phase reads only this.
+    """
+
+    target: AnalysisTarget
+    time_range: dict[str, str] | None
+    causal_time_range: dict[str, str] | None
+    event_time_range: dict[str, str] | None
+    since_time: str
+    control_plane_in_scope: bool
+    used_mcp: bool
+    responses: list[dict[str, object]]
+    logs: list[dict[str, object]]
+    exec_probes: list[dict[str, object]]
+    pod_summary_data: dict[str, object] | None
+    workload_resolution: dict[str, object]
+    resolved_pod_anchor: AnalysisTarget | None
+    target_pod_describe: dict[str, object]
+    resolved_pod_describe: dict[str, object]
+    missing: list[str]
+    warnings: list[str]
+
+
+@dataclass
+class _K8sSignals:
+    """What those reads mean: the typed observations the report is built from."""
+
+    successful: object
+    required_failures: object
+    required_completed: object
+    pod_statuses: object
+    warning_events: object
+    causal_warning_events: object
+    causal_target_warning_events: object
+    node_conditions: object
+    runai_control_plane_pods: object
+    runai_control_plane_events: object
+    runai_crds: object
+    crd_findings: object
+    container_diagnostics: object
+    scheduling_artifact: object
+    gpu_node_resource_observations: object
+
+
 class KubernetesCollector:
     name = "kubernetes"
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:  # noqa: ANN001
+    async def _read_cluster(self, target: AnalysisTarget, plan=None) -> _K8sReads | CollectorResult:
+        """Fetch through MCP or the direct API. Returns a finished result only
+        when the cluster cannot be read at all (no service account token)."""
         target = _scope_target(target, plan)
         time_range = incident_time_range(target)
         causal_time_range = causal_evidence_time_range(target)
@@ -1535,6 +1847,40 @@ class KubernetesCollector:
                     previous_containers=_restarted_container_names(pod_summary_data),
                     since_time=since_time,
                 )
+        return _K8sReads(
+            target=target,
+            time_range=time_range,
+            causal_time_range=causal_time_range,
+            event_time_range=event_time_range,
+            since_time=since_time,
+            control_plane_in_scope=control_plane_in_scope,
+            used_mcp=used_mcp,
+            responses=responses,
+            logs=logs,
+            exec_probes=exec_probes,
+            pod_summary_data=pod_summary_data,
+            workload_resolution=workload_resolution,
+            resolved_pod_anchor=resolved_pod_anchor,
+            target_pod_describe=target_pod_describe,
+            resolved_pod_describe=resolved_pod_describe,
+            missing=missing,
+            warnings=warnings,
+        )
+
+    async def _interpret_reads(self, reads: _K8sReads, plan=None) -> _K8sSignals:
+        """Derive the typed signals: pod states, causal warning events, node
+        conditions, Run:ai CRD health."""
+        target = reads.target
+        responses = reads.responses
+        missing = reads.missing
+        warnings = reads.warnings
+        causal_time_range = reads.causal_time_range
+        pod_summary_data = reads.pod_summary_data
+        workload_resolution = reads.workload_resolution
+        resolved_pod_anchor = reads.resolved_pod_anchor
+        target_pod_describe = reads.target_pod_describe
+        resolved_pod_describe = reads.resolved_pod_describe
+        control_plane_in_scope = reads.control_plane_in_scope
         container_diagnostics = _container_diagnostics(pod_summary_data)
         scheduling_describe = (
             target_pod_describe if target.pod else resolved_pod_describe
@@ -1642,49 +1988,41 @@ class KubernetesCollector:
                 + ", ".join(map(str, runai_crds["truncated"]))
                 + "."
             )
+        return _K8sSignals(
+            successful=successful,
+            required_failures=required_failures,
+            required_completed=required_completed,
+            pod_statuses=pod_statuses,
+            warning_events=warning_events,
+            causal_warning_events=causal_warning_events,
+            causal_target_warning_events=causal_target_warning_events,
+            node_conditions=node_conditions,
+            runai_control_plane_pods=runai_control_plane_pods,
+            runai_control_plane_events=runai_control_plane_events,
+            runai_crds=runai_crds,
+            crd_findings=crd_findings,
+            container_diagnostics=container_diagnostics,
+            scheduling_artifact=scheduling_artifact,
+            gpu_node_resource_observations=gpu_node_resource_observations,
+        )
 
-        if required_completed and not required_failures and not missing:
-            status = "ok"
-            confidence = "high"
-            summary = ko_en(
-                self._settings,
-                "알림 대상에 대한 Kubernetes 조회를 완료했습니다.",
-                "Kubernetes API queries completed for the resolved alert target.",
-            )
-        elif successful or required_completed:
-            status = "partial"
-            confidence = "medium"
-            if required_failures:
-                failed_names = ", ".join(
-                    str(item.get("name") or "query") for item in required_failures
-                )
-                summary = ko_en(
-                    self._settings,
-                    "Kubernetes 대상 쿼리 일부가 실패했습니다. 성공한 쿼리 증거는 "
-                    f"유지했습니다. 실패: {failed_names}.",
-                    "Kubernetes target queries were incomplete; usable per-query "
-                    f"evidence was retained. Failed: {failed_names}.",
-                )
-            else:
-                summary = ko_en(
-                    self._settings,
-                    "Kubernetes API에는 접속했지만 알림 대상 정보가 불완전합니다. "
-                    "네임스페이스/파드/워크로드/노드 레이블이 없을 수 있습니다.",
-                    "Kubernetes API is reachable, but the alert target is incomplete. "
-                    "Namespace, pod, workload, or node labels may be missing.",
-                )
-        else:
-            status = "unavailable"
-            confidence = "low"
-            summary = f"{NO_EVIDENCE} " + ko_en(
-                self._settings,
-                "네임스페이스가 범위 설정에서 제외되어 Kubernetes 조회를 건너뛰었습니다."
-                if target.namespace and not target.node and not _namespace_allowed(self._settings, target.namespace)
-                else "Kubernetes API 조회가 실패했습니다.",
-                "Kubernetes queries were skipped because the namespace is excluded by scope configuration."
-                if target.namespace and not target.node and not _namespace_allowed(self._settings, target.namespace)
-                else "Kubernetes API direct queries failed.",
-            )
+    def _verdict(self, reads: _K8sReads, signals: _K8sSignals) -> tuple[str, str, str, bool]:
+        """Collector status/summary/confidence, plus the notes that outrank it."""
+        target = reads.target
+        responses = reads.responses
+        missing = reads.missing
+        successful = signals.successful
+        required_completed = signals.required_completed
+        required_failures = signals.required_failures
+        crd_findings = signals.crd_findings
+        status, summary, confidence = _collection_status(
+            self._settings,
+            target,
+            successful=successful,
+            required_completed=required_completed,
+            required_failures=required_failures,
+            missing=missing,
+        )
 
         # The alert names a pod that no longer exists (and left no live sibling
         # or events): say so — it IS the finding. Without this the report blames
@@ -1723,18 +2061,30 @@ class KubernetesCollector:
                 "No pods or events were observed for the queried scope.",
             )
             confidence = "low"
+        return status, summary, confidence, target_pod_missing
 
-        insight = await _senior_insight(
-            self._settings,
-            summary=summary,
-            container_diagnostics=container_diagnostics,
-            warning_events=causal_target_warning_events,
-            logs=_verified_logs_in_time_range(logs, causal_time_range),
-            # A denied/unavailable exec capability is collection metadata, not
-            # a workload observation for the insight model to explain.
-            exec_probes=[probe for probe in exec_probes if not probe.get("error")],
-        )
-
+    def _collection_details(
+        self, reads: _K8sReads, signals: _K8sSignals, *, target_pod_missing: bool, insight: str
+    ) -> dict[str, object]:
+        target = reads.target
+        responses = reads.responses
+        logs = reads.logs
+        exec_probes = reads.exec_probes
+        time_range = reads.time_range
+        causal_time_range = reads.causal_time_range
+        used_mcp = reads.used_mcp
+        workload_resolution = reads.workload_resolution
+        target_pod_describe = reads.target_pod_describe
+        resolved_pod_describe = reads.resolved_pod_describe
+        pod_statuses = signals.pod_statuses
+        warning_events = signals.warning_events
+        node_conditions = signals.node_conditions
+        container_diagnostics = signals.container_diagnostics
+        gpu_node_resource_observations = signals.gpu_node_resource_observations
+        runai_control_plane_pods = signals.runai_control_plane_pods
+        runai_control_plane_events = signals.runai_control_plane_events
+        runai_crds = signals.runai_crds
+        crd_findings = signals.crd_findings
         details = {
             "kubernetes_api_url": self._settings.kubernetes_api_url,
             "kubernetes_mcp_url": self._settings.kubernetes_mcp_url,
@@ -1770,9 +2120,34 @@ class KubernetesCollector:
             "insight": insight,
             "queries": responses,
         }
-        if insight:
-            summary = f"{summary} {insight}"
+        return details
 
+    async def _collection_artifacts(
+        self,
+        reads: _K8sReads,
+        signals: _K8sSignals,
+        *,
+        details: dict[str, object],
+        status: str,
+        summary: str,
+        confidence: str,
+    ) -> list:
+        target = reads.target
+        responses = reads.responses
+        logs = reads.logs
+        exec_probes = reads.exec_probes
+        time_range = reads.time_range
+        causal_time_range = reads.causal_time_range
+        event_time_range = reads.event_time_range
+        used_mcp = reads.used_mcp
+        pod_summary_data = reads.pod_summary_data
+        resolved_pod_anchor = reads.resolved_pod_anchor
+        target_pod_describe = reads.target_pod_describe
+        causal_target_warning_events = signals.causal_target_warning_events
+        container_diagnostics = signals.container_diagnostics
+        crd_findings = signals.crd_findings
+        gpu_node_resource_observations = signals.gpu_node_resource_observations
+        scheduling_artifact = signals.scheduling_artifact
         artifacts = [
             artifact(
                 agent=self.name,
@@ -1905,196 +2280,18 @@ class KubernetesCollector:
             _pod_log_artifact(self.name, log, time_range=causal_time_range)
             for log in logs
         )
-        if target_pod_describe:
-            describe_error = target_pod_describe.get("error")
-            describe_events_error = target_pod_describe.get("events_error")
-            describe_events = target_pod_describe.get("events")
-            event_count = len(describe_events) if isinstance(describe_events, list) else 0
-            snapshot_observation: dict[str, object] = {
-                "kind": "kubernetes_pod_snapshot",
-                "predicate": "kubernetes_pod_snapshot",
-                # YAML/describe is a live snapshot. Do not let the pipeline's
-                # broad incident window stand in for an occurrence time.
-                "polarity": "unknown",
-                "coverage": "partial",
-                "observation_window": {},
-            }
-            described_entity = _pod_log_observed_entity(
-                {"observed_entity": target_pod_describe.get("observed_entity")}
+        artifacts.extend(
+            await _pod_inspection_artifacts(
+                self.name,
+                self._settings,
+                target,
+                target_pod_describe,
+                event_time_range=event_time_range,
             )
-            if described_entity:
-                snapshot_observation["observed_entity"] = described_entity
-            artifacts.append(
-                artifact(
-                    agent=self.name,
-                    source="kubernetes",
-                    type="pod_inspection",
-                    # A failed events read must not discard the successfully
-                    # collected Pod YAML from the usable evidence set.
-                    status=(
-                        "unavailable"
-                        if describe_error
-                        else "partial"
-                        if describe_events_error
-                        else "ok"
-                    ),
-                    confidence=(
-                        "high" if not describe_error and not describe_events_error else "low"
-                    ),
-                    title=ko_en(self._settings, "Pod YAML + 상세 점검", "Pod YAML + describe"),
-                    query=pod_inspection_repr(target.namespace, target.pod),
-                    summary=(
-                        str(describe_error)
-                        if describe_error
-                        else (
-                            ko_en(
-                                self._settings,
-                                "Pod 전체 YAML을 수집했지만 incident 시간창 이벤트 조회를 "
-                                f"완료하지 못했습니다: {describe_events_error}",
-                                "Collected full Pod YAML, but the incident-window events read was "
-                                f"unavailable: {describe_events_error}",
-                            )
-                            if describe_events_error
-                            else ko_en(
-                            self._settings,
-                            (
-                                "Pod 전체 YAML과 incident 시간창 이벤트 "
-                                f"{event_count}건을 확인했습니다."
-                            ),
-                            f"Collected full Pod YAML and {event_count} incident-window event(s).",
-                            )
-                        )
-                    ),
-                    # YAML is a live inspection; its filtered events are
-                    # represented by the dedicated historical event artifact.
-                    result={
-                        **target_pod_describe,
-                        "observation": snapshot_observation,
-                    },
-                )
-            )
-            # Stable-identity topology: the PVC claims this pod mounts and the
-            # Services whose selector matches its labels. Ingest projects these
-            # under the STEM workload identity so the graph answers "workloads
-            # with this name expose these Services / use this PVC" — the live
-            # binding itself is never evidence (polarity stays unknown).
-            services_items: list[dict] = []
-            try:
-                services_response = await k8s_read(
-                    self._settings, "services", namespace=target.namespace
-                )
-                data = services_response.get("data")
-                if isinstance(data, dict) and isinstance(data.get("items"), list):
-                    services_items = [item for item in data["items"] if isinstance(item, dict)]
-            except Exception:  # noqa: BLE001 - topology is optional context
-                _log.warning("service listing for workload topology failed", exc_info=True)
-            topology = _workload_topology(target_pod_describe.get("object"), services_items)
-            if topology["services"] or topology["pvcs"]:
-                artifacts.append(
-                    artifact(
-                        agent=self.name,
-                        source="kubernetes",
-                        type="workload_topology",
-                        status="ok",
-                        confidence="low",
-                        title=ko_en(self._settings, "워크로드 토폴로지", "Workload topology"),
-                        query=f"kubectl get svc,pvc -n {target.namespace}",
-                        summary=ko_en(
-                            self._settings,
-                            f"대상 워크로드에 연결된 Service {len(topology['services'])}개, "
-                            f"PVC {len(topology['pvcs'])}개를 확인했습니다.",
-                            f"Observed {len(topology['services'])} Service(s) and "
-                            f"{len(topology['pvcs'])} PVC(s) attached to the target workload.",
-                        ),
-                        result={
-                            "observation": {
-                                "kind": "workload_topology",
-                                "predicate": "workload_topology",
-                                "polarity": "unknown",
-                                "coverage": "partial",
-                                "observation_window": {},
-                            },
-                            **topology,
-                        },
-                    )
-                )
-            # The claims this Pod mounts are named in its own spec, so their
-            # size/class/phase is target-verified configuration — the thing an
-            # operator has to change on a storage failure.
-            artifacts.extend(
-                await _storage_claim_artifacts(
-                    self.name,
-                    self._settings,
-                    target,
-                    topology["pvcs"],
-                    time_range=event_time_range,
-                )
-            )
-        if exec_probes:
-            exec_successes = [probe for probe in exec_probes if not probe.get("error")]
-            # A probe that couldn't START (binary absent, exec subresource down) is
-            # not a finding — exclude it so "command not found" never becomes a
-            # medium card (owner rule: a probe that can't run is not evidence).
-            real_errors = [
-                str(probe.get("error"))
-                for probe in exec_probes
-                if probe.get("error")
-                and not probe.get("transport_error")
-                and not _exec_probe_unusable(str(probe.get("error")))
-            ]
-            # Nothing usable ran: no successful probe and no real error to report.
-            exec_unavailable = not exec_successes and not real_errors
-            exec_observation: dict[str, object] = {
-                "kind": "kubernetes_live_exec",
-                "predicate": "kubernetes_live_exec",
-                # Exec output has exact Pod provenance but is sampled now; it
-                # cannot establish a condition during a past incident.
-                "polarity": "unavailable" if exec_unavailable else "unknown",
-                "coverage": "unknown" if exec_unavailable else "partial",
-                "observation_window": {},
-            }
-            exec_entity = _exec_probes_observed_entity(exec_probes)
-            if exec_entity:
-                exec_observation["observed_entity"] = exec_entity
-            if exec_unavailable:
-                # Probes couldn't run (e.g. the binaries aren't in a minimal image);
-                # mark no-evidence so the trail hides it instead of showing errors.
-                exec_summary = f"{NO_EVIDENCE} " + ko_en(
-                    self._settings,
-                    "컨테이너에서 진단 명령을 실행할 수 없었습니다 (해당 바이너리 없음 또는 exec 불가).",
-                    "Diagnostic commands could not run in the container (binaries absent or exec unavailable).",
-                )
-            elif real_errors:
-                exec_summary = "; ".join(real_errors)
-            else:
-                exec_summary = ko_en(
-                    self._settings,
-                    f"읽기 전용 진단 명령 {len(exec_successes)}개를 실행했습니다.",
-                    f"Executed {len(exec_successes)} read-only diagnostic command(s).",
-                )
-            artifacts.append(
-                artifact(
-                    agent=self.name,
-                    source="kubernetes",
-                    type="pod_exec",
-                    status=(
-                        "unavailable" if exec_unavailable else "partial" if real_errors else "ok"
-                    ),
-                    confidence=("low" if exec_unavailable else "medium" if real_errors else "high"),
-                    title=ko_en(
-                        self._settings, "컨테이너 읽기 전용 exec", "Read-only container exec"
-                    ),
-                    query="; ".join(
-                        f"kubectl exec {target.pod} -n {target.namespace} -- {probe['command']}"
-                        for probe in exec_probes
-                    ),
-                    summary=exec_summary,
-                    result={
-                        "probes": exec_probes,
-                        "observation": exec_observation,
-                    },
-                )
-            )
+        )
+        artifacts.extend(
+            _exec_probe_artifacts(self.name, self._settings, target, exec_probes)
+        )
 
         if used_mcp:
             # The base gather is transport-exclusive: when MCP succeeded, EVERY
@@ -2105,18 +2302,42 @@ class KubernetesCollector:
             for item in artifacts:
                 if item.query and item.query.startswith("kubectl"):
                     item.query = f"MCP · {item.query}"
+        return artifacts
 
+    async def collect(self, target: AnalysisTarget, plan=None) -> CollectorResult:
+        reads = await self._read_cluster(target, plan)
+        if isinstance(reads, CollectorResult):
+            return reads
+        signals = await self._interpret_reads(reads, plan)
+        status, summary, confidence, target_pod_missing = self._verdict(reads, signals)
+        insight = await _senior_insight(
+            self._settings,
+            summary=summary,
+            container_diagnostics=signals.container_diagnostics,
+            warning_events=signals.causal_target_warning_events,
+            logs=_verified_logs_in_time_range(reads.logs, reads.causal_time_range),
+            # A denied/unavailable exec capability is collection metadata, not
+            # a workload observation for the insight model to explain.
+            exec_probes=[probe for probe in reads.exec_probes if not probe.get("error")],
+        )
+        details = self._collection_details(
+            reads, signals, target_pod_missing=target_pod_missing, insight=insight
+        )
+        if insight:
+            summary = f"{summary} {insight}"
+        artifacts = await self._collection_artifacts(
+            reads, signals, details=details, status=status, summary=summary, confidence=confidence
+        )
         return CollectorResult(
             agent=self.name,
             status=status,
             summary=summary,
             confidence=confidence,
             details=details,
-            missing_data=missing,
-            warnings=warnings,
+            missing_data=reads.missing,
+            warnings=reads.warnings,
             artifacts=artifacts,
         )
-
 
 def _warning_event_observation(
     warning_events: list[dict[str, object]],
@@ -2815,15 +3036,20 @@ async def _k8s_mcp_json(
         return await _k8s_mcp_json_within_budget(settings, candidates)
 
 
-async def _k8s_mcp_json_within_budget(
-    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+async def _k8s_mcp_first_usable(
+    settings: Settings,
+    candidates: list[tuple[str, dict[str, object]]],
+    use: Callable[[object, str], object],
 ) -> object:
-    # Walk candidates and return the first one that yields a machine-readable
-    # payload. A candidate can "succeed" at the MCP protocol level yet answer with
-    # a human table (kubernetes-mcp-server's events_list does) that _k8s_yaml_payload
-    # can't parse — when that happens, fall through to the next candidate (e.g.
-    # resources_list, which honors --list-output=yaml) instead of raising and
-    # losing the evidence to the direct-API fallback.
+    """Walk MCP tool candidates and return the first result ``use`` accepts.
+
+    A candidate can "succeed" at the MCP protocol level yet answer with a human
+    table (kubernetes-mcp-server's events_list does) that the payload parser
+    cannot read. ``use`` rejects such a reply by raising RuntimeError, and the
+    walk falls through to the next candidate (e.g. resources_list, which honors
+    --list-output=yaml) instead of losing the evidence to the direct-API
+    fallback.
+    """
     last_error = ""
     for tool, args in candidates:
         try:
@@ -2838,15 +3064,28 @@ async def _k8s_mcp_json_within_budget(
             last_error = f"{tool}: {error}"
             continue
         try:
-            data = _k8s_mcp_payload(result)
+            return use(result, tool)
         except RuntimeError as exc:
             last_error = f"{tool}: {exc}"
             continue
-        if not _k8s_mcp_payload_recognized(data, tool=tool):
-            last_error = f"{tool}: MCP response missing a Kubernetes object/list payload"
-            continue
-        return data
     raise RuntimeError(last_error or "Kubernetes MCP tool failed")
+
+
+def _k8s_mcp_recognized_payload(result: object, tool: str) -> object:
+    data = _k8s_mcp_payload(result)
+    if not _k8s_mcp_payload_recognized(data, tool=tool):
+        raise RuntimeError("MCP response missing a Kubernetes object/list payload")
+    return data
+
+
+async def _k8s_mcp_json_within_budget(
+    settings: Settings, candidates: list[tuple[str, dict[str, object]]]
+) -> object:
+    return await _k8s_mcp_first_usable(
+        settings,
+        candidates,
+        _k8s_mcp_recognized_payload,
+    )
 
 
 _KUBERNETES_GO_KEY_ALIASES = {
@@ -2921,16 +3160,6 @@ def _k8s_mcp_payload(result: object) -> object:
     return build_masker(()).mask_object(_canonicalize_kubernetes_payload(parsed))
 
 
-def _k8s_yaml_payload(text: str) -> object:
-    """Return a masked Kubernetes YAML reply for compatibility callers.
-
-    Parsing occurs before masking so secret-shaped values cannot corrupt YAML
-    syntax. The MCP transport uses the same parser, then normalizes Go-field
-    keys before applying this mask.
-    """
-    return build_masker(()).mask_object(_parse_k8s_yaml_payload(text))
-
-
 def _parse_k8s_yaml_payload(text: str) -> object:
     """Parse a Kubernetes YAML reply without masking it first.
 
@@ -2974,21 +3203,7 @@ async def _k8s_mcp_result(
 async def _k8s_mcp_result_within_budget(
     settings: Settings, candidates: list[tuple[str, dict[str, object]]]
 ):
-    last_error = ""
-    for tool, args in candidates:
-        try:
-            result = await mcp_call(settings.kubernetes_mcp_url, tool, args)
-        except TimeoutError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
-            last_error = f"{tool}: {exc.__class__.__name__}: {exc}"
-            continue
-        error = mcp_error(result)
-        if error:
-            last_error = f"{tool}: {error}"
-            continue
-        return result
-    raise RuntimeError(last_error or "Kubernetes MCP tool failed")
+    return await _k8s_mcp_first_usable(settings, candidates, lambda result, _tool: result)
 
 
 def _scope_target(target: AnalysisTarget, plan) -> AnalysisTarget:  # noqa: ANN001
@@ -3418,26 +3633,6 @@ async def _collect_resolved_pod_logs(
                 }
             )
     return logs
-
-
-def best_matching_pod(items: list[dict], stems: list[str]) -> dict | None:
-    """The stem-matching pod that is most plausibly the alert's subject.
-
-    Prefer UNHEALTHY matches: a crashlooping workload's replacement is unhealthy
-    too, while e.g. a DaemonSet has healthy siblings on every OTHER node —
-    newest-wins alone would happily pick one of those and attach node evidence
-    to the wrong node. The preferred pool is only trusted when it is
-    unambiguous: a single pod, or several pods all on the SAME node (successive
-    incarnations). Unhealthy siblings spread across nodes cannot be attributed
-    to the alert's pod — None; no evidence beats wrong-node evidence."""
-    matches: list[tuple[str, dict]] = []
-    for item in items:
-        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-        name = str(metadata.get("name") or "")
-        if not name or not any(stem and name.startswith(stem) for stem in stems):
-            continue
-        matches.append((str(metadata.get("creationTimestamp") or ""), item))
-    return _best_unambiguous_pod(matches)
 
 
 def _best_unambiguous_pod(matches: list[tuple[str, dict]]) -> dict | None:
@@ -4674,49 +4869,21 @@ async def _collect_pod_logs_via_mcp(
     previous_containers: list[str] | None = None,
     since_time: str = "",
 ) -> list[dict[str, object]]:
-    """Fetch logs through MCP, preferring direct time-bounded API for history."""
-    # See _collect_pod_logs: same KUBERNETES_NAMESPACES scope as the rest of the sweep.
-    if not (target.namespace and target.pod and _namespace_allowed(settings, target.namespace)):
+    """Fetch logs through MCP, preferring direct time-bounded API for history.
+
+    Same read as _collect_resolved_pod_logs, which also applies the
+    KUBERNETES_NAMESPACES scope; this entry point additionally requires the
+    target to already name a namespace and Pod.
+    """
+    if not (target.namespace and target.pod):
         return []
-    targets: list[str | None] = list(containers) if containers else [None]
-    logs: list[dict[str, object]] = []
-    for container in targets:
-        previous_requests = [False] + (
-            [True] if container and container in (previous_containers or []) else []
-        )
-        for previous in previous_requests:
-            if previous and not container:
-                continue
-            item = await k8s_logs(
-                settings,
-                target.namespace,
-                target.pod,
-                container=container or "",
-                tail=settings.kubernetes_list_limit,
-                previous=previous,
-                since_time=since_time,
-            )
-            logs.append(
-                {
-                    "namespace": item.get("namespace") or target.namespace,
-                    "pod": item.get("pod") or target.pod,
-                    "container": container,
-                    "previous": previous,
-                    "since_time": since_time or None,
-                    "transport": item.get("transport"),
-                    "source_verified": item.get("source_verified") is True,
-                    "time_scope_verified": item.get("time_scope_verified") is not False,
-                    **(
-                        {"observed_entity": item["observed_entity"]}
-                        if isinstance(item.get("observed_entity"), dict)
-                        else {}
-                    ),
-                    "status_code": item.get("status_code"),
-                    "error": item.get("error"),
-                    "lines": item.get("lines") or [],
-                }
-            )
-    return logs
+    return await _collect_resolved_pod_logs(
+        settings,
+        target,
+        containers,
+        previous_containers=previous_containers,
+        since_time=since_time,
+    )
 
 
 def _log_lines(data: object, *, historical: bool = False) -> list[str]:
@@ -5516,11 +5683,6 @@ def _event_summary(
     if observed_entity:
         summary["observed_entity"] = observed_entity
     return summary
-
-
-def _event_timestamp(event: dict[str, object]) -> object:
-    timestamps = _event_timestamps(event)
-    return timestamps[-1][1] if timestamps else None
 
 
 def _event_sort_timestamp(event: dict[str, object]) -> tuple[bool, str]:

@@ -25,17 +25,16 @@ from app.knowledge import load_architecture
 from app.ontology.typedb_client import escape_typeql as esc
 from app.ontology.typedb_client import open_driver
 from ontology.normalization import workload_uid
+from ontology.upsert import (
+    exists,
+)
 
 ARCHITECTURE_FILE = Path("knowledge/runai_architecture.yaml")
 
 
-def _exists(tx: Any, match: str) -> bool:
-    return bool(list(tx.query(f"match {match} select $x;").resolve().as_concept_rows()))
-
-
 def _ensure_component(tx: Any, entry: dict[str, Any]) -> None:
     name = entry["component"]
-    if not _exists(tx, f'$x isa control_plane_component, has name "{esc(name)}";'):
+    if not exists(tx, f'$x isa control_plane_component, has name "{esc(name)}";'):
         tx.query(f'insert $x isa control_plane_component, has name "{esc(name)}";').resolve()
     single_valued = {
         "layer": entry.get("layer"),
@@ -51,7 +50,7 @@ def _ensure_component(tx: Any, entry: dict[str, Any]) -> None:
         text = str(value or "").strip()
         if not text:
             continue
-        if _exists(
+        if exists(
             tx,
             f'$x isa control_plane_component, has name "{esc(name)}", has {attr} "{esc(text)}";',
         ):
@@ -81,7 +80,7 @@ def _ensure_component(tx: Any, entry: dict[str, Any]) -> None:
 
 def _ensure_service(tx: Any, component: str, namespace: str, service: str) -> None:
     workload = workload_uid(namespace, component)
-    if not _exists(tx, f'$x isa service, has name "{esc(service)}";'):
+    if not exists(tx, f'$x isa service, has name "{esc(service)}";'):
         tx.query(f'insert $x isa service, has name "{esc(service)}";').resolve()
     if namespace:
         tx.query(
@@ -92,7 +91,7 @@ def _ensure_service(tx: Any, component: str, namespace: str, service: str) -> No
             f'match $s isa service, has name "{esc(service)}"; '
             f'insert $s has namespace_name "{esc(namespace)}";'
         ).resolve()
-    if not _exists(tx, f'$x isa workload, has workload_uid "{esc(workload)}";'):
+    if not exists(tx, f'$x isa workload, has workload_uid "{esc(workload)}";'):
         tx.query(
             f'insert $x isa workload, has workload_uid "{esc(workload)}", '
             f'has name "{esc(component)}";'
@@ -106,7 +105,7 @@ def _ensure_service(tx: Any, component: str, namespace: str, service: str) -> No
             f'match $w isa workload, has workload_uid "{esc(workload)}"; '
             f'insert $w has namespace_name "{esc(namespace)}";'
         ).resolve()
-    if not _exists(
+    if not exists(
         tx,
         f'$s isa service, has name "{esc(service)}"; '
         f'$w isa workload, has workload_uid "{esc(workload)}"; '
@@ -120,7 +119,7 @@ def _ensure_service(tx: Any, component: str, namespace: str, service: str) -> No
 
 
 def _relate_depends_on(tx: Any, dependent: str, dependency: str) -> None:
-    if _exists(
+    if exists(
         tx,
         f'$x isa control_plane_component, has name "{esc(dependent)}"; '
         f'$d isa control_plane_component, has name "{esc(dependency)}"; '

@@ -446,6 +446,8 @@ func (s *Store) EditKnowledgeCandidateActions(id string, actions []string, actor
 	if len(trimmed) == 0 || len(trimmed) > 10 {
 		return KnowledgeCandidate{}, errors.New("between 1 and 10 non-empty actions are required")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -466,6 +468,8 @@ func (s *Store) EditKnowledgeCandidateActions(id string, actions []string, actor
 // a concurrent human edit always wins. Applying an unchanged list still stamps
 // the curation marker so the refiner is never re-invoked for this candidate.
 func (s *Store) RefineKnowledgeCandidateActions(id string, expected, refined []string) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -482,6 +486,8 @@ func (s *Store) RefineKnowledgeCandidateActions(id string, expected, refined []s
 // KnowledgeCandidatesPendingActionRefinement lists ready candidates whose
 // actions have not been curated yet (neither LLM-refined nor human-edited).
 func (s *Store) KnowledgeCandidatesPendingActionRefinement() []KnowledgeCandidate {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := []KnowledgeCandidate{}
@@ -541,15 +547,28 @@ func (s *Store) applyKnowledgeCandidateActionsLocked(candidate *KnowledgeCandida
 
 // compiledKnowledgePayload is intentionally a narrow public representation.
 // It excludes analysis prose, artifacts, raw evidence, tool queries, and logs.
-func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, operatorConfirmed bool) (map[string]any, string) {
-	if snapshot == nil {
-		return nil, "missing source case snapshot"
-	}
-	card, _ := snapshot.Snapshot["case_card"].(map[string]any)
+// promotionEvidence is what the gate cascade below proves before any knowledge
+// payload is built: which hypothesis carries the claim, the observations that
+// support it, and the probe templates that tested it.
+type promotionEvidence struct {
+	hypothesis       map[string]any
+	support          map[string]bool
+	evidenceSource   string
+	probeTemplateIDs []string
+	quality          int
+	qualitySource    string
+}
+
+// knowledgePromotionGates runs every veto between an approved case snapshot and
+// promotable knowledge, in order. A non-empty second return is the reason the
+// candidate was refused, and is surfaced to the reviewer verbatim.
+func knowledgePromotionGates(
+	snapshot *CaseSnapshot, trace map[string]any, operatorConfirmed bool,
+) (promotionEvidence, string) {
 	metadata, _ := snapshot.Snapshot["metadata"].(map[string]any)
 	harness, _ := metadata["harness"].(map[string]any)
 	if harness == nil {
-		return nil, "missing validation harness"
+		return promotionEvidence{}, "missing validation harness"
 	}
 	quality, source := harnessQualityScore(metadata)
 	if quality < 80 {
@@ -561,12 +580,12 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 		// the honest harness number with an explicit source. Hard gates and the
 		// supporting-evidence requirements below still veto as before.
 		if !operatorConfirmed {
-			return nil, "quality score must be at least 80"
+			return promotionEvidence{}, "quality score must be at least 80"
 		}
 		source = "operator_confirmed_review"
 	}
 	if !harnessHardGatesPassed(harness) {
-		return nil, "all non-empty harness hard gates must pass"
+		return promotionEvidence{}, "all non-empty harness hard gates must pass"
 	}
 	hypothesis, support, contradiction, ledgerErr := readyTraceV3Hypothesis(trace, snapshot.RootCauseFamily, snapshot.Mechanism, operatorConfirmed)
 	if ledgerErr == "" && len(support) == 0 {
@@ -590,22 +609,22 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 		var ok bool
 		hypothesis, support, contradiction, ok = harnessClaimHypothesis(snapshot, harness, trace)
 		if !ok {
-			return nil, ledgerErr
+			return promotionEvidence{}, ledgerErr
 		}
 		evidenceSource = "harness_claim"
 		minimumSourceGroups = 1
 	}
 	if len(support) == 0 {
-		return nil, "missing supporting evidence"
+		return promotionEvidence{}, "missing supporting evidence"
 	}
 	if len(contradiction) > 0 {
-		return nil, "unresolved contradicting evidence"
+		return promotionEvidence{}, "unresolved contradicting evidence"
 	}
 	if errorText := canonicalSupportingEvidenceError(trace, support, minimumSourceGroups); errorText != "" {
-		return nil, errorText
+		return promotionEvidence{}, errorText
 	}
 	hypothesisID := stringValue(hypothesis["hypothesis_id"])
-	family, mechanism := stringValue(hypothesis["family"]), stringValue(hypothesis["mechanism"])
+	family := stringValue(hypothesis["family"])
 	probeTemplateIDs := traceV3LinkedProbeTemplateIDs(trace, hypothesisID, support)
 	if evidenceSource != "" {
 		// A harness claim has its own synthetic hypothesis ID, but can still
@@ -613,11 +632,34 @@ func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, oper
 		probeTemplateIDs = traceV3FamilyLinkedProbeTemplateIDs(trace, family, support)
 	}
 	if evidenceSource == "" && len(probeTemplateIDs) == 0 {
-		return nil, "missing probe execution linked to hypothesis evidence"
+		return promotionEvidence{}, "missing probe execution linked to hypothesis evidence"
 	}
 	if strings.TrimSpace(stringValue(snapshot.Snapshot["analysis_summary"])) == "" || strings.TrimSpace(stringValue(snapshot.Snapshot["analysis_detail"])) == "" {
-		return nil, "missing analysis result"
+		return promotionEvidence{}, "missing analysis result"
 	}
+	return promotionEvidence{
+		hypothesis:       hypothesis,
+		support:          support,
+		evidenceSource:   evidenceSource,
+		probeTemplateIDs: probeTemplateIDs,
+		quality:          quality,
+		qualitySource:    source,
+	}, ""
+}
+
+func compiledKnowledgePayload(snapshot *CaseSnapshot, trace map[string]any, operatorConfirmed bool) (map[string]any, string) {
+	if snapshot == nil {
+		return nil, "missing source case snapshot"
+	}
+	proven, reason := knowledgePromotionGates(snapshot, trace, operatorConfirmed)
+	if reason != "" {
+		return nil, reason
+	}
+	card, _ := snapshot.Snapshot["case_card"].(map[string]any)
+	hypothesis, support := proven.hypothesis, proven.support
+	evidenceSource, probeTemplateIDs := proven.evidenceSource, proven.probeTemplateIDs
+	quality, source := proven.quality, proven.qualitySource
+	family, mechanism := stringValue(hypothesis["family"]), stringValue(hypothesis["mechanism"])
 	confidence, _ := numberToFloat(hypothesis["confidence"])
 	evidenceSummaries, observedTerms := traceEvidenceSummaries(trace, support)
 	// mechanism is the ranking LLM's internal hypothesis text -- English by
@@ -1025,15 +1067,15 @@ func knowledgeEvidenceSummaries(raw any) []KnowledgeEvidenceSummary {
 	return out
 }
 
-func readyTraceV3Hypothesis(trace map[string]any, finalFamily, finalMechanism string, operatorConfirmed bool) (map[string]any, map[string]bool, map[string]bool, string) {
-	hypotheses, _ := trace["hypotheses"].([]any)
-	evidence, _ := trace["evidence"].([]any)
-	knownEvidence := map[string]bool{}
-	for _, raw := range evidence {
-		if item, ok := raw.(map[string]any); ok && stringValue(item["evidence_id"]) != "" {
-			knownEvidence[stringValue(item["evidence_id"])] = true
-		}
-	}
+// selectTraceV3Hypothesis picks the ONE trace hypothesis that matches the final
+// root cause: a "selected" one, else a "supported" one, else — only when the
+// operator has explicitly confirmed the diagnosis — a family match in any
+// status. That override relaxes the status/confidence requirement ONLY; the
+// evidence gates in traceV3HypothesisEvidence are unchanged, so promoted
+// knowledge still carries at least one real supporting observation.
+func selectTraceV3Hypothesis(
+	hypotheses []any, finalFamily, finalMechanism string, operatorConfirmed bool,
+) (map[string]any, string) {
 	// status == "" matches any status; used only for the operator-confirmed override.
 	selectMatching := func(status string) []map[string]any {
 		matches := []map[string]any{}
@@ -1055,54 +1097,70 @@ func readyTraceV3Hypothesis(trace map[string]any, finalFamily, finalMechanism st
 	}
 	selected := selectMatching("selected")
 	if len(selected) > 1 {
-		return nil, nil, nil, "multiple selected trace-v3 hypotheses match final root cause"
+		return nil, "multiple selected trace-v3 hypotheses match final root cause"
 	}
 	if len(selected) == 0 {
 		selected = selectMatching("supported")
 	}
 	if len(selected) != 1 {
 		if !operatorConfirmed {
-			return nil, nil, nil, "expected exactly one supported trace-v3 hypothesis matching final root cause"
+			return nil, "expected exactly one supported trace-v3 hypothesis matching final root cause"
 		}
-		// Operator override for non-reproducible incidents: accept a family-matching
-		// hypothesis in ANY status when the operator has explicitly confirmed the
-		// diagnosis. This relaxes the status/confidence requirement ONLY — the
-		// evidence, contradiction, and probe-linkage gates below are unchanged, so
-		// promoted knowledge still carries at least one real supporting observation.
 		selected = selectMatching("")
 		if len(selected) != 1 {
-			return nil, nil, nil, "operator confirmation needs exactly one trace-v3 hypothesis matching the confirmed root cause"
+			return nil, "operator confirmation needs exactly one trace-v3 hypothesis matching the confirmed root cause"
 		}
 	}
-	for _, hypothesis := range selected {
-		id, family, mechanism := strings.TrimSpace(stringValue(hypothesis["hypothesis_id"])), strings.TrimSpace(stringValue(hypothesis["family"])), strings.TrimSpace(stringValue(hypothesis["mechanism"]))
-		if id == "" || family == "" || mechanism == "" {
-			return nil, nil, nil, "selected trace hypothesis is incomplete"
-		}
-		confidence, ok := numberToFloat(hypothesis["confidence"])
-		if !operatorConfirmed && (!ok || confidence < 0.7) {
-			return nil, nil, nil, "selected trace hypothesis confidence must be at least 0.7"
-		}
-		support, against := map[string]bool{}, map[string]bool{}
-		for _, value := range sanitizeStringSlice(hypothesis["evidence_for"]) {
-			if !knownEvidence[value] {
-				return nil, nil, nil, "trace references unknown supporting evidence"
-			}
-			support[value] = true
-		}
-		for _, value := range sanitizeStringSlice(hypothesis["evidence_against"]) {
-			if !knownEvidence[value] {
-				return nil, nil, nil, "trace references unknown contradicting evidence"
-			}
-			against[value] = true
-		}
-		return hypothesis, support, against, ""
-	}
-	return nil, nil, nil, "missing selected trace-v3 hypothesis"
+	return selected[0], ""
 }
 
-func traceV3HasLinkedProbe(trace map[string]any, hypothesisID string, evidence map[string]bool) bool {
-	return len(traceV3LinkedProbeTemplateIDs(trace, hypothesisID, evidence)) > 0
+// traceV3HypothesisEvidence checks the selected hypothesis is complete, confident
+// enough, and cites only evidence the trace actually carries.
+func traceV3HypothesisEvidence(
+	hypothesis map[string]any, knownEvidence map[string]bool, operatorConfirmed bool,
+) (map[string]bool, map[string]bool, string) {
+	id, family, mechanism := strings.TrimSpace(stringValue(hypothesis["hypothesis_id"])), strings.TrimSpace(stringValue(hypothesis["family"])), strings.TrimSpace(stringValue(hypothesis["mechanism"]))
+	if id == "" || family == "" || mechanism == "" {
+		return nil, nil, "selected trace hypothesis is incomplete"
+	}
+	confidence, ok := numberToFloat(hypothesis["confidence"])
+	if !operatorConfirmed && (!ok || confidence < 0.7) {
+		return nil, nil, "selected trace hypothesis confidence must be at least 0.7"
+	}
+	support, against := map[string]bool{}, map[string]bool{}
+	for _, value := range sanitizeStringSlice(hypothesis["evidence_for"]) {
+		if !knownEvidence[value] {
+			return nil, nil, "trace references unknown supporting evidence"
+		}
+		support[value] = true
+	}
+	for _, value := range sanitizeStringSlice(hypothesis["evidence_against"]) {
+		if !knownEvidence[value] {
+			return nil, nil, "trace references unknown contradicting evidence"
+		}
+		against[value] = true
+	}
+	return support, against, ""
+}
+
+func readyTraceV3Hypothesis(trace map[string]any, finalFamily, finalMechanism string, operatorConfirmed bool) (map[string]any, map[string]bool, map[string]bool, string) {
+	hypotheses, _ := trace["hypotheses"].([]any)
+	evidence, _ := trace["evidence"].([]any)
+	knownEvidence := map[string]bool{}
+	for _, raw := range evidence {
+		if item, ok := raw.(map[string]any); ok && stringValue(item["evidence_id"]) != "" {
+			knownEvidence[stringValue(item["evidence_id"])] = true
+		}
+	}
+	hypothesis, reason := selectTraceV3Hypothesis(hypotheses, finalFamily, finalMechanism, operatorConfirmed)
+	if reason != "" {
+		return nil, nil, nil, reason
+	}
+	support, against, reason := traceV3HypothesisEvidence(hypothesis, knownEvidence, operatorConfirmed)
+	if reason != "" {
+		return nil, nil, nil, reason
+	}
+	return hypothesis, support, against, ""
 }
 
 func traceV3LinkedProbeTemplateIDs(trace map[string]any, hypothesisID string, evidence map[string]bool) []string {
@@ -1436,6 +1494,8 @@ func knowledgeCandidateAwaitsValidatorRetry(candidate *KnowledgeCandidate) bool 
 }
 
 func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -1498,6 +1558,8 @@ func (s *Store) ApproveKnowledgeCandidate(id string, request KnowledgeDecisionRe
 // exposing it to the active runtime snapshot. A later explicit activation is
 // required, so an approved case cannot change RCA ranking by accident.
 func (s *Store) ShadowKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -1536,21 +1598,33 @@ func (s *Store) ShadowKnowledgeCandidate(id string, request KnowledgeDecisionReq
 	return cloneKnowledgeCandidate(candidate), cloneKnowledgePackage(pkg), nil
 }
 
-// ActivateShadowKnowledgeCandidate makes an already validated shadow package
-// visible to the Agent. It is the only shadow -> active transition.
-func (s *Store) ActivateShadowKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+// shadowPairLocked resolves the candidate and package a shadow decision acts
+// on, refusing anything that is not still in shadow on BOTH sides.
+func (s *Store) shadowPairLocked(id string) (*KnowledgeCandidate, *KnowledgePackage, error) {
 	candidate := s.knowledgeCandidates[id]
 	if candidate == nil {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate not found")
+		return nil, nil, errors.New("knowledge candidate not found")
 	}
 	if candidate.Status != knowledgeCandidateShadow {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate is not in shadow")
+		return nil, nil, errors.New("knowledge candidate is not in shadow")
 	}
 	pkg := s.knowledgePackages[candidate.PackageID]
 	if pkg == nil || pkg.Status != knowledgePackageShadow {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge shadow package not found")
+		return nil, nil, errors.New("knowledge shadow package not found")
+	}
+	return candidate, pkg, nil
+}
+
+// ActivateShadowKnowledgeCandidate makes an already validated shadow package
+// visible to the Agent. It is the only shadow -> active transition.
+func (s *Store) ActivateShadowKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	candidate, pkg, err := s.shadowPairLocked(id)
+	if err != nil {
+		return KnowledgeCandidate{}, KnowledgePackage{}, err
 	}
 	validated := s.knowledgeCandidateForSnapshotLocked(s.caseSnapshots[candidate.CaseID])
 	if err := revalidationError(validated, validated != nil && validated.ContentHash == candidate.ContentHash); err != nil {
@@ -1592,18 +1666,13 @@ func (s *Store) ActivateShadowKnowledgeCandidate(id string, request KnowledgeDec
 // RejectShadowKnowledgeCandidate retires an observation-only package without
 // ever making it visible to the runtime.
 func (s *Store) RejectShadowKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, KnowledgePackage, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	candidate := s.knowledgeCandidates[id]
-	if candidate == nil {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate not found")
-	}
-	if candidate.Status != knowledgeCandidateShadow {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge candidate is not in shadow")
-	}
-	pkg := s.knowledgePackages[candidate.PackageID]
-	if pkg == nil || pkg.Status != knowledgePackageShadow {
-		return KnowledgeCandidate{}, KnowledgePackage{}, errors.New("knowledge shadow package not found")
+	candidate, pkg, err := s.shadowPairLocked(id)
+	if err != nil {
+		return KnowledgeCandidate{}, KnowledgePackage{}, err
 	}
 	now := time.Now().UTC()
 	actor, note := knowledgeActor(request.Actor), strings.TrimSpace(request.Note)
@@ -1629,6 +1698,8 @@ func (s *Store) RejectShadowKnowledgeCandidate(id string, request KnowledgeDecis
 // content-derived, so this is housekeeping, not censorship: an evaluation that
 // reproduces the same knowledge regenerates the row.
 func (s *Store) DeleteKnowledgeCandidate(id string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -1659,6 +1730,8 @@ func (s *Store) DeleteKnowledgeCandidate(id string) error {
 }
 
 func (s *Store) RejectKnowledgeCandidate(id string, request KnowledgeDecisionRequest) (KnowledgeCandidate, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -1685,6 +1758,8 @@ func (s *Store) RejectKnowledgeCandidate(id string, request KnowledgeDecisionReq
 // rejection. Transport and 5xx failures never call this method, so a candidate
 // remains ready when validation infrastructure is unavailable.
 func (s *Store) FailKnowledgeCandidateValidation(id, reason string) (KnowledgeCandidate, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	candidate := s.knowledgeCandidates[id]
@@ -1713,6 +1788,8 @@ func (s *Store) FailKnowledgeCandidateValidation(id, reason string) (KnowledgeCa
 }
 
 func (s *Store) RetireKnowledgePackage(id string, request KnowledgeDecisionRequest) (KnowledgePackage, error) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pkg := s.knowledgePackages[id]
@@ -1744,6 +1821,8 @@ func (s *Store) UpdateKnowledgePackageMirror(id, status, lastError string, updat
 	if status != "pending" && status != "synced" && status != "error" {
 		return KnowledgePackage{}, errors.New("invalid knowledge mirror status")
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pkg := s.knowledgePackages[id]

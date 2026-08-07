@@ -103,32 +103,6 @@ def _row(**overrides: Any) -> dict[str, Any]:
 # --- action extraction ----------------------------------------------------------
 
 
-def test_extract_actions_caps_and_scopes_to_recommended_actions() -> None:
-    actions = ingest._extract_actions(_row()["analysis_detail"])
-    assert actions == [
-        "Free disk space on the node",
-        "Cordon and drain gpu-node-1",
-        "Raise the eviction threshold",
-    ]
-
-
-def test_extract_actions_truncates_and_handles_missing_section() -> None:
-    assert ingest._extract_actions("## Root Cause\n\n- no actions here") == []
-    assert ingest._extract_actions("") == []
-    long = "## Recommended Actions\n- " + "x" * 500
-    assert len(ingest._extract_actions(long)[0]) == ingest._ACTION_MAXLEN
-
-
-def test_extract_actions_matches_numbered_and_korean_headings() -> None:
-    # The live report now emits numbered/Korean headings — both must still parse.
-    assert ingest._extract_actions("## 3. Recommended Actions\n- do the thing") == [
-        "do the thing"
-    ]
-    assert ingest._extract_actions("## 3. 권장 조치 (Recommended Actions)\n- 조치하기") == [
-        "조치하기"
-    ]
-
-
 # --- row eligibility -------------------------------------------------------------
 
 

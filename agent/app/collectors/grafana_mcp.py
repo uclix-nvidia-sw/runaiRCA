@@ -6,6 +6,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from app.mcp_client import mcp_call, mcp_error, mcp_tool_json
+
+# Module-local clock so a test can freeze THIS module's notion of time without
+# patching the stdlib object, which is also the asyncio event loop's clock.
+_now = time.monotonic
+
 _GRAFANA_UID = re.compile(r"^[a-zA-Z0-9\-_]{1,40}$")
 _SUCCESS_TTL_SECONDS = 300.0
 _FAILURE_TTL_SECONDS = 30.0
@@ -37,7 +43,7 @@ async def resolve_grafana_datasource_uid(
     dtype = datasource_type.strip().lower()
     configured = configured_uid.strip()
     key = (url, dtype, configured)
-    now = time.monotonic()
+    now = _now()
     cached = _DATASOURCE_CACHE.get(key)
     if cached and cached.expires_at > now:
         if cached.error:
@@ -115,7 +121,7 @@ def mark_grafana_datasource_failure(
         return
     key = (url, datasource_type.strip().lower(), configured_uid.strip())
     _DATASOURCE_CACHE[key] = _DatasourceCacheEntry(
-        expires_at=time.monotonic() + _FAILURE_TTL_SECONDS,
+        expires_at=_now() + _FAILURE_TTL_SECONDS,
         error=_resolution_error(datasource_type, exc),
     )
 
@@ -136,7 +142,6 @@ def _select_datasource_uid(data: object, datasource_type: str) -> str:
     candidates: list[dict[str, Any]] = []
     for datasource in _datasource_items(data):
         dtype = str(datasource.get("type") or "").strip().lower()
-        name = str(datasource.get("name") or "").strip().lower()
         if datasource_type not in dtype:
             continue
         uid = str(datasource.get("uid") or "").strip()
@@ -192,3 +197,64 @@ def _datasource_items(data: object) -> list[dict[str, Any]]:
     if isinstance(nested, dict):
         return _datasource_items(nested)
     return []
+
+
+async def call_grafana_mcp_json(
+    url: str, tool: str, args_list: list[dict[str, object]]
+) -> object:
+    """Call one Grafana MCP tool, trying each argument schema in turn.
+
+    v0.x servers disagree on argument names, so callers pass every candidate
+    shape and the first one the server accepts wins; the last failure is raised
+    when none do.
+    """
+    last_error = ""
+    for args in args_list:
+        try:
+            result = await mcp_call(url, tool, args)
+        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
+            last_error = f"{exc.__class__.__name__}: {exc}"
+            continue
+        try:
+            return grafana_mcp_result_json(result, tool)
+        except RuntimeError as exc:
+            last_error = str(exc)
+            continue
+    raise RuntimeError(last_error or f"{tool} failed")
+
+
+def grafana_mcp_result_json(result: object, tool: str) -> object:
+    error = mcp_error(result)
+    if error:
+        raise RuntimeError(error)
+    data = mcp_tool_json(result)
+    if isinstance(data, dict) and "raw" in data:
+        raise RuntimeError(f"{tool} result was not JSON")
+    return data
+
+
+def grafana_datasource_error(error: str) -> bool:
+    """Whether a tool error means the datasource UID itself was rejected."""
+    lowered = error.casefold()
+    return "get datasource by uid" in lowered or "id is invalid" in lowered
+
+
+async def grafana_datasource_uid(
+    url: str, datasource_type: str, configured_uid: str = ""
+) -> str:
+    return await resolve_grafana_datasource_uid(
+        url, datasource_type, configured_uid, call_json=call_grafana_mcp_json
+    )
+
+
+def raise_on_datasource_error(items: list[dict[str, object]]) -> None:
+    """Abort the whole collector when Grafana rejected the datasource UID.
+
+    That failure is not a property of any one query: every remaining query would
+    fail identically, and reporting it per query turns one configuration problem
+    into N unavailable evidence cards.
+    """
+    for item in items:
+        error = str(item.get("error") or "")
+        if grafana_datasource_error(error):
+            raise RuntimeError(error)

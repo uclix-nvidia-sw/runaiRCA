@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -421,6 +422,244 @@ def _historical_journal_response_verified(
     )
 
 
+async def _scan_source(
+    settings: Settings,
+    source: str,
+    *,
+    node: str,
+    base_url: str,
+    headers: dict[str, str],
+    time_range: dict[str, str] | None,
+    causal_time_range: dict[str, str] | None,
+) -> tuple[dict[str, object], list[str]]:
+    """One node log source: its result row plus the lines that matched."""
+    params = {"source": source, "lines": "500"}
+    # Only journalctl sources have a trustworthy historical time predicate.
+    # Snapshot sources are current-state context, not proof about a past
+    # incident.
+    if source in _TIME_WINDOWABLE_SOURCES and time_range:
+        params.update({"since": time_range["start"], "until": time_range["end"]})
+    if "{node}" not in settings.system_agent_url:
+        params["node"] = node
+    response = await get_json(
+        base_url=base_url,
+        path="/logs",
+        timeout_seconds=settings.system_agent_timeout_seconds,
+        params=params,
+        headers=headers,
+    )
+    lines = _lines(response.data)
+    matches = _matching_lines(source, lines)
+    historical_window_verified = bool(
+        source in _TIME_WINDOWABLE_SOURCES
+        and time_range
+        and _historical_journal_response_verified(response.data, time_range, source)
+    )
+    matching_timestamps = _journal_matching_timestamps(
+        matches, causal_time_range if historical_window_verified else None
+    )
+    return {
+        "source": source,
+        "url": response.url,
+        "status_code": response.status_code,
+        "line_count": len(lines),
+        "error_count": len(matches),
+        "errors": compact(matches, limit=8),
+        "error": response.error,
+        "time_range": (
+            time_range if source in _TIME_WINDOWABLE_SOURCES and time_range else None
+        ),
+        "historical_scope": bool(source in _TIME_WINDOWABLE_SOURCES and time_range),
+        "historical_window_verified": historical_window_verified,
+        "matching_timestamps": matching_timestamps,
+    }, matches
+
+
+@dataclass
+class _NodeScan:
+    """What one node's log sweep found, before any of it becomes a verdict.
+
+    Each list is a different admissibility tier: incident_successful proved its
+    historical window, causal_errors carry a timestamp inside the causal span,
+    and snapshot_hits matched on a source that cannot prove per-line timing at
+    all. The verdict ladder below reads exactly these.
+    """
+
+    node: str
+    time_range: dict[str, str] | None
+    causal_time_range: dict[str, str] | None
+    firing: bool
+    historical_node_scope_verified: bool
+    historical_response_verified: bool
+    source_results: list[dict[str, object]]
+    raw_matches: dict[str, list[str]]
+    successful: list[dict[str, object]]
+    incident_successful: list[dict[str, object]]
+    with_errors: list[dict[str, object]]
+    causal_errors: list[dict[str, object]]
+    error_lines: list[str]
+    snapshot_hits: list[dict[str, object]]
+    snapshot_error_lines: list[str]
+    sources_skipped: list[str]
+    warnings: list[str]
+
+
+def _scan_verdict(
+    settings: Settings, scan: _NodeScan, target: AnalysisTarget
+) -> tuple[str, str, str]:
+    """Status, confidence, and the operator-facing sentence for one node scan.
+
+    Ordered strongest-claim-first: every branch states what this node's logs can
+    and cannot establish about the incident, and only the branches that verified
+    both the window and the node identity return "ok".
+    """
+    node, time_range = scan.node, scan.time_range
+    causal_errors, error_lines = scan.causal_errors, scan.error_lines
+    with_errors, successful = scan.with_errors, scan.successful
+    incident_successful = scan.incident_successful
+    snapshot_hits, snapshot_error_lines = scan.snapshot_hits, scan.snapshot_error_lines
+    historical_node_scope_verified = scan.historical_node_scope_verified
+    historical_response_verified = scan.historical_response_verified
+    firing = scan.firing
+    if time_range and not historical_response_verified:
+        status = "partial"
+        confidence = "low"
+        deterministic = f"{NO_EVIDENCE} " + ko_en(
+            settings,
+            f"노드 {node}: system agent가 요청한 incident 시간창의 journalctl 응답을 확인하지 "
+            "못했습니다. 반환된 로그는 참고용이며 과거 incident 증거로 사용하지 않습니다.",
+            f"Node {node}: the system agent did not confirm a requested incident-window "
+            "journalctl response. Returned logs are context only, not historical evidence.",
+        )
+    elif causal_errors and time_range and not historical_node_scope_verified:
+        status = "partial"
+        confidence = "low"
+        deterministic = f"{NO_EVIDENCE} " + ko_en(
+            settings,
+            f"노드 {node}: 현재 pod에서 추론한 노드의 incident 시간창 journalctl에 "
+            f"커널/하드웨어 에러 라인 {len(error_lines)}건이 있지만, alert가 노드를 "
+            "명시하지 않아 참고용으로만 사용합니다.",
+            f"Node {node}: its incident-window journalctl logs have {len(error_lines)} "
+            "kernel/hardware error line(s), but the node was inferred from a current Pod "
+            "rather than the alert; "
+            "this is context only.",
+        )
+    elif causal_errors:
+        status = "ok"
+        confidence = "high"
+        sources_text = ", ".join(sorted({item["source"] for item in causal_errors}))
+        deterministic = ko_en(
+            settings,
+            f"노드 {node}: {sources_text}에서 커널/하드웨어 에러 라인 "
+            f"{len(error_lines)}건을 발견했습니다.",
+            f"Node {node}: {len(error_lines)} kernel/hardware error line(s) found in "
+            f"{sources_text}.",
+        )
+    elif with_errors:
+        status = "partial"
+        confidence = "low"
+        resolved = bool(
+            parse_incident_time(target.resolved_at)
+            and parse_incident_time(target.fired_at)
+            and parse_incident_time(target.resolved_at) >= parse_incident_time(target.fired_at)
+        )
+        deterministic = f"{NO_EVIDENCE} " + ko_en(
+            settings,
+            (
+                f"노드 {node}: 커널/하드웨어 에러 라인이 incident 해결 후 recovery 구간에만 있어 "
+                "원인 증거가 아닌 참고용으로 유지합니다."
+                if resolved else f"노드 {node}: 에러 라인을 인과 시간창 안에서 검증할 수 없어 참고용으로 유지합니다."
+            ),
+            (
+                f"Node {node}: kernel/hardware error lines occur only in the post-resolution "
+                "recovery window and remain context, not causal evidence."
+                if resolved else f"Node {node}: error lines could not be verified inside the causal window; kept as context."
+            ),
+        )
+    elif snapshot_hits and firing:
+        # journal/fabricmanager are clean, but a source that cannot prove
+        # per-line timing still matched, and the alert is still active:
+        # this snapshot was collected inside the incident, not merely
+        # near it. Report it as real evidence rather than a false "no
+        # error signatures" -- "scoped" only when the node itself is
+        # verified as the alert's (same bar the causal_errors branch
+        # above applies), otherwise a guessed cluster-scan node keeps
+        # this as context. A resolved/historical alert gets no such
+        # branch and falls through to `incident_successful` below
+        # unchanged: a live snapshot fetched long after resolution
+        # cannot be backdated to a closed incident (see
+        # test_historical_incident_scopes_journal_and_ignores_current_tails).
+        scoped = historical_node_scope_verified
+        status = "ok" if scoped else "partial"
+        confidence = "medium" if scoped else "low"
+        sources_text = ", ".join(sorted({item["source"] for item in snapshot_hits}))
+        deterministic = (
+            ko_en(
+                settings,
+                f"노드 {node}: {sources_text}에서 커널/GPU/하드웨어 에러 시그니처 "
+                f"{len(snapshot_error_lines)}건을 발견했습니다. journal/fabricmanager는 "
+                "깨끗하지만 alert가 아직 진행 중이므로 지금 수집한 스냅샷도 유효한 "
+                "증거로 사용합니다.",
+                f"Node {node}: {len(snapshot_error_lines)} kernel/GPU/hardware error "
+                f"signature(s) found in {sources_text}. journal/fabricmanager are clean, "
+                "but the alert is still firing, so this live snapshot is admissible "
+                "evidence for the active incident.",
+            )
+            if scoped
+            else f"{NO_EVIDENCE} " + ko_en(
+                settings,
+                f"노드 {node}: {sources_text}에서 커널/GPU/하드웨어 에러 시그니처 "
+                f"{len(snapshot_error_lines)}건을 발견했지만, alert가 노드를 명시하지 "
+                "않아 참고용으로만 사용합니다.",
+                f"Node {node}: {len(snapshot_error_lines)} kernel/GPU/hardware error "
+                f"signature(s) found in {sources_text}, but the alert did not name "
+                "this node; this is context only.",
+            )
+        )
+    elif incident_successful:
+        # The endpoint returns a bounded journal tail. A clean tail is
+        # useful context, but cannot rule out a node signal elsewhere in
+        # the incident window.
+        status = "partial"
+        confidence = "low"
+        deterministic = ko_en(
+            settings,
+            f"노드 {node}: incident 시간창에서 가져온 journalctl 줄에는 커널/GPU/하드웨어 "
+            "에러 시그니처가 없습니다. 유한한 tail이므로 부재 증거는 아니며, "
+            "dmesg/syslog/nvidia-smi/nvlink는 현재 상태 참고입니다."
+            if time_range
+            else f"노드 {node}: 시스템 에이전트 접속 정상, 최근 "
+            "dmesg/journal/syslog/fabricmanager/nvidia-smi/nvlink에 "
+            "커널/GPU/하드웨어 에러 시그니처가 없습니다.",
+            f"Node {node}: no kernel/GPU/hardware error signatures were found in the "
+            "retrieved journalctl lines for the incident window. The finite tail is not "
+            "absence evidence; dmesg/syslog/nvidia-smi/nvlink are current-state context."
+            if time_range
+            else f"Node {node}: system agent reachable, no kernel/GPU/hardware "
+            "error signatures in recent dmesg/journal/syslog/fabricmanager/nvidia-smi/nvlink.",
+        )
+    elif successful and time_range:
+        status = "partial"
+        confidence = "low"
+        deterministic = f"{NO_EVIDENCE} " + ko_en(
+            settings,
+            f"노드 {node}: incident 시간창 journalctl 조회에 실패했습니다. "
+            "dmesg/syslog/nvidia-smi/nvlink는 현재 상태만 보여 "
+            "과거 incident 반증으로 사용할 수 없습니다.",
+            f"Node {node}: the incident-window journalctl queries failed. Current dmesg/syslog "
+            "tails cannot disprove a past incident.",
+        )
+    else:
+        status = "unavailable"
+        confidence = "low"
+        deterministic = f"{NO_EVIDENCE} " + ko_en(
+            settings,
+            f"노드 {node}: 모든 소스에서 시스템 에이전트에 접속하지 못했습니다.",
+            f"Node {node}: system agent unreachable on all sources.",
+        )
+    return status, confidence, deterministic
+
+
 class SystemCollector:
     name = "system"
 
@@ -665,51 +904,19 @@ class SystemCollector:
         ]
         sources_to_scan = [source for source in _SOURCES if source not in sources_skipped]
         for source in sources_to_scan:
-            params = {"source": source, "lines": "500"}
-            # Only journalctl sources have a trustworthy historical time
-            # predicate. Snapshot sources are current-state context, not proof
-            # about a past incident.
-            if source in _TIME_WINDOWABLE_SOURCES and time_range:
-                params.update({"since": time_range["start"], "until": time_range["end"]})
-            if "{node}" not in self._settings.system_agent_url:
-                params["node"] = node
-            response = await get_json(
+            row, matches = await _scan_source(
+                self._settings,
+                source,
+                node=node,
                 base_url=base_url,
-                path="/logs",
-                timeout_seconds=self._settings.system_agent_timeout_seconds,
-                params=params,
                 headers=headers,
+                time_range=time_range,
+                causal_time_range=causal_time_range,
             )
-            lines = _lines(response.data)
-            matches = _matching_lines(source, lines)
             raw_matches[source] = matches
-            historical_window_verified = bool(
-                source in _TIME_WINDOWABLE_SOURCES
-                and time_range
-                and _historical_journal_response_verified(response.data, time_range, source)
-            )
-            matching_timestamps = _journal_matching_timestamps(
-                matches, causal_time_range if historical_window_verified else None
-            )
-            source_results.append(
-                {
-                    "source": source,
-                    "url": response.url,
-                    "status_code": response.status_code,
-                    "line_count": len(lines),
-                    "error_count": len(matches),
-                    "errors": compact(matches, limit=8),
-                    "error": response.error,
-                    "time_range": (
-                        time_range if source in _TIME_WINDOWABLE_SOURCES and time_range else None
-                    ),
-                    "historical_scope": bool(source in _TIME_WINDOWABLE_SOURCES and time_range),
-                    "historical_window_verified": historical_window_verified,
-                    "matching_timestamps": matching_timestamps,
-                }
-            )
-            if response.error:
-                warnings.append(f"System agent query failed for {source}: {response.error}")
+            source_results.append(row)
+            if row["error"]:
+                warnings.append(f"System agent query failed for {source}: {row['error']}")
 
         successful = [item for item in source_results if not item["error"]]
         incident_sources = (
@@ -774,143 +981,26 @@ class SystemCollector:
                 "its log lines are context only."
             )
 
-        if time_range and not historical_response_verified:
-            status = "partial"
-            confidence = "low"
-            deterministic = f"{NO_EVIDENCE} " + ko_en(
-                self._settings,
-                f"노드 {node}: system agent가 요청한 incident 시간창의 journalctl 응답을 확인하지 "
-                "못했습니다. 반환된 로그는 참고용이며 과거 incident 증거로 사용하지 않습니다.",
-                f"Node {node}: the system agent did not confirm a requested incident-window "
-                "journalctl response. Returned logs are context only, not historical evidence.",
-            )
-        elif causal_errors and time_range and not historical_node_scope_verified:
-            status = "partial"
-            confidence = "low"
-            deterministic = f"{NO_EVIDENCE} " + ko_en(
-                self._settings,
-                f"노드 {node}: 현재 pod에서 추론한 노드의 incident 시간창 journalctl에 "
-                f"커널/하드웨어 에러 라인 {len(error_lines)}건이 있지만, alert가 노드를 "
-                "명시하지 않아 참고용으로만 사용합니다.",
-                f"Node {node}: its incident-window journalctl logs have {len(error_lines)} "
-                "kernel/hardware error line(s), but the node was inferred from a current Pod "
-                "rather than the alert; "
-                "this is context only.",
-            )
-        elif causal_errors:
-            status = "ok"
-            confidence = "high"
-            sources_text = ", ".join(sorted({item["source"] for item in causal_errors}))
-            deterministic = ko_en(
-                self._settings,
-                f"노드 {node}: {sources_text}에서 커널/하드웨어 에러 라인 "
-                f"{len(error_lines)}건을 발견했습니다.",
-                f"Node {node}: {len(error_lines)} kernel/hardware error line(s) found in "
-                f"{sources_text}.",
-            )
-        elif with_errors:
-            status = "partial"
-            confidence = "low"
-            resolved = bool(
-                parse_incident_time(target.resolved_at)
-                and parse_incident_time(target.fired_at)
-                and parse_incident_time(target.resolved_at) >= parse_incident_time(target.fired_at)
-            )
-            deterministic = f"{NO_EVIDENCE} " + ko_en(
-                self._settings,
-                (
-                    f"노드 {node}: 커널/하드웨어 에러 라인이 incident 해결 후 recovery 구간에만 있어 "
-                    "원인 증거가 아닌 참고용으로 유지합니다."
-                    if resolved else f"노드 {node}: 에러 라인을 인과 시간창 안에서 검증할 수 없어 참고용으로 유지합니다."
-                ),
-                (
-                    f"Node {node}: kernel/hardware error lines occur only in the post-resolution "
-                    "recovery window and remain context, not causal evidence."
-                    if resolved else f"Node {node}: error lines could not be verified inside the causal window; kept as context."
-                ),
-            )
-        elif snapshot_hits and firing:
-            # journal/fabricmanager are clean, but a source that cannot prove
-            # per-line timing still matched, and the alert is still active:
-            # this snapshot was collected inside the incident, not merely
-            # near it. Report it as real evidence rather than a false "no
-            # error signatures" -- "scoped" only when the node itself is
-            # verified as the alert's (same bar the causal_errors branch
-            # above applies), otherwise a guessed cluster-scan node keeps
-            # this as context. A resolved/historical alert gets no such
-            # branch and falls through to `incident_successful` below
-            # unchanged: a live snapshot fetched long after resolution
-            # cannot be backdated to a closed incident (see
-            # test_historical_incident_scopes_journal_and_ignores_current_tails).
-            scoped = historical_node_scope_verified
-            status = "ok" if scoped else "partial"
-            confidence = "medium" if scoped else "low"
-            sources_text = ", ".join(sorted({item["source"] for item in snapshot_hits}))
-            deterministic = (
-                ko_en(
-                    self._settings,
-                    f"노드 {node}: {sources_text}에서 커널/GPU/하드웨어 에러 시그니처 "
-                    f"{len(snapshot_error_lines)}건을 발견했습니다. journal/fabricmanager는 "
-                    "깨끗하지만 alert가 아직 진행 중이므로 지금 수집한 스냅샷도 유효한 "
-                    "증거로 사용합니다.",
-                    f"Node {node}: {len(snapshot_error_lines)} kernel/GPU/hardware error "
-                    f"signature(s) found in {sources_text}. journal/fabricmanager are clean, "
-                    "but the alert is still firing, so this live snapshot is admissible "
-                    "evidence for the active incident.",
-                )
-                if scoped
-                else f"{NO_EVIDENCE} " + ko_en(
-                    self._settings,
-                    f"노드 {node}: {sources_text}에서 커널/GPU/하드웨어 에러 시그니처 "
-                    f"{len(snapshot_error_lines)}건을 발견했지만, alert가 노드를 명시하지 "
-                    "않아 참고용으로만 사용합니다.",
-                    f"Node {node}: {len(snapshot_error_lines)} kernel/GPU/hardware error "
-                    f"signature(s) found in {sources_text}, but the alert did not name "
-                    "this node; this is context only.",
-                )
-            )
-        elif incident_successful:
-            # The endpoint returns a bounded journal tail. A clean tail is
-            # useful context, but cannot rule out a node signal elsewhere in
-            # the incident window.
-            status = "partial"
-            confidence = "low"
-            deterministic = ko_en(
-                self._settings,
-                f"노드 {node}: incident 시간창에서 가져온 journalctl 줄에는 커널/GPU/하드웨어 "
-                "에러 시그니처가 없습니다. 유한한 tail이므로 부재 증거는 아니며, "
-                "dmesg/syslog/nvidia-smi/nvlink는 현재 상태 참고입니다."
-                if time_range
-                else f"노드 {node}: 시스템 에이전트 접속 정상, 최근 "
-                "dmesg/journal/syslog/fabricmanager/nvidia-smi/nvlink에 "
-                "커널/GPU/하드웨어 에러 시그니처가 없습니다.",
-                f"Node {node}: no kernel/GPU/hardware error signatures were found in the "
-                "retrieved journalctl lines for the incident window. The finite tail is not "
-                "absence evidence; dmesg/syslog/nvidia-smi/nvlink are current-state context."
-                if time_range
-                else f"Node {node}: system agent reachable, no kernel/GPU/hardware "
-                "error signatures in recent dmesg/journal/syslog/fabricmanager/nvidia-smi/nvlink.",
-            )
-        elif successful and time_range:
-            status = "partial"
-            confidence = "low"
-            deterministic = f"{NO_EVIDENCE} " + ko_en(
-                self._settings,
-                f"노드 {node}: incident 시간창 journalctl 조회에 실패했습니다. "
-                "dmesg/syslog/nvidia-smi/nvlink는 현재 상태만 보여 "
-                "과거 incident 반증으로 사용할 수 없습니다.",
-                f"Node {node}: the incident-window journalctl queries failed. Current dmesg/syslog "
-                "tails cannot disprove a past incident.",
-            )
-        else:
-            status = "unavailable"
-            confidence = "low"
-            deterministic = f"{NO_EVIDENCE} " + ko_en(
-                self._settings,
-                f"노드 {node}: 모든 소스에서 시스템 에이전트에 접속하지 못했습니다.",
-                f"Node {node}: system agent unreachable on all sources.",
-            )
-
+        scan = _NodeScan(
+            node=node,
+            time_range=time_range,
+            causal_time_range=causal_time_range,
+            firing=firing,
+            historical_node_scope_verified=historical_node_scope_verified,
+            historical_response_verified=historical_response_verified,
+            source_results=source_results,
+            raw_matches=raw_matches,
+            successful=successful,
+            incident_successful=incident_successful,
+            with_errors=with_errors,
+            causal_errors=causal_errors,
+            error_lines=error_lines,
+            snapshot_hits=snapshot_hits,
+            snapshot_error_lines=snapshot_error_lines,
+            sources_skipped=sources_skipped,
+            warnings=warnings,
+        )
+        status, confidence, deterministic = _scan_verdict(self._settings, scan, target)
         summary = deterministic
         if causal_errors and (not time_range or historical_node_scope_verified) and llm_configured(self._settings):
             insight = await _llm_insight(self._settings, node, error_lines)

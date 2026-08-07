@@ -76,48 +76,6 @@ async def get_json(
     )
 
 
-async def post_form_json(
-    *,
-    url: str,
-    timeout_seconds: int,
-    data: dict[str, Any],
-    headers: dict[str, str] | None = None,
-    verify: bool | str = True,
-) -> JsonResponse:
-    try:
-        import httpx
-    except ImportError:
-        return JsonResponse(
-            url=_safe_text(url, limit=2000),
-            status_code=0,
-            error="python.httpx is not installed",
-        )
-
-    try:
-        async with httpx.AsyncClient(
-            timeout=_client_timeout(timeout_seconds), verify=verify, follow_redirects=True
-        ) as client:
-            response = await client.post(url, data=data, headers=headers)
-    except Exception as exc:  # noqa: BLE001 - collectors report diagnostics, not failures.
-        return JsonResponse(
-            url=_safe_text(url, limit=2000),
-            status_code=0,
-            error=_safe_text(f"{exc.__class__.__name__}: {exc}", limit=1000),
-        )
-
-    payload = _response_data(response)
-
-    error = None
-    if response.status_code >= 400:
-        error = f"HTTP {response.status_code}"
-    return JsonResponse(
-        url=_safe_text(str(response.url), limit=2000),
-        status_code=response.status_code,
-        data=payload,
-        error=error,
-    )
-
-
 async def post_json(
     *,
     url: str,

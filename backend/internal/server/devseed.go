@@ -11,6 +11,8 @@ import "time"
 // never reached "supported" (probes stayed inconclusive), so it previews as
 // validation_failed until an operator confirms it.
 func (s *Store) SeedDevFixtures() {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

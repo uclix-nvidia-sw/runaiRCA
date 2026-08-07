@@ -144,3 +144,54 @@ def test_new_family_keywords_are_not_bare_identity_tokens() -> None:
         )
         bare = [kw for kw in keywords if _is_bare_identity_token(kw)]
         assert not bare, f"{family} has bare identity-token keyword(s): {bare}"
+
+
+def test_ingest_whitelists_track_families_yaml() -> None:
+    """defect (b), generalized: load_alerts.py froze a stale whitelist and
+    dropped alerts declaring families it had never heard of. Both loaders now
+    derive their whitelist from families.yaml, so adding a family there cannot
+    silently make it un-ingestable — and the two loaders cannot disagree."""
+    from ontology.load_known_issues import FAMILIES as LOAD_KNOWN_ISSUES_FAMILIES
+
+    catalog = load_family_catalog(str(_FAMILIES_FILE))
+    for name, whitelist in (
+        ("load_alerts", LOAD_ALERTS_FAMILIES),
+        ("load_known_issues", LOAD_KNOWN_ISSUES_FAMILIES),
+    ):
+        missing = set(catalog.families) - set(whitelist)
+        assert not missing, f"{name} would drop families.yaml families: {sorted(missing)}"
+        assert _INSUFFICIENT_EVIDENCE in whitelist, f"{name} must keep the ranker sentinel"
+    assert set(LOAD_ALERTS_FAMILIES) == set(LOAD_KNOWN_ISSUES_FAMILIES)
+
+
+def test_symptom_names_do_not_collide_across_catalogs() -> None:
+    """Symptom identity in TypeDB is the bare name string, and the loaders now
+    share one reconciling `indicates` write — which deletes a symptom's edges to
+    any family other than the one being written. That is correct while each
+    catalog owns its own names, and silently destructive the moment two
+    catalogs use the same one: the last loader to run would retire the other's
+    edge."""
+    catalogs = {
+        "runai_alerts_catalog.yaml": ("alert", lambda d: d),
+        "runai_known_issues.yaml": ("issue", lambda d: d),
+        "failure_modes.yaml": (
+            "name",
+            lambda d: [s for fam in d for s in (fam.get("symptoms") or [])],
+        ),
+    }
+    names: dict[str, set[str]] = {}
+    for filename, (key, entries_of) in catalogs.items():
+        data = yaml.safe_load((_KNOWLEDGE_DIR / filename).read_text())
+        names[filename] = {
+            str(entry[key]) for entry in entries_of(data) if isinstance(entry, dict) and entry.get(key)
+        }
+        assert names[filename], f"{filename} produced no symptom names"
+
+    files = sorted(names)
+    for i, left in enumerate(files):
+        for right in files[i + 1 :]:
+            shared = names[left] & names[right]
+            assert not shared, (
+                f"{left} and {right} both declare {sorted(shared)}; whichever loader "
+                "runs last would retire the other's indicates edge"
+            )

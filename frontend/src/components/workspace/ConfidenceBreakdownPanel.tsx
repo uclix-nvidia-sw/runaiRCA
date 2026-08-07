@@ -7,6 +7,7 @@ export type ConfidenceScoreRow = {
   label: string;
   effect: string;
   sourceGroups: string[];
+  evidenceIds: string[];
 };
 
 export type ConfidenceGateRow = {
@@ -23,6 +24,7 @@ export type ConfidenceBreakdownView = {
   preHarnessConfidence?: string;
   finalFamily?: string;
   rankingScore?: number;
+  rankingScoreFrame: string;
   finalConfidence?: string;
   independentSourceGroups: string[];
   scoreRows: ConfidenceScoreRow[];
@@ -98,20 +100,25 @@ function formatNumber(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
 }
 
-// A floor is max(), not addition: without the running tally the table reads
-// "+1, +1, 최소 9점" against a final score of 9 and looks like it lost 2 points.
+// A floor is max(), not addition, and it is checked BEFORE delta on purpose:
+// the promotion helpers write score_floor and delta on the same row, so a
+// delta-first read renders an 8/10-point floor as a plain "+N" addition while a
+// floor-only row renders as a replacement — the same rule telling two stories.
+// Floors also avoid the "A → B" arrow entirely: that shape means "accumulated"
+// everywhere else in this table, and reusing it for a replacement is what made
+// a floored score unreadable (a 2-point tally floored to 9 read as +7).
 function scoreEffect(item: UnknownRecord, running: number): { text: string; next: number } {
+  const floor = numberValue(item.score_floor);
+  if (floor !== undefined) {
+    if (floor > running) {
+      return { text: `하한 ${formatNumber(floor)}점 적용 (누적 ${formatNumber(running)}점 대체)`, next: floor };
+    }
+    return { text: `하한 ${formatNumber(floor)}점 (누적 ${formatNumber(running)}점이 더 높아 유지)`, next: running };
+  }
   const delta = numberValue(item.delta);
   if (delta !== undefined) {
     const next = running + delta;
     return { text: `${formatNumber(running)} → ${formatNumber(next)} (${delta >= 0 ? '+' : ''}${formatNumber(delta)})`, next };
-  }
-  const floor = numberValue(item.score_floor);
-  if (floor !== undefined) {
-    if (floor > running) {
-      return { text: `${formatNumber(running)} → ${formatNumber(floor)} (바닥 보장, 가산 아님)`, next: floor };
-    }
-    return { text: `최소 ${formatNumber(floor)}점 (누적 ${formatNumber(running)}점 유지)`, next: running };
   }
   const factor = numberValue(item.factor);
   if (factor !== undefined) {
@@ -131,12 +138,25 @@ function parseScoreRows(candidate: UnknownRecord | undefined): ConfidenceScoreRo
     const stage = stringValue(item.stage) || stringValue(item.kind) || 'ranking';
     const label = stringValue(item.label) || stringValue(item.kind) || '점수 조정';
     const sourceGroups = strings(item.source_groups);
+    const evidenceIds = strings(item.evidence_ids);
     const singleSource = stringValue(item.source_group);
     if (singleSource && !sourceGroups.includes(singleSource)) sourceGroups.push(singleSource);
     const effect = scoreEffect(item, running);
     running = effect.next;
-    return [{ stage, label, effect: effect.text, sourceGroups }];
+    return [{ stage, label, effect: effect.text, sourceGroups, evidenceIds }];
   });
+}
+
+function rankingScoreFrame(candidate: UnknownRecord | undefined): string {
+  const gate = record(candidate?.confidence_gate);
+  const thresholds: string[] = [];
+  const scoreFloor = numberValue(gate?.score_floor);
+  const mediumThreshold = numberValue(gate?.medium_score_threshold);
+  const highThreshold = numberValue(gate?.high_score_threshold);
+  if (scoreFloor !== undefined) thresholds.push(`최소 ${formatNumber(scoreFloor)}점`);
+  if (mediumThreshold !== undefined) thresholds.push(`Medium ${formatNumber(mediumThreshold)}점`);
+  if (highThreshold !== undefined) thresholds.push(`High ${formatNumber(highThreshold)}점`);
+  return ['상한 없음', ...thresholds].join(' · ');
 }
 
 function gateDetail(candidate: UnknownRecord, key: string): string {
@@ -257,6 +277,7 @@ export function parseConfidenceBreakdown(
     preHarnessConfidence: stringValue(preHarnessCandidate?.confidence),
     finalFamily: stringValue(finalCandidate?.family),
     rankingScore: numberValue(rankingCandidate?.score),
+    rankingScoreFrame: rankingScoreFrame(rankingCandidate),
     finalConfidence: stringValue(finalCandidate?.confidence) || stringValue(rankingCandidate?.confidence),
     independentSourceGroups: strings(rankingCandidate?.independent_source_groups),
     scoreRows: parseScoreRows(rankingCandidate),
@@ -327,7 +348,7 @@ export function ConfidenceBreakdownPanel({
 
           <div className="confidence-summary" aria-label="Confidence 요약">
             <p><strong>후보 Family</strong><span>{view.family || '—'}</span></p>
-            <p><strong>Ranking 점수</strong><span>{view.rankingScore === undefined ? '—' : formatNumber(view.rankingScore)}</span></p>
+            <p><strong>Ranking 점수</strong><span>{view.rankingScore === undefined ? '—' : `${formatNumber(view.rankingScore)}점 (${view.rankingScoreFrame})`}</span></p>
             <p><strong>Ranking Confidence</strong><span>{view.rankingConfidence || '—'}</span></p>
             <p><strong>독립 Source Group</strong><span>{view.independentSourceGroups.length ? view.independentSourceGroups.join(', ') : '기록 없음'}</span></p>
           </div>
@@ -341,12 +362,12 @@ export function ConfidenceBreakdownPanel({
 
           <div className="confidence-subsection">
             <h3>Ranking 점수 내역</h3>
-            <p className="confidence-score-note">아래는 9점의 구성요소가 아니라, 0점부터 위에서 아래 순서로 적용한 계산 기록입니다. 최솟값 규칙은 점수를 더하지 않고 해당 값까지 올립니다.</p>
+            <p className="confidence-score-note">아래는 {view.rankingScore === undefined ? '이 후보' : `${formatNumber(view.rankingScore)}점`}의 구성요소가 아니라, 0점부터 위에서 아래 순서로 적용한 계산 기록입니다. 최솟값 규칙은 점수를 더하지 않고 해당 값까지 올립니다.</p>
             {view.scoreRows.length ? (
               <div className="confidence-table-scroll" role="region" aria-label="Ranking 점수 내역" tabIndex={0}>
                 <table className="confidence-table confidence-score-table">
                   <caption className="sr-only">결정론적 ranking 점수의 단계별 증감</caption>
-                  <thead><tr><th scope="col">단계</th><th scope="col">근거/규칙</th><th scope="col">누적 점수</th><th scope="col">Source Group</th></tr></thead>
+                  <thead><tr><th scope="col">단계</th><th scope="col">근거/규칙</th><th scope="col">누적 점수</th><th scope="col">Source Group</th><th scope="col">Evidence ID</th></tr></thead>
                   <tbody>
                     {view.scoreRows.map((row, index) => (
                       <tr key={`${row.stage}-${row.label}-${index}`}>
@@ -354,6 +375,7 @@ export function ConfidenceBreakdownPanel({
                         <th scope="row">{row.label}</th>
                         <td className="confidence-delta">{row.effect}</td>
                         <td>{row.sourceGroups.length ? row.sourceGroups.join(', ') : '—'}</td>
+                        <td>{row.evidenceIds.length ? row.evidenceIds.join(', ') : '—'}</td>
                       </tr>
                     ))}
                   </tbody>

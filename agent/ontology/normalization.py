@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 _CONFIDENCE_SCORES = {"high": 0.9, "medium": 0.7, "low": 0.4}
 _MISSING_WORKLOAD_NAMESPACE = "__missing_namespace__"
 

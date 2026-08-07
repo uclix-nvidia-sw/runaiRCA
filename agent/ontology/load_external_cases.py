@@ -48,12 +48,14 @@ from ontology import ingest
 from ontology.incident import OntologyIncident
 from ontology.load_knowledge import (
     FAMILIES,
-    _ensure_action,
     _ensure_symptom,
-    _relate_indicates,
-    _relate_resolved_by,
 )
 from ontology.normalization import confidence_score
+from ontology.upsert import (
+    ensure_action,
+    relate_symptom_indicates,
+    relate_symptom_resolved_by,
+)
 
 PAYLOAD_NAME = "03_ingestion_payload.yaml"
 # Baked into the agent image (agent/Dockerfile COPYs knowledge/); the Helm
@@ -478,13 +480,13 @@ def _write_case(
         "has_symptom", "incident", "symptom",
     )
     if chain:
-        _relate_indicates(tx, inc.incident_id, inc.root_cause_family)
+        relate_symptom_indicates(tx, inc.incident_id, inc.root_cause_family)
         for action in inc.successful_actions:
             statement = str(action.get("statement") or "").strip()
             if not statement:
                 continue
-            _ensure_action(tx, statement)
-            _relate_resolved_by(tx, inc.incident_id, statement)
+            ensure_action(tx, statement)
+            relate_symptom_resolved_by(tx, inc.incident_id, statement)
     else:
         # A case demoted AFTER previously entering the chain must lose its old
         # causal edges (its keywords self-reconcile inside _ensure_symptom).

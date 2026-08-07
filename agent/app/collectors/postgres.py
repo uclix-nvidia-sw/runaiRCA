@@ -351,20 +351,16 @@ async def _postgres_result(
     )
 
 
-async def _collect_postgres_checks(
-    conn: Any, target: AnalysisTarget, *, check_rca_tables: bool = True
-) -> dict[str, Any]:
-    await conn.fetchval("SELECT 1")
-    active_connections = await conn.fetchval(
-        """
-        SELECT count(*)
+# The direct-connection and MCP health checks ask the same questions; only the
+# transport differs. Output aliases are required by MCP (which returns rows as
+# dicts) and harmless for asyncpg fetchval, which takes the first column.
+_ACTIVE_CONNECTIONS_SQL = """
+        SELECT count(*) AS active_connections
         FROM pg_stat_activity
         WHERE datname = current_database()
           AND state <> 'idle'
         """
-    )
-    long_transactions = await conn.fetch(
-        """
+_LONG_TRANSACTIONS_SQL = """
         SELECT
           pid,
           usename,
@@ -380,9 +376,23 @@ async def _collect_postgres_checks(
         ORDER BY xact_start ASC
         LIMIT 5
         """
+_PGVECTOR_EXTENSION_SQL = (
+    "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') AS exists"
+)
+
+
+async def _collect_postgres_checks(
+    conn: Any, target: AnalysisTarget, *, check_rca_tables: bool = True
+) -> dict[str, Any]:
+    await conn.fetchval("SELECT 1")
+    active_connections = await conn.fetchval(
+        _ACTIVE_CONNECTIONS_SQL
+    )
+    long_transactions = await conn.fetch(
+        _LONG_TRANSACTIONS_SQL
     )
     pgvector_extension = await conn.fetchval(
-        "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')"
+        _PGVECTOR_EXTENSION_SQL
     )
     table_rows = []
     visible_tables = []
@@ -579,7 +589,15 @@ def _quoted_identifier(value: str) -> str:
     return f'"{value}"'
 
 
-def _history_query(table: dict[str, Any], *, mcp: bool, time_range: dict[str, str] | None) -> str:
+def _history_query_parts(
+    table: dict[str, Any], *, mcp: bool, time_range: dict[str, str] | None
+) -> tuple[str, str, str, str, str]:
+    """Quoted schema/table/timestamp identifiers plus the incident-window bounds.
+
+    MCP has no bind parameters, so its window is inlined as literals and an
+    absent range is refused outright: a history query without one would read the
+    whole table and present it as incident evidence.
+    """
     schema = _quoted_identifier(str(table["schema"]))
     name = _quoted_identifier(str(table["table"]))
     timestamp = _quoted_identifier(str(table["timestamp_column"]))
@@ -590,6 +608,13 @@ def _history_query(table: dict[str, Any], *, mcp: bool, time_range: dict[str, st
         end = f"'{time_range['end']}'::timestamptz"
     else:
         start, end = "$1::timestamptz", "$2::timestamptz"
+    return schema, name, timestamp, start, end
+
+
+def _history_query(table: dict[str, Any], *, mcp: bool, time_range: dict[str, str] | None) -> str:
+    schema, name, timestamp, start, end = _history_query_parts(
+        table, mcp=mcp, time_range=time_range
+    )
     columns = [f"{timestamp} AS event_time"]
     for column in table.get("context_columns", []):
         quoted = _quoted_identifier(str(column))
@@ -607,16 +632,9 @@ def _history_query(table: dict[str, Any], *, mcp: bool, time_range: dict[str, st
 def _history_aggregate_query(
     table: dict[str, Any], *, mcp: bool, time_range: dict[str, str] | None
 ) -> str:
-    schema = _quoted_identifier(str(table["schema"]))
-    name = _quoted_identifier(str(table["table"]))
-    timestamp = _quoted_identifier(str(table["timestamp_column"]))
-    if mcp:
-        if not time_range:
-            raise ValueError("incident time range is required for audit/history queries")
-        start = f"'{time_range['start']}'::timestamptz"
-        end = f"'{time_range['end']}'::timestamptz"
-    else:
-        start, end = "$1::timestamptz", "$2::timestamptz"
+    schema, name, timestamp, start, end = _history_query_parts(
+        table, mcp=mcp, time_range=time_range
+    )
     return f"""
         SELECT count(*) AS matching_rows,
                min({timestamp}) AS first_event_at,
@@ -625,6 +643,34 @@ def _history_aggregate_query(
         WHERE {timestamp} >= {start}
           AND {timestamp} <= {end}
     """
+
+
+_STRONG_TARGET_COLUMNS = frozenset(
+    {"workload", "workload_name", "workload_id", "pod", "pod_name", "resource_id"}
+)
+
+
+def _target_column_values(target: AnalysisTarget) -> dict[str, tuple[str, ...]]:
+    """Which alert-target values would prove a history row is about this target.
+
+    Deliberately a superset of _HISTORY_TARGET_COLUMNS: a namespace column can
+    CONFIRM a row that already matched on something narrower, but selecting rows
+    by namespace alone would return every workload in it, so namespace is absent
+    from the allowlist used to build the WHERE.
+    """
+    return {
+        "workload": (target.workload_name, target.runai_workload_id),
+        "workload_name": (target.workload_name,),
+        "workload_id": (target.runai_workload_id,),
+        "pod": (target.pod,),
+        "pod_name": (target.pod,),
+        "project": (target.project,),
+        "project_name": (target.project,),
+        "queue": (target.queue,),
+        "queue_name": (target.queue,),
+        "namespace": (target.namespace,),
+        "resource_id": (target.workload_name, target.runai_workload_id),
+    }
 
 
 def _history_target_clause(
@@ -638,23 +684,9 @@ def _history_target_clause(
     direct-DB value; MCP has no parameter channel, so encode its values as
     hexadecimal UTF-8 SQL expressions after constraining the column identifier.
     """
-    expected = {
-        "workload": (target.workload_name, target.runai_workload_id),
-        "workload_name": (target.workload_name,),
-        "workload_id": (target.runai_workload_id,),
-        "pod": (target.pod,),
-        "pod_name": (target.pod,),
-        "project": (target.project,),
-        "project_name": (target.project,),
-        "queue": (target.queue,),
-        "queue_name": (target.queue,),
-        "namespace": (target.namespace,),
-        "resource_id": (target.workload_name, target.runai_workload_id),
-    }
+    expected = _target_column_values(target)
     available = {str(column) for column in table.get("context_columns", [])}
-    strong_columns = frozenset(
-        {"workload", "workload_name", "workload_id", "pod", "pod_name", "resource_id"}
-    )
+    strong_columns = _STRONG_TARGET_COLUMNS
     has_strong_alert_identity = any(
         str(value).strip()
         for column in strong_columns
@@ -719,6 +751,26 @@ def _sql_text_expression(value: str) -> str:
     return f"convert_from(decode('{encoded}', 'hex'), 'UTF8')"
 
 
+def _history_target_parts(
+    table: dict[str, Any],
+    target: AnalysisTarget,
+    *,
+    mcp: bool,
+    time_range: dict[str, str] | None,
+) -> tuple[tuple[str, str, str, str, str], str, list[list[str]]] | None:
+    """Query parts plus the bound target predicate, or None when this table
+    carries no column that can prove a row belongs to the alert target."""
+    clause = _history_target_clause(table, target, mcp=mcp)
+    if clause is None:
+        return None
+    target_clause, parameters = clause
+    return (
+        _history_query_parts(table, mcp=mcp, time_range=time_range),
+        target_clause,
+        parameters,
+    )
+
+
 def _history_target_query(
     table: dict[str, Any],
     target: AnalysisTarget,
@@ -726,20 +778,10 @@ def _history_target_query(
     mcp: bool,
     time_range: dict[str, str] | None,
 ) -> tuple[str, list[list[str]]] | None:
-    clause = _history_target_clause(table, target, mcp=mcp)
-    if clause is None:
+    parts = _history_target_parts(table, target, mcp=mcp, time_range=time_range)
+    if parts is None:
         return None
-    target_clause, parameters = clause
-    schema = _quoted_identifier(str(table["schema"]))
-    name = _quoted_identifier(str(table["table"]))
-    timestamp = _quoted_identifier(str(table["timestamp_column"]))
-    if mcp:
-        if not time_range:
-            raise ValueError("incident time range is required for audit/history queries")
-        start = f"'{time_range['start']}'::timestamptz"
-        end = f"'{time_range['end']}'::timestamptz"
-    else:
-        start, end = "$1::timestamptz", "$2::timestamptz"
+    (schema, name, timestamp, start, end), target_clause, parameters = parts
     columns = [f"{timestamp} AS event_time"]
     for column in table.get("context_columns", []):
         quoted = _quoted_identifier(str(column))
@@ -764,20 +806,10 @@ def _history_target_aggregate_query(
     mcp: bool,
     time_range: dict[str, str] | None,
 ) -> tuple[str, list[list[str]]] | None:
-    clause = _history_target_clause(table, target, mcp=mcp)
-    if clause is None:
+    parts = _history_target_parts(table, target, mcp=mcp, time_range=time_range)
+    if parts is None:
         return None
-    target_clause, parameters = clause
-    schema = _quoted_identifier(str(table["schema"]))
-    name = _quoted_identifier(str(table["table"]))
-    timestamp = _quoted_identifier(str(table["timestamp_column"]))
-    if mcp:
-        if not time_range:
-            raise ValueError("incident time range is required for audit/history queries")
-        start = f"'{time_range['start']}'::timestamptz"
-        end = f"'{time_range['end']}'::timestamptz"
-    else:
-        start, end = "$1::timestamptz", "$2::timestamptz"
+    (schema, name, timestamp, start, end), target_clause, parameters = parts
     return (
         f"""
         SELECT count(*) AS matching_rows,
@@ -899,34 +931,14 @@ async def _collect_postgres_checks_mcp(
     await _mcp_fetchval(settings, "SELECT 1 AS ok")
     active_connections = await _mcp_fetchval(
         settings,
-        """
-        SELECT count(*) AS active_connections
-        FROM pg_stat_activity
-        WHERE datname = current_database()
-          AND state <> 'idle'
-        """,
+        _ACTIVE_CONNECTIONS_SQL,
     )
     long_transactions = await _mcp_fetch(
         settings,
-        """
-        SELECT
-          pid,
-          usename,
-          state,
-          wait_event_type,
-          wait_event,
-          (now() - xact_start)::text AS xact_age,
-          left(coalesce(query, ''), 240) AS query
-        FROM pg_stat_activity
-        WHERE xact_start IS NOT NULL
-          AND state <> 'idle'
-          AND now() - xact_start > interval '5 minutes'
-        ORDER BY xact_start ASC
-        LIMIT 5
-        """,
+        _LONG_TRANSACTIONS_SQL,
     )
     pgvector_extension = await _mcp_fetchval(
-        settings, "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') AS exists"
+        settings, _PGVECTOR_EXTENSION_SQL
     )
     table_rows: list[dict[str, Any]] = []
     visible_tables: list[dict[str, Any]] = []
@@ -999,19 +1011,6 @@ async def _mcp_fetchval(settings: Settings, sql: str) -> Any:
         return None
     first = rows[0]
     return next(iter(first.values()), None)
-
-
-def _postgres_rows(data: Any) -> list[Any]:
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        for key in ("rows", "result", "data"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
-        if all(not isinstance(value, (list, dict)) for value in data.values()):
-            return [data]
-    return []
 
 
 def _mcp_postgres_rows(data: Any) -> list[Any] | None:
@@ -1255,20 +1254,8 @@ def _target_history_row_entity(
     row: dict[str, Any], table: dict[str, Any], target: AnalysisTarget
 ) -> dict[str, str] | None:
     """Return a row-proven target identity, never a fallback target label."""
-    expected = {
-        "workload": (target.workload_name, target.runai_workload_id),
-        "workload_name": (target.workload_name,),
-        "workload_id": (target.runai_workload_id,),
-        "pod": (target.pod,),
-        "pod_name": (target.pod,),
-        "project": (target.project,),
-        "project_name": (target.project,),
-        "queue": (target.queue,),
-        "queue_name": (target.queue,),
-        "namespace": (target.namespace,),
-        "resource_id": (target.workload_name, target.runai_workload_id),
-    }
-    strong_columns = {"workload", "workload_name", "workload_id", "pod", "pod_name", "resource_id"}
+    expected = _target_column_values(target)
+    strong_columns = _STRONG_TARGET_COLUMNS
     has_strong_target = any(
         str(value).strip() for column in strong_columns for value in expected[column]
     )

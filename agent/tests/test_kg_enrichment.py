@@ -23,8 +23,8 @@ from app.services.kg_enrichment import (
     enrich,
 )
 from app.services.pipeline import (
+    ReportKnowledge,
     _causal_chain_line,
-    _graph_remediation_lines,
     _knowledge_base_lines,
     _playbook_lines,
     _xid_diagnostic_guidance_lines,
@@ -230,7 +230,7 @@ def test_query_remediation_projects_xid_trigger_and_renders_guidance() -> None:
 
     assert out.xid_triggers == {79: "Check for PCIe link errors before reset."}
     assert out.as_dict()["xid_triggers"] == {"79": "Check for PCIe link errors before reset."}
-    rendered = "\n".join(_graph_remediation_lines(out))
+    rendered = "\n".join(_xid_diagnostic_guidance_lines(out, "en"))
     assert "Diagnostic guidance (XID 79" in rendered
     assert "Check for PCIe link errors before reset." in rendered
     # This FakeClient never returns a detail_for_xid() row, but XID 79 is a
@@ -826,19 +826,15 @@ def test_typedb_symptom_component_preserves_yaml_playbook_checks() -> None:
     }
 
     typedb_lines = _playbook_lines(
-        None,
-        "cluster sync unhealthy",
-        {"runai_control_plane_error": [typedb_symptom]},
-        "",
-        components=components,
-    )
+                       None,
+                       "cluster sync unhealthy",
+                       knowledge=ReportKnowledge(failure_modes={"runai_control_plane_error": [typedb_symptom]}, cases="", components=components),
+                   )
     yaml_lines = _playbook_lines(
-        None,
-        "cluster sync unhealthy",
-        {"runai_control_plane_error": [{**typedb_symptom}]},
-        "",
-        components=components,
-    )
+                     None,
+                     "cluster sync unhealthy",
+                     knowledge=ReportKnowledge(failure_modes={"runai_control_plane_error": [{**typedb_symptom}]}, cases="", components=components),
+                 )
 
     assert typedb_lines == yaml_lines
     assert "Check order: cluster-sync → runai-backend" in "\n".join(typedb_lines)

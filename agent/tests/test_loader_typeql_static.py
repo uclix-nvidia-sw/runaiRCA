@@ -1,6 +1,7 @@
 """Static guardrail for the TypeDB loaders, which have NO live-DB test coverage.
 
-Every loader's `_exists(tx, match)` helper wraps the match as
+The shared `exists(tx, match)` helper (ontology/upsert.py, once copied into six
+loaders) wraps the match as
 `match {match} select $x;` — so the match snippet MUST bind `$x`. A copied
 helper that bound `$s` instead shipped and crashed the schema-load Job on the
 first live TypeDB run ([REP18] The variable 'x' was not available). This test
@@ -16,7 +17,7 @@ from pathlib import Path
 import pytest
 
 ONTOLOGY = Path(__file__).parents[1] / "ontology"
-LOADERS = sorted(ONTOLOGY.glob("load_*.py")) + [ONTOLOGY / "ingest.py"]
+LOADERS = sorted(ONTOLOGY.glob("load_*.py")) + [ONTOLOGY / "ingest.py", ONTOLOGY / "upsert.py"]
 
 
 def _literal_text(node: ast.AST) -> str:
@@ -35,7 +36,7 @@ def _exists_calls(tree: ast.AST):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
-            and node.func.id == "_exists"
+            and node.func.id in ("exists", "_exists")
             and len(node.args) >= 2
         ):
             yield node
@@ -51,7 +52,7 @@ def test_every_exists_match_binds_dollar_x(path: Path) -> None:
             continue  # non-literal match (built elsewhere) — out of scope
         checked += 1
         assert "$x" in text, (
-            f"{path.name}:{call.lineno}: _exists() match does not bind $x — the "
+            f"{path.name}:{call.lineno}: exists() match does not bind $x — the "
             f"helper runs `match ... select $x;`, so this fails on a live TypeDB "
             f"with [REP18]. Match text: {text!r}"
         )

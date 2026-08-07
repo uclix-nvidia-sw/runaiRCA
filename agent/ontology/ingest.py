@@ -36,14 +36,16 @@ from app.masking import build_masker
 from app.ontology.typedb_client import escape_typeql as esc
 from ontology.incident import OntologyIncident
 from ontology.load_knowledge import (
-    _ensure_action,
     _ensure_cause,
     _ensure_symptom,
-    _relate_indicates,
-    _relate_resolved_by,
-    _selected_values,
 )
 from ontology.normalization import confidence_score, workload_uid
+from ontology.upsert import (
+    ensure_action,
+    relate_symptom_indicates,
+    relate_symptom_resolved_by,
+    selected_values,
+)
 
 _log = logging.getLogger(__name__)
 _MASKER = build_masker((r"\b(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}\b",))
@@ -727,35 +729,14 @@ def _relate_trace_evidence(
     _trace_relation(tx, match, edge, f"$x isa {relation}, links (claim: $h, proof: $e)")
 
 
-def _write_trace_v3_projection(tx: Any, inc: OntologyIncident, ensured_evidence: set[str]) -> None:
-    """Write only the explicit, versioned hypothesis/probe trace contract."""
-    trace = inc.reasoning_trace_v3
-    if not inc.run_id or not isinstance(trace, dict):
-        return
-    try:
-        version = int(trace.get("schema_version") or 0)
-    except (TypeError, ValueError):
-        return
-    if version != 3:
-        return
-
-    raw_hypotheses = trace.get("hypotheses")
-    raw_evidence = trace.get("evidence")
-    raw_executions = trace.get("probe_executions")
-    if not isinstance(raw_hypotheses, list):
-        raw_hypotheses = []
-    if not isinstance(raw_evidence, list):
-        raw_evidence = []
-    if not isinstance(raw_executions, list):
-        raw_executions = []
-    _clear_trace_v3_projection(tx, inc.run_id)
-
-    evidence = {
-        evidence_id: evidence_id
-        for item in raw_evidence
-        if isinstance(item, dict)
-        if (evidence_id := _ensure_trace_evidence(tx, inc, item, ensured_evidence))
-    }
+def _write_trace_hypotheses(
+    tx: Any,
+    inc: OntologyIncident,
+    raw_hypotheses: list,
+    evidence: dict[str, str],
+    version: int,
+) -> dict[str, str]:
+    """Each hypothesis node, its run/incident edge, and its evidence links."""
     hypothesis_ids: dict[str, str] = {}
     for item in raw_hypotheses:
         if not isinstance(item, dict):
@@ -789,7 +770,18 @@ def _write_trace_v3_projection(tx: Any, inc: OntologyIncident, ensured_evidence:
         for evidence_id in item.get("evidence_against") or []:
             if _trace_id(evidence_id) in evidence:
                 _relate_trace_evidence(tx, hypothesis_id, evidence[_trace_id(evidence_id)], "contradicted_by")
+    return hypothesis_ids
 
+
+def _write_trace_probe_executions(
+    tx: Any,
+    inc: OntologyIncident,
+    raw_executions: list,
+    evidence: dict[str, str],
+    hypothesis_ids: dict[str, str],
+    version: int,
+) -> None:
+    """Each probe execution, bound to its authored template, hypotheses, evidence."""
     for item in raw_executions:
         if not isinstance(item, dict):
             continue
@@ -835,6 +827,11 @@ def _write_trace_v3_projection(tx: Any, inc: OntologyIncident, ensured_evidence:
             eedge = "$link isa probe_execution_evidence, links (execution: $x, proof: $e)"
             _trace_relation(tx, ematch, eedge, "$link isa probe_execution_evidence, links (execution: $x, proof: $e)")
 
+
+def _write_trace_rejected_links(
+    tx: Any, trace: dict, evidence: dict[str, str], hypothesis_ids: dict[str, str]
+) -> None:
+    """Evidence a hypothesis explicitly refused, with the stated reason."""
     for item in trace.get("rejected_evidence_links") or []:
         if not isinstance(item, dict):
             continue
@@ -851,6 +848,42 @@ def _write_trace_v3_projection(tx: Any, inc: OntologyIncident, ensured_evidence:
         if not list(tx.query(f"match {match} {edge}; select $x;").resolve().as_concept_rows()):
             suffix = f', has rejection_reason "{esc(reason)}"' if reason else ""
             tx.query(f"match {match} insert $x isa rejected_evidence_link, links (hypothesis: $h, proof: $e){suffix};").resolve()
+
+
+def _write_trace_v3_projection(tx: Any, inc: OntologyIncident, ensured_evidence: set[str]) -> None:
+    """Write only the explicit, versioned hypothesis/probe trace contract."""
+    trace = inc.reasoning_trace_v3
+    if not inc.run_id or not isinstance(trace, dict):
+        return
+    try:
+        version = int(trace.get("schema_version") or 0)
+    except (TypeError, ValueError):
+        return
+    if version != 3:
+        return
+
+    raw_hypotheses = trace.get("hypotheses")
+    raw_evidence = trace.get("evidence")
+    raw_executions = trace.get("probe_executions")
+    if not isinstance(raw_hypotheses, list):
+        raw_hypotheses = []
+    if not isinstance(raw_evidence, list):
+        raw_evidence = []
+    if not isinstance(raw_executions, list):
+        raw_executions = []
+    _clear_trace_v3_projection(tx, inc.run_id)
+
+    evidence = {
+        evidence_id: evidence_id
+        for item in raw_evidence
+        if isinstance(item, dict)
+        if (evidence_id := _ensure_trace_evidence(tx, inc, item, ensured_evidence))
+    }
+    hypothesis_ids = _write_trace_hypotheses(tx, inc, raw_hypotheses, evidence, version)
+    _write_trace_probe_executions(
+        tx, inc, raw_executions, evidence, hypothesis_ids, version
+    )
+    _write_trace_rejected_links(tx, trace, evidence, hypothesis_ids)
     stop_reason = _trace_text(trace.get("stop_reason"), 300)
     if stop_reason:
         _replace_attr(tx, "analysis_run", "run_id", inc.run_id, "trace_stop_reason", stop_reason)
@@ -982,7 +1015,7 @@ def _ensure_resolution(
     outcome = str(action.get("outcome") or "").strip()
     if not statement or outcome not in {"resolved", "mitigated", "ineffective"}:
         return
-    _ensure_action(tx, statement)
+    ensure_action(tx, statement)
     match = (
         f'$r isa analysis_run, has run_id "{esc(inc.run_id)}"; '
         f'$i isa incident, has incident_id "{esc(inc.incident_id)}"; '
@@ -1243,28 +1276,6 @@ _ACTION_CAP = 3
 _ACTION_MAXLEN = 200
 
 
-def _extract_actions(detail: str) -> list[str]:
-    """Bullet lines from the Recommended-Actions section only.
-
-    The heading appears as '## Recommended Actions', numbered
-    '## 3. Recommended Actions', or Korean '## 3. 권장 조치 (Recommended Actions)'
-    depending on language/report shape — match the phrase, not an exact prefix."""
-    actions: list[str] = []
-    in_section = False
-    for line in (detail or "").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("## "):
-            in_section = "recommended actions" in stripped.lower() or "권장 조치" in stripped
-            continue
-        if in_section and stripped.startswith("- "):
-            text = stripped[2:].strip().strip("*").strip()
-            if text:
-                actions.append(text[:_ACTION_MAXLEN])
-        if len(actions) >= _ACTION_CAP:
-            break
-    return actions
-
-
 def _action_statements(value: Any) -> list[str]:
     """Return only outcome-qualified action text from the CaseCard SQL shape."""
     structured = [
@@ -1349,10 +1360,10 @@ def _promote_one(tx: Any, alert_name: str, family: str, actions: list[str]) -> N
     name = f"{_PROMOTED_PREFIX}{alert_name}"
     _ensure_cause(tx, family)
     _ensure_symptom(tx, name, [alert_name.strip().lower()])
-    _relate_indicates(tx, name, family)
+    relate_symptom_indicates(tx, name, family)
     for statement in actions[:_ACTION_CAP]:
-        _ensure_action(tx, statement)
-        _relate_resolved_by(tx, name, statement)
+        ensure_action(tx, statement)
+        relate_symptom_resolved_by(tx, name, statement)
 
 
 def _purge_promoted_one(tx: Any, name: str) -> None:
@@ -1389,7 +1400,7 @@ def _purge_promoted_knowledge() -> int:
         with driver.transaction(settings.typedb_database, TransactionType.READ) as tx:
             names = sorted(
                 name
-                for name in _selected_values(tx, "$s isa symptom, has name $n;", "n")
+                for name in selected_values(tx, "$s isa symptom, has name $n;", "n")
                 if name.startswith(_PROMOTED_PREFIX)
             )
         if not names:

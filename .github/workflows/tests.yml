@@ -41,6 +41,14 @@ jobs:
         env:
           RCA_TEST_POSTGRES_DSN: postgres://rca:rca@localhost:5432/rcatest?sslmode=disable
         run: go test ./...
+      # The store's writers release the memory lock across their Postgres round
+      # trips, so a mistake there is a data race rather than a failed assertion
+      # and the plain run above cannot see it. Runs without the Postgres DSN:
+      # this step is here for the concurrency, and the integration tests already
+      # had their turn.
+      - name: Test (race)
+        working-directory: backend
+        run: go test -race ./...
 
   agent:
     runs-on: ubuntu-latest
@@ -99,7 +107,8 @@ jobs:
         run: ENABLE_RCA_OUTPUT_HARNESS=false python -m eval.check_nat_eval --min-avg 1.0
 
   ontology-definitions:
-    # Compiles schema and function definitions only; it does not load knowledge data.
+    # Compiles schema and function definitions, then runs the loader-graph test,
+    # whose fixture loads knowledge/alerts/known-issues into a scratch database.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -130,6 +139,20 @@ jobs:
         run: |
           ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 TYPEDB_USERNAME=admin TYPEDB_PASSWORD=password TYPEDB_DATABASE=ci_schema_check TYPEDB_TLS_ENABLED=false python -m ontology.load_schema
           ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 TYPEDB_USERNAME=admin TYPEDB_PASSWORD=password TYPEDB_DATABASE=ci_schema_check TYPEDB_TLS_ENABLED=false python -m ontology.load_functions
+      - name: Loader graph behaviour
+        # Skips itself without TYPEDB_ADDRESS. The fake-transaction tests can see
+        # the TypeQL text but not the graph, so a relation that is written and
+        # never retired is invisible to them.
+        working-directory: agent
+        env:
+          RCA_TEST_TYPEDB: "1"
+          ENABLE_TYPEDB: "true"
+          TYPEDB_ADDRESS: localhost:1729
+          TYPEDB_USERNAME: admin
+          TYPEDB_PASSWORD: password
+          TYPEDB_DATABASE: ci_loader_check
+          TYPEDB_TLS_ENABLED: "false"
+        run: python -m pytest tests/test_typedb_integration.py -q
 
   frontend:
     runs-on: ubuntu-latest
@@ -144,6 +167,11 @@ jobs:
       - name: Install
         working-directory: frontend
         run: npm ci
+      - name: Lint
+        working-directory: frontend
+        # Rules of Hooks only. A hook behind an early return type-checks, builds,
+        # and passes every unit test, then crashes the panel at runtime.
+        run: npm run lint
       - name: Build
         working-directory: frontend
         run: npm run build

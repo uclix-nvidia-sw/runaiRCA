@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -253,5 +254,84 @@ func TestPostgresReactivationAfterRetirementPersists(t *testing.T) {
 	}
 	if candidateID != second.CandidateID || status != knowledgePackageActive {
 		t.Fatalf("package not republished: candidate=%s status=%s", candidateID, status)
+	}
+}
+
+// Concurrent webhooks for the same alert must leave Postgres agreeing with
+// memory. Each firing here carries a strictly newer StartsAt, so every one is a
+// NEW episode that bumps FiredAt and the occurrence count — which is what makes
+// a lost update visible at all.
+//
+// This started as a test for an off-lock write path that has since been
+// withdrawn (see UpsertAlertResult). It is kept because it is the only place
+// that checks the webhook's rows survive a reload from Postgres alone, and
+// because it is exactly the test that would catch that design coming back
+// without the ordering it needs: with the writes moved off the store lock and
+// unordered, it fails 5 runs out of 5 with "a later writer committed first".
+func TestPostgresConcurrentWebhooksLeaveNoStaleRow(t *testing.T) {
+	store := postgresTestStore(t)
+	webhook := AlertmanagerWebhook{}
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	firing := func(i int) Alert {
+		return Alert{
+			Status:      "firing",
+			Labels:      map[string]string{"alertname": "KubePodNotReady", "namespace": "runai", "pod": "p1"},
+			Annotations: map[string]string{"summary": "pod not ready"},
+			StartsAt:    base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+		}
+	}
+	first := store.UpsertAlertResult(webhook, firing(0))
+	if first.Alert.AlertID == "" || first.Incident.IncidentID == "" {
+		t.Fatalf("upsert produced no ids: %+v", first)
+	}
+
+	var wg sync.WaitGroup
+	for i := 1; i <= 24; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			store.UpsertAlertResult(webhook, firing(i))
+		}(i)
+	}
+	wg.Wait()
+
+	// Reload a fresh Store from Postgres alone and compare with memory.
+	reloaded := NewStore()
+	reloaded.ConnectDatabase(os.Getenv("RCA_TEST_POSTGRES_DSN"), 15*time.Second)
+	if !reloaded.dbReady {
+		t.Fatal("reload store did not become ready")
+	}
+	store.mu.RLock()
+	wantAlert := cloneAlert(store.alerts[first.Alert.AlertID])
+	wantIncident := cloneIncident(store.incidents[first.Incident.IncidentID])
+	store.mu.RUnlock()
+	if wantAlert == nil || wantIncident == nil {
+		t.Fatal("in-memory rows disappeared")
+	}
+	if wantAlert.OccurrenceCount < 2 {
+		t.Fatalf("fixture did not produce competing writers: occurrence_count=%d", wantAlert.OccurrenceCount)
+	}
+
+	reloaded.mu.RLock()
+	gotAlert := reloaded.alerts[first.Alert.AlertID]
+	gotIncident := reloaded.incidents[first.Incident.IncidentID]
+	reloaded.mu.RUnlock()
+	if gotAlert == nil {
+		t.Fatalf("alert %s never reached Postgres", first.Alert.AlertID)
+	}
+	if gotIncident == nil {
+		t.Fatalf("incident %s never reached Postgres", first.Incident.IncidentID)
+	}
+	if !gotAlert.FiredAt.Equal(wantAlert.FiredAt) {
+		t.Fatalf("persisted alert is stale: fired_at db=%v memory=%v (a later writer committed first)",
+			gotAlert.FiredAt, wantAlert.FiredAt)
+	}
+	if gotAlert.OccurrenceCount != wantAlert.OccurrenceCount {
+		t.Fatalf("persisted alert is stale: occurrence_count db=%d memory=%d",
+			gotAlert.OccurrenceCount, wantAlert.OccurrenceCount)
+	}
+	if gotIncident.AlertCount != wantIncident.AlertCount {
+		t.Fatalf("persisted incident is stale: alert_count db=%d memory=%d",
+			gotIncident.AlertCount, wantIncident.AlertCount)
 	}
 }

@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from hashlib import sha256
 
 from app import knowledge as knowledge_module
@@ -695,38 +696,70 @@ def _component_narrative(
     )
 
 
-async def plan_investigation(
+@dataclass
+class _PlanLeads:
+    """What the deterministic planner concluded before narrative or LLM refinement.
+
+    Every field here can promote a family, and the focus/narrative text below all
+    read the same set, so they travel together instead of as a dozen locals.
+    """
+
+    hypotheses: list[dict]
+    namespaces: list[str]
+    planned_workload: str
+    component: str
+    component_entry: dict | None
+    architecture: object
+    matched_alert: dict | None
+    change_lead: dict | None
+    symptom_lead: dict | None
+    keyword_signal: bool
+    node_focused: bool
+    check_control_plane: bool
+    scope: str
+    strategy: str
+    used_similarity: bool
+    used_ontology: bool
+    best_similar: object
+    seed_family: str
+    seed_valid: bool
+
+    @property
+    def leader_earned(self) -> bool:
+        """Did anything actually EARN the leading hypothesis, or is it just the
+        declaration-order tiebreak? A namespace scope, a documented alert, a
+        node-level alert, or a keyword hit all count as real signal."""
+        return bool(
+            self.keyword_signal
+            or self.matched_alert
+            or self.component
+            or self.change_lead
+            or self.symptom_lead
+            or self.scope in _SCOPE_LEAD
+            or self.node_focused
+            or self.seed_valid
+        )
+
+
+def _collect_leads(
     settings: Settings,
     target: AnalysisTarget,
     alert,
-    kg_context: dict | None,
-    similar_incidents: list | None,
-    recent_changes: list[dict] | None = None,
-    seed_family: str = "",
-) -> InvestigationPlan:
-    kg_context = kg_context or {}
-    similar_incidents = similar_incidents or []
-    recent_changes = recent_changes or []
-    alert_text = _alert_haystack(target, alert)
-
+    alert_text: str,
+    kg_context: dict,
+    similar_incidents: list,
+    recent_changes: list[dict],
+    family_catalog,
+    seed_family: str,
+    seed_valid: bool,
+) -> _PlanLeads:
+    """Rank the failure families from the alert's own identity and context."""
     namespaces = [target.namespace] if target.namespace else []
     check_control_plane = _implicates_control_plane(target)
     if check_control_plane:
         for ns in settings.runai_log_namespaces:
             if ns and ns not in namespaces:
                 namespaces.append(ns)
-
-    family_catalog = load_family_catalog(settings.families_file)
-    seed_family = str(seed_family or "").strip()
-    plan_warnings: list[str] = []
-    seed_valid = seed_family in family_catalog.families
-    if seed_family and not seed_valid:
-        plan_warnings.append(
-            f"operator seed_family '{seed_family}' is not in the root-cause family catalog and was ignored"
-        )
-    diagnostic_directive = _diagnostic_directive(
-        settings, kg_context, alert_text, family_catalog, seed_family if seed_valid else ""
-    )
     hypotheses, keyword_signal = _ordered_hypotheses(target, family_catalog)
     # Namespace decides the emphasis: a Run:ai platform namespace (runai/runai-backend)
     # means the control plane itself is unhealthy -> lead control-plane + node/system
@@ -841,16 +874,32 @@ async def plan_investigation(
     # Did anything actually EARN the leading hypothesis, or is it just the
     # declaration-order tiebreak? A namespace scope, a documented alert, a
     # node-level alert, or a keyword hit all count as real signal.
-    leader_earned = (
-        keyword_signal
-        or bool(matched_alert)
-        or bool(component)
-        or bool(change_lead)
-        or bool(symptom_lead)
-        or scope in _SCOPE_LEAD
-        or node_focused
-        or seed_valid
+    return _PlanLeads(
+        hypotheses=hypotheses,
+        namespaces=namespaces,
+        planned_workload=planned_workload,
+        component=component,
+        component_entry=component_entry,
+        architecture=architecture,
+        matched_alert=matched_alert,
+        change_lead=change_lead,
+        symptom_lead=symptom_lead,
+        keyword_signal=keyword_signal,
+        node_focused=node_focused,
+        check_control_plane=check_control_plane,
+        scope=scope,
+        strategy=strategy,
+        used_similarity=used_similarity,
+        used_ontology=used_ontology,
+        best_similar=best_similar,
+        seed_family=seed_family,
+        seed_valid=seed_valid,
     )
+
+
+def _plan_focus(target: AnalysisTarget, leads: _PlanLeads) -> tuple[str, list[dict]]:
+    """The one-line focus, plus the hypotheses it may have had to demote."""
+    hypotheses, leader_earned = leads.hypotheses, leads.leader_earned
     where = target.workload_name or target.pod or target.namespace or "the cluster"
     if not leader_earned:
         # No signal at all: don't let node_kubelet_pressure masquerade as the
@@ -870,7 +919,18 @@ async def plan_investigation(
             f"{target.alert_name or 'alert'} on {where} "
             f"— most likely {hypotheses[0]['family'].replace('_', ' ')}"
         )
+    return focus, hypotheses
 
+
+def _plan_narrative(settings: Settings, target: AnalysisTarget, leads: _PlanLeads) -> str:
+    """Operator-facing prose for why the plan investigates the way it does."""
+    strategy, scope = leads.strategy, leads.scope
+    used_similarity, used_ontology = leads.used_similarity, leads.used_ontology
+    best_similar, matched_alert = leads.best_similar, leads.matched_alert
+    change_lead, node_focused = leads.change_lead, leads.node_focused
+    component_entry, component = leads.component_entry, leads.component
+    check_control_plane = leads.check_control_plane
+    seed_family, seed_valid = leads.seed_family, leads.seed_valid
     if strategy == "targeted":
         matched: list[str] = []
         if used_similarity:
@@ -945,24 +1005,67 @@ async def plan_investigation(
             f"A seeded root-cause family selected {seed_family} as the leading hypothesis. "
             "Collect evidence that could confirm or refute it. " + narrative
         )
+    return narrative
+
+
+async def plan_investigation(
+    settings: Settings,
+    target: AnalysisTarget,
+    alert,
+    kg_context: dict | None,
+    similar_incidents: list | None,
+    recent_changes: list[dict] | None = None,
+    seed_family: str = "",
+) -> InvestigationPlan:
+    kg_context = kg_context or {}
+    similar_incidents = similar_incidents or []
+    recent_changes = recent_changes or []
+    alert_text = _alert_haystack(target, alert)
+
+    family_catalog = load_family_catalog(settings.families_file)
+    seed_family = str(seed_family or "").strip()
+    plan_warnings: list[str] = []
+    seed_valid = seed_family in family_catalog.families
+    if seed_family and not seed_valid:
+        plan_warnings.append(
+            f"operator seed_family '{seed_family}' is not in the root-cause family catalog and was ignored"
+        )
+    diagnostic_directive = _diagnostic_directive(
+        settings, kg_context, alert_text, family_catalog, seed_family if seed_valid else ""
+    )
+    leads = _collect_leads(
+        settings,
+        target,
+        alert,
+        alert_text,
+        kg_context,
+        similar_incidents,
+        recent_changes,
+        family_catalog,
+        seed_family,
+        seed_valid,
+    )
+    focus, hypotheses = _plan_focus(target, leads)
+    narrative = _plan_narrative(settings, target, leads)
+    architecture, matched_alert = leads.architecture, leads.matched_alert
 
     annotations = getattr(alert, "annotations", None) or {}
     run_id = str(annotations.get("analysis_run_id") or "").strip()
     hypotheses = _assign_hypothesis_ids(hypotheses, run_id)
     plan = InvestigationPlan(
         focus=focus,
-        namespaces=namespaces,
+        namespaces=leads.namespaces,
         node=target.node or "",
-        workload=planned_workload,
+        workload=leads.planned_workload,
         pod=target.pod or "",
-        check_control_plane=check_control_plane,
+        check_control_plane=leads.check_control_plane,
         hypotheses=hypotheses,
-        strategy=strategy,
-        used_similarity=used_similarity,
-        used_ontology=used_ontology,
+        strategy=leads.strategy,
+        used_similarity=leads.used_similarity,
+        used_ontology=leads.used_ontology,
         narrative=narrative,
         matched_alert=matched_alert,
-        component=component,
+        component=leads.component,
         diagnostic_directive=diagnostic_directive,
         case_cards=list(kg_context.get("case_cards") or [])[:3],
         warnings=plan_warnings,

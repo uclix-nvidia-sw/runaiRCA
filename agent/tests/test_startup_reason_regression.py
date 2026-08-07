@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from app.collectors.base import CollectorResult, artifact
+from app.collectors.base import CollectorResult
 from app.collectors.kubernetes import _container_lifecycle_artifact, _pod_scheduling_artifact
 from app.plan import InvestigationPlan
 from app.services.evidence_blackboard import Blackboard

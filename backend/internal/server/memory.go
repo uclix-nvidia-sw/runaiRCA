@@ -141,12 +141,6 @@ func (e *embedder) embedResultContext(ctx context.Context, text string) embedRes
 	return embedResult{vector: normalize(vector), basis: embeddingBasisRemote}
 }
 
-// remoteEmbed POSTs to {endpoint}/embeddings and returns the raw model vector.
-// The response follows the OpenAI embeddings schema: {"data":[{"embedding":[...]}]}.
-func (e *embedder) remoteEmbed(text string) ([]float32, error) {
-	return e.remoteEmbedContext(context.Background(), text)
-}
-
 func (e *embedder) remoteEmbedContext(parent context.Context, text string) ([]float32, error) {
 	body, err := json.Marshal(map[string]any{"model": e.model, "input": text})
 	if err != nil {
@@ -378,16 +372,12 @@ func (s *Store) SearchIncidentMemoryExcluding(
 			RetrievalKind:    retrievalKindSparseIdentity,
 		})
 	}
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].Similarity == results[j].Similarity {
-			return results[i].CreatedAt.After(results[j].CreatedAt)
-		}
-		return results[i].Similarity > results[j].Similarity
-	})
-	return dedupeSimilarByIncident(results, limit)
+	return rankSimilar(results, limit)
 }
 
 func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	alert := s.alerts[alertID]
@@ -423,6 +413,8 @@ func (s *Store) ApplyAnalysis(alertID string, response AgentAnalysisResponse) {
 // for the alert since runID — i.e. this run's result is stale and will not be
 // applied. Lets callers distinguish "superseded" from a real persistence failure.
 func (s *Store) IsSupersededAnalysisRun(runID string, alertID string) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.alerts[alertID] != nil && !s.isLatestAnalysisRunForAlertLocked(runID, alertID)
@@ -433,6 +425,8 @@ func (s *Store) IsSupersededAnalysisRun(runID string, alertID string) bool {
 // operator-triggered run; those stale results remain auditable in analysis_runs
 // but must not overwrite the visible RCA.
 func (s *Store) ApplyAnalysisForRun(runID string, alertID string, response AgentAnalysisResponse) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	alert := s.alerts[alertID]
@@ -484,14 +478,6 @@ func (s *Store) applyAnalysisLocked(alert *AlertRecord, response AgentAnalysisRe
 	s.invalidateRecurrenceStatsLocked()
 }
 
-func (s *Store) MarkAnalyzing(incidentID string, analyzing bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if incident := s.incidents[incidentID]; incident != nil {
-		incident.IsAnalyzing = analyzing
-	}
-}
-
 // BeginAnalyzing flags the incident and alert as analyzing so the dashboard can
 // render an in-progress state for the whole lifecycle, and records the start as
 // incident activity. Starting an analysis IS activity, so the ordinary
@@ -499,6 +485,8 @@ func (s *Store) MarkAnalyzing(incidentID string, analyzing bool) {
 // incident list needs no separate analyzing-first sort branch.
 func (s *Store) BeginAnalyzing(incidentID string, alertID string) {
 	now := time.Now().UTC()
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if incident := s.incidents[incidentID]; incident != nil {
@@ -519,25 +507,12 @@ func (s *Store) BeginManualAnalysis(incidentID string, alertID string) {
 	s.BeginAnalyzing(incidentID, alertID)
 }
 
-// ApplyFallbackAnalysisIfAbsent implements the overwrite policy for failed runs:
-// a successful RCA already attached to the alert is always preserved, and the
-// fallback RCA is only surfaced on the alert when there is nothing to keep. It
-// returns true when the fallback was written. The analyzing flags are cleared in
-// both cases. Fallback RCA is never written to incident memory.
-func (s *Store) ApplyFallbackAnalysisIfAbsent(alertID string, response AgentAnalysisResponse) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	alert := s.alerts[alertID]
-	if alert == nil {
-		return false
-	}
-	return s.applyFallbackAnalysisIfAbsentLocked(alert, response)
-}
-
 // ApplyFallbackAnalysisIfAbsentForRun is the guarded version used by async run
 // completion. It prevents an older failed run from clearing the analyzing state
 // or surfacing fallback text after a newer run has already started.
 func (s *Store) ApplyFallbackAnalysisIfAbsentForRun(runID string, alertID string, response AgentAnalysisResponse) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	alert := s.alerts[alertID]
@@ -707,13 +682,7 @@ func (s *Store) similarIncidentsLocked(
 			RetrievalKind:    retrievalKindSparseIdentity,
 		})
 	}
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].Similarity == results[j].Similarity {
-			return results[i].CreatedAt.After(results[j].CreatedAt)
-		}
-		return results[i].Similarity > results[j].Similarity
-	})
-	return dedupeSimilarByIncident(results, limit)
+	return rankSimilar(results, limit)
 }
 
 func (s *Store) similarRecentCountLocked(
@@ -745,6 +714,18 @@ func (s *Store) similarRecentCountLocked(
 		}
 	}
 	return len(seen)
+}
+
+// rankSimilar orders sparse-identity matches the way the panel reads them:
+// strongest similarity first, most recent incident breaking a tie.
+func rankSimilar(results []SimilarIncident, limit int) []SimilarIncident {
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Similarity == results[j].Similarity {
+			return results[i].CreatedAt.After(results[j].CreatedAt)
+		}
+		return results[i].Similarity > results[j].Similarity
+	})
+	return dedupeSimilarByIncident(results, limit)
 }
 
 func dedupeSimilarByIncident(results []SimilarIncident, limit int) []SimilarIncident {

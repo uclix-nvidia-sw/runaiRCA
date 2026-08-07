@@ -19,6 +19,35 @@ from app.services.root_cause_ranking import RankedCause
 from tests.test_orchestrator import make_settings
 
 
+def _probe_state(assessment: dict) -> tuple[object, object]:
+    """A pipeline state holding one ontology-probe artifact and its assessment.
+
+    Three probe-verdict tests need exactly this scaffold; the assessment dict
+    and the ledger are what each of them is actually about, so those stay in
+    the tests.
+    """
+    request = AlertAnalysisRequest(alert=Alert(labels={"alertname": "PodPending"}))
+    state = new_state(make_settings(), request, collectors=[])
+    probe_artifact = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="ontology_probe",
+        status="ok",
+        confidence="medium",
+        summary="FailedMount for claim data",
+    )
+    state.results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="mount failed",
+            artifacts=[probe_artifact],
+            details={"ontology_probe_assessments": [assessment]},
+        )
+    ]
+    return state, probe_artifact
+
+
 def test_v3_hypothesis_restores_mechanism_from_compact_statement() -> None:
     hypothesis = _public_v3_hypothesis(
         {
@@ -178,34 +207,14 @@ def test_open_world_candidate_rejects_text_only_artifacts() -> None:
 
 
 def test_probe_verdict_links_only_explicit_hypothesis_without_promoting_it() -> None:
-    request = AlertAnalysisRequest(alert=Alert(labels={"alertname": "PodPending"}))
-    state = new_state(make_settings(), request, collectors=[])
-    probe_artifact = artifact(
-        agent="kubernetes",
-        source="kubernetes",
-        type="ontology_probe",
-        status="ok",
-        confidence="medium",
-        summary="FailedMount for claim data",
+    state, probe_artifact = _probe_state(
+{
+            "hypothesis_family": "k8s_storage_error",
+            "hypothesis_ids": ["H-storage"],
+            "verdict": "supports",
+            "artifact_index": 0,
+        }
     )
-    state.results = [
-        CollectorResult(
-            agent="kubernetes",
-            status="ok",
-            summary="mount failed",
-            artifacts=[probe_artifact],
-            details={
-                "ontology_probe_assessments": [
-                    {
-                        "hypothesis_family": "k8s_storage_error",
-                        "hypothesis_ids": ["H-storage"],
-                        "verdict": "supports",
-                        "artifact_index": 0,
-                    }
-                ]
-            },
-        )
-    ]
     state.investigation_context = {
         "hypothesis_ledger": [
             {"id": "H-storage", "family": "k8s_storage_error", "status": "testing"}
@@ -223,34 +232,14 @@ def test_probe_verdict_links_only_explicit_hypothesis_without_promoting_it() -> 
 
 
 def test_probe_verdict_never_falls_back_to_same_family_hypotheses() -> None:
-    request = AlertAnalysisRequest(alert=Alert(labels={"alertname": "PodPending"}))
-    state = new_state(make_settings(), request, collectors=[])
-    probe_artifact = artifact(
-        agent="kubernetes",
-        source="kubernetes",
-        type="ontology_probe",
-        status="ok",
-        confidence="medium",
-        summary="FailedMount for claim data",
+    state, probe_artifact = _probe_state(
+{
+            "hypothesis_family": "k8s_storage_error",
+            "hypothesis_ids": ["H-target"],
+            "verdict": "refutes",
+            "artifact_index": 0,
+        }
     )
-    state.results = [
-        CollectorResult(
-            agent="kubernetes",
-            status="ok",
-            summary="mount failed",
-            artifacts=[probe_artifact],
-            details={
-                "ontology_probe_assessments": [
-                    {
-                        "hypothesis_family": "k8s_storage_error",
-                        "hypothesis_ids": ["H-target"],
-                        "verdict": "refutes",
-                        "artifact_index": 0,
-                    }
-                ]
-            },
-        )
-    ]
     state.investigation_context = {
         "hypothesis_ledger": [
             {"id": "H-target", "family": "k8s_storage_error", "status": "testing"},
@@ -392,38 +381,18 @@ def test_reasoning_trace_v3_exposes_precise_observation_timing() -> None:
 
 
 def test_reasoning_trace_v3_uses_assessment_hypothesis_ids_without_family_inference() -> None:
-    request = AlertAnalysisRequest(alert=Alert(labels={"alertname": "PodPending"}))
-    state = new_state(make_settings(), request, collectors=[])
-    probe_artifact = artifact(
-        agent="kubernetes",
-        source="kubernetes",
-        type="ontology_probe",
-        status="ok",
-        confidence="medium",
-        summary="FailedMount for claim data",
+    state, probe_artifact = _probe_state(
+{
+            "probe_id": "mount-check",
+            "template_id": "mount-check",
+            "execution_id": "run-1:mount-check:0",
+            "executed_at": "2026-07-13T00:01:00Z",
+            "hypothesis_family": "same-family-but-not-a-link",
+            "hypothesis_ids": ["H-exact"],
+            "verdict": "supports",
+            "artifact_index": 0,
+        }
     )
-    state.results = [
-        CollectorResult(
-            agent="kubernetes",
-            status="ok",
-            summary="mount failed",
-            artifacts=[probe_artifact],
-            details={
-                "ontology_probe_assessments": [
-                    {
-                        "probe_id": "mount-check",
-                        "template_id": "mount-check",
-                        "execution_id": "run-1:mount-check:0",
-                        "executed_at": "2026-07-13T00:01:00Z",
-                        "hypothesis_family": "same-family-but-not-a-link",
-                        "hypothesis_ids": ["H-exact"],
-                        "verdict": "supports",
-                        "artifact_index": 0,
-                    }
-                ]
-            },
-        )
-    ]
     state.blackboard = Blackboard()
     state.blackboard.seed_results({"kubernetes": state.results[0]})
     state.investigation_context = {

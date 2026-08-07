@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from app.knowledge import load_failure_modes, match_failure_mode_symptoms
 from app.schemas import Alert, AlertAnalysisRequest
-from app.services.pipeline import _numbered_actions
+from app.services.pipeline import ReportKnowledge, _numbered_actions
 from app.services.root_cause_ranking import RankedCause
 
 FM = "knowledge/failure_modes.yaml"
@@ -49,12 +49,12 @@ def test_numbered_actions_surfaces_cross_family_fix() -> None:
         alert=Alert(status="firing", labels={"alertname": "X"}, annotations={}, fingerprint="fp")
     )
     actions = _numbered_actions(
-        None,
-        None,
-        [RankedCause(family="node_kubelet_pressure", confidence="low", score=1.0)],
-        "the training container was oomkilled (exit 137)",
-        fm,
-        [],
-        request,
-    )
+                  None,
+                  None,
+                  [RankedCause(family="node_kubelet_pressure", confidence="low", score=1.0)],
+                  "the training container was oomkilled (exit 137)",
+                  [],
+                  request,
+                  knowledge=ReportKnowledge(failure_modes=fm),
+              )
     assert any("memory limit" in a.lower() for a in actions)

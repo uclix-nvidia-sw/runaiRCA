@@ -18,11 +18,13 @@ from app.ontology.typedb_client import open_driver
 from ontology.ingest import _ensure, _iso_or_empty, _replace_attr
 from ontology.load_knowledge import (
     _concept_value,
-    _ensure_action,
     _ensure_cause,
     _ensure_symptom,
-    _relate_indicates,
-    _relate_resolved_by,
+)
+from ontology.upsert import (
+    ensure_action,
+    relate_symptom_indicates,
+    relate_symptom_resolved_by,
 )
 
 _SELECT_PACKAGES = """
@@ -240,10 +242,10 @@ def _mirror_learned_knowledge(tx: Any, row: dict[str, Any]) -> tuple[int, int]:
         _ensure_cause(tx, family)
         _ensure_symptom(tx, name, keywords)
         _replace_attr(tx, "symptom", "name", name, "learned_package_id", package_id)
-        _relate_indicates(tx, name, family)
+        relate_symptom_indicates(tx, name, family)
         for statement in actions:
-            _ensure_action(tx, statement)
-            _relate_resolved_by(tx, name, statement)
+            ensure_action(tx, statement)
+            relate_symptom_resolved_by(tx, name, statement)
         written += 1
     return written, skipped
 
