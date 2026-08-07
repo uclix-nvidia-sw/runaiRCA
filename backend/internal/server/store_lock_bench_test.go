@@ -2,6 +2,7 @@ package server
 
 import (
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -108,4 +109,77 @@ func TestWebhookWriteOverlapsItsTwoRoundTripsUnderTheStoreLock(t *testing.T) {
 	t.Logf("webhook write %v (max(%v, %v), not the sum) | worst concurrent read %v | GOMAXPROCS=%d",
 		elapsed.Round(time.Millisecond), incidentWriteLatency, alertWriteLatency,
 		time.Duration(worst.Load()).Round(100*time.Microsecond), runtime.GOMAXPROCS(0))
+}
+
+// TestConcurrentWriterCannotLandInsideAWebhooksPersistWindow is the test the
+// withdrawn optimisation needed and did not have.
+//
+// UpsertAlertResult writes its two rows with s.mu released. The hazard that
+// forced the first revert is a SECOND writer — SoftDeleteIncident here, but
+// ArchiveIncident, RestoreIncident, incidentResolve and ApplyAnalysisForRun are
+// the same shape — mutating and persisting the same incident inside that
+// window. Its row lands first, the webhook's older row lands on top, and
+// deleted_at is silently reverted in Postgres with nothing wrong in memory.
+//
+// The latencies are deliberately lopsided. With both statements equally slow
+// the delete cannot interleave no matter what the locking does — it is issued
+// later and therefore finishes later — and the test passes with writeMu
+// removed, which is exactly how the first version of it was vacuous. A short
+// incidents write and a long alerts write open a real window between the
+// webhook's two statements for the delete to fall into.
+func TestConcurrentWriterCannotLandInsideAWebhooksPersistWindow(t *testing.T) {
+	store, state := storeWithSlowPostgres(t)
+	state.SetExecLatencyFor("INSERT INTO incidents", 50*time.Millisecond)
+	state.SetExecLatencyFor("INSERT INTO alerts", 400*time.Millisecond)
+
+	firing := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "KubePodNotReady", "namespace": "runai", "pod": "p1"},
+		Annotations: map[string]string{"summary": "pod not ready"},
+		StartsAt:    time.Now().UTC().Format(time.RFC3339),
+	}
+	seeded := store.UpsertAlertResult(AlertmanagerWebhook{}, firing)
+	incidentID := seeded.Incident.IncidentID
+	before := len(state.Execs())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		store.UpsertAlertResult(AlertmanagerWebhook{}, firing)
+	}()
+
+	// Past the webhook's incidents write (50ms), well inside its alerts write
+	// (400ms) — the gap the delete would fall into.
+	time.Sleep(120 * time.Millisecond)
+	if _, ok := store.SoftDeleteIncident(incidentID); !ok {
+		t.Fatal("soft delete did not apply")
+	}
+	<-done
+
+	// Required order: the webhook's incidents row, the webhook's alerts row,
+	// then the delete's incidents row. Without writeMu the delete's write lands
+	// second, and the webhook is still holding a pre-delete copy of the incident
+	// — nothing rewrites deleted_at after that.
+	var incidents, alerts []int
+	for i, statement := range state.Execs()[before:] {
+		switch {
+		case strings.Contains(statement, "INSERT INTO incidents"):
+			incidents = append(incidents, i)
+		case strings.Contains(statement, "INSERT INTO alerts"):
+			alerts = append(alerts, i)
+		}
+	}
+	if len(incidents) != 2 || len(alerts) != 1 {
+		t.Fatalf("expected two incident writes and one alert write, got %d/%d: %v",
+			len(incidents), len(alerts), state.Execs()[before:])
+	}
+	if alerts[0] > incidents[1] {
+		t.Fatalf("the delete's incident write landed INSIDE the webhook's persist window "+
+			"(incidents at %v, alerts at %v) — the webhook is holding a pre-delete copy, "+
+			"so deleted_at is reverted in Postgres", incidents, alerts)
+	}
+	incident, ok := store.IncidentDetail(incidentID)
+	if ok && incident != nil && !incidentDeleted(&incident.Incident) {
+		t.Fatal("incident is not deleted in memory either")
+	}
 }

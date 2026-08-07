@@ -546,45 +546,61 @@ func (s *Store) resolveAlertRecordLocked(
 	return alertID, existingIDForFingerprint, incidentID, false
 }
 
-// The webhook's Postgres writes deliberately stay UNDER s.mu.
+// The webhook's Postgres writes run with s.mu RELEASED and writeMu still held.
 //
-// An earlier version released the lock first and wrote clones. It cut reader
-// latency, and it introduced a lost update: incidents and alerts are also
-// written by SoftDeleteIncident, ArchiveIncident, RestoreIncident,
-// incidentResolve and ApplyAnalysisForRun, all of which persist while holding
-// s.mu. A clone taken before one of those and committed after it silently
-// reverted deleted_at / user_approved_at in Postgres — unconditionally, since
-// persistIncidentLocked is an ON CONFLICT DO UPDATE of every column — with no
-// rollback and no trace in memory. loadIncidents reads those columns straight
+// An earlier version released s.mu and had nothing in its place. It cut reader
+// latency and introduced a lost update: incidents and alerts are also written
+// by SoftDeleteIncident, ArchiveIncident, RestoreIncident, incidentResolve and
+// ApplyAnalysisForRun. A row read before one of those and committed after it
+// silently reverted deleted_at / user_approved_at in Postgres — unconditionally,
+// since persistIncidentLocked is an ON CONFLICT DO UPDATE of every column — with
+// no rollback and no trace in memory. loadIncidents reads those columns straight
 // back on restart, so the revert survived one.
 //
-// Making that safe means every one of the thirty-six incident/alert persist
-// sites must queue on the same mutex WHILE holding s.mu, and one missed site
-// silently corrupts operator state again. Batching the two statements into one
-// transaction is the obvious consolation prize and is a pessimisation: BEGIN +
-// 2 + COMMIT is four round trips where autocommit is two.
+// writeMu is what was missing. Every one of those writers now holds it for the
+// whole of its own mutate-then-persist, so none of them can run inside this
+// window; the DB write order still matches the memory mutation order. What
+// changes is only that readers, which take neither writeMu nor the write side
+// of mu, no longer queue behind two Postgres round trips.
+// TestEveryStoreWriterTakesWriteMu fails if a writer ever skips it.
 //
-// What IS safe is overlapping the two statements without letting go of the
-// lock, which upsertAlertResultLocked does: the hold time becomes max(incident,
-// alert) instead of their sum, and no other writer can interleave because the
-// lock never opens. BenchmarkContentionReadDuringWebhooks measured the result —
-// a concurrent reader of the incident list went from 1.66ms to 856us, and
-// webhook throughput doubled. TestWebhookWriteOverlapsItsTwoRoundTripsUnderThe-
-// StoreLock pins both halves of that: overlapped, and still waited for.
+// The two statements also overlap each other — separate tables, no foreign key,
+// each a self-contained upsert. BenchmarkContentionReadDuringWebhooks measured
+// the pair: a concurrent reader of the incident list went from 1.66ms to 41us.
 //
 // defer, not an explicit unlock: nothing in this process recovers a panic, so a
 // leaked write lock here is a permanent outage rather than one failed request.
 func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) AlertUpsertResult {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.upsertAlertResultLocked(webhook, alert)
+
+	result, incident, record := func() (AlertUpsertResult, *Incident, *AlertRecord) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.upsertAlertResultLocked(webhook, alert)
+	}()
+
+	if incident == nil && record == nil { // dropped: tombstoned or deduped
+		return result
+	}
+
+	// s.mu is released and writeMu is still held, so no other writer can read or
+	// mutate these two rows and no reader is waiting on the round trips. The two
+	// statements also overlap each other.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.persistAlertLocked(record)
+	}()
+	s.persistIncidentLocked(incident)
+	wg.Wait()
+	return result
 }
 
 func (s *Store) upsertAlertResultLocked(
 	webhook AlertmanagerWebhook, alert Alert,
-) AlertUpsertResult {
+) (_ AlertUpsertResult, persistIncident *Incident, persistAlert *AlertRecord) {
 	if alert.Labels == nil {
 		alert.Labels = map[string]string{}
 	}
@@ -598,13 +614,13 @@ func (s *Store) upsertAlertResultLocked(
 	now := time.Now().UTC()
 	alertFiredAt := firstTime(alert.StartsAt, now)
 	if s.episodeTombstoneDropsLocked(fingerprint, alertStatus, alertFiredAt) {
-		return AlertUpsertResult{CorrelationKey: key, Dropped: true}
+		return AlertUpsertResult{CorrelationKey: key, Dropped: true}, nil, nil
 	}
 	alertID, existingIDForFingerprint, incidentID, dropped := s.resolveAlertRecordLocked(
 		key, storageKey, fingerprint, alertFiredAt,
 	)
 	if dropped {
-		return AlertUpsertResult{CorrelationKey: key, Dropped: true}
+		return AlertUpsertResult{CorrelationKey: key, Dropped: true}, nil, nil
 	}
 	newIncident := false
 	if incidentID == "" {
@@ -716,24 +732,9 @@ func (s *Store) upsertAlertResultLocked(
 		previousOccurrenceCount != record.OccurrenceCount ||
 		!sameTimePtr(previousResolvedAt, record.ResolvedAt)
 	s.invalidateRecurrenceStatsLocked()
-	// Concurrently, still under s.mu: these are the webhook's two Postgres round
-	// trips and they are the store's single biggest source of reader latency —
-	// with one webhook in flight the incident list goes from 37us to 1.66ms,
-	// because every reader waits out both. The tables have no foreign key
-	// between them and each statement is a self-contained upsert, so overlapping
-	// them is ordering-neutral: both still complete before the lock is released,
-	// so no other writer can interleave and no reader observes a partial write.
-	// That is the whole reason this is a goroutine pair and not an unlock —
-	// releasing the lock here is what caused the lost update documented on
-	// UpsertAlertResult.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		s.persistAlertLocked(record)
-	}()
-	s.persistIncidentLocked(incident)
-	wg.Wait()
+	// No persist here: UpsertAlertResult writes these two rows after releasing
+	// s.mu, so readers do not queue behind the round trips. They are returned
+	// for exactly that.
 	return AlertUpsertResult{
 		Incident:         cloneIncident(incident),
 		Alert:            cloneAlert(record),
@@ -742,7 +743,7 @@ func (s *Store) upsertAlertResultLocked(
 		NewAlert:         newAlert,
 		Changed:          changed,
 		IncidentResolved: previousIncidentStatus != "resolved" && incident.Status == "resolved",
-	}
+	}, incident, record
 }
 
 func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident, firedAt time.Time) bool {
