@@ -56,9 +56,6 @@ type recurrenceStatsCacheEntry struct {
 
 type Store struct {
 	mu sync.RWMutex
-	// dbMu serialises the Postgres writes that commitAfterUnlock runs with
-	// s.mu released. Lock order is always mu -> dbMu.
-	dbMu sync.Mutex
 	// Dense-score calibration state. Guarded by its own mutex: the centroid is
 	// read on the search path, which must never contend with the store lock.
 	centroidMu           sync.Mutex
@@ -536,30 +533,37 @@ func (s *Store) resolveAlertRecordLocked(
 	return alertID, existingIDForFingerprint, incidentID, false
 }
 
+// The webhook's Postgres writes deliberately stay UNDER s.mu.
+//
+// An earlier version released the lock first and wrote clones. It cut reader
+// latency, and it introduced a lost update: incidents and alerts are also
+// written by SoftDeleteIncident, ArchiveIncident, RestoreIncident,
+// incidentResolve and ApplyAnalysisForRun, all of which persist while holding
+// s.mu. A clone taken before one of those and committed after it silently
+// reverted deleted_at / user_approved_at in Postgres — unconditionally, since
+// persistIncidentLocked is an ON CONFLICT DO UPDATE of every column — with no
+// rollback and no trace in memory. loadIncidents reads those columns straight
+// back on restart, so the revert survived one.
+//
+// Making that safe means every one of the twenty-two incident/alert persist
+// sites must queue on the same mutex WHILE holding s.mu, and one missed site
+// silently corrupts operator state again. Measured benefit under real
+// concurrency was ~2x, not the 24x a single-writer benchmark showed. Batching
+// the two statements into one transaction is the obvious consolation prize and
+// is a pessimisation: BEGIN + 2 + COMMIT is four round trips where autocommit
+// is two. So: two round trips under the lock, and
+// TestWebhookWriteCostsTwoRoundTripsUnderTheStoreLock records what that costs.
+//
+// defer, not an explicit unlock: nothing in this process recovers a panic, so a
+// leaked write lock here is a permanent outage rather than one failed request.
 func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) AlertUpsertResult {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	result, write := s.upsertAlertResultLocked(webhook, alert)
-	s.commitAfterUnlock(write)
-	return result
-}
-
-// commitAfterUnlock releases the store lock and only then runs write, so a
-// Postgres round trip never blocks a reader. dbMu is taken while s.mu is still
-// held, so writers still commit in the order they held the store lock.
-//
-// write may only touch clones the caller owns: once s.mu is released another
-// goroutine may be mutating the store's own objects. This is why only callers
-// that IGNORE the persist result can use it — the ones that roll their
-// in-memory change back when the write fails must stay under the lock.
-func (s *Store) commitAfterUnlock(write func()) {
-	if write == nil {
-		s.mu.Unlock()
-		return
+	if write != nil {
+		write()
 	}
-	s.dbMu.Lock()
-	s.mu.Unlock()
-	defer s.dbMu.Unlock()
-	write()
+	return result
 }
 
 func (s *Store) upsertAlertResultLocked(
@@ -696,11 +700,9 @@ func (s *Store) upsertAlertResultLocked(
 		previousOccurrenceCount != record.OccurrenceCount ||
 		!sameTimePtr(previousResolvedAt, record.ResolvedAt)
 	s.invalidateRecurrenceStatsLocked()
-	// Clones, because these writes run after the lock is released.
-	incidentRow, alertRow := cloneIncident(incident), cloneAlert(record)
 	write := func() {
-		s.persistIncidentLocked(incidentRow)
-		s.persistAlertLocked(alertRow)
+		s.persistIncidentLocked(incident)
+		s.persistAlertLocked(record)
 	}
 	return AlertUpsertResult{
 		Incident:         cloneIncident(incident),
