@@ -144,6 +144,11 @@ jobs:
       - name: Install
         working-directory: frontend
         run: npm ci
+      - name: Lint
+        working-directory: frontend
+        # Rules of Hooks only. A hook behind an early return type-checks, builds,
+        # and passes every unit test, then crashes the panel at runtime.
+        run: npm run lint
       - name: Build
         working-directory: frontend
         run: npm run build
