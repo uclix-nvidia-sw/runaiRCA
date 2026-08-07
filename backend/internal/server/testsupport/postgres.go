@@ -24,6 +24,7 @@ func RegisterPostgresDriver(state *PostgresState) string {
 type PostgresState struct {
 	mu                       sync.Mutex
 	execLatency              time.Duration
+	execLatencyFor           map[string]time.Duration
 	failCreateVector         bool
 	failAnalysisRuns         bool
 	failAnalysisRunExecAfter int
@@ -76,9 +77,26 @@ func (s *PostgresState) SetExecLatency(d time.Duration) {
 	s.execLatency = d
 }
 
-func (s *PostgresState) latency() time.Duration {
+// SetExecLatencyFor gives one statement its own duration, so a test can tell
+// "these two ran concurrently" apart from "the caller did not wait for the
+// second one" — with a single latency both look the same from the outside.
+func (s *PostgresState) SetExecLatencyFor(substr string, d time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.execLatencyFor == nil {
+		s.execLatencyFor = map[string]time.Duration{}
+	}
+	s.execLatencyFor[substr] = d
+}
+
+func (s *PostgresState) latencyFor(query string) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for substr, d := range s.execLatencyFor {
+		if strings.Contains(query, substr) {
+			return d
+		}
+	}
 	return s.execLatency
 }
 
@@ -238,7 +256,7 @@ func maxDollarPlaceholder(query string) int {
 }
 
 func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	if d := c.state.latency(); d > 0 {
+	if d := c.state.latencyFor(query); d > 0 {
 		time.Sleep(d)
 	}
 	// Mimic Postgres bind semantics: it binds exactly the number of $N params the

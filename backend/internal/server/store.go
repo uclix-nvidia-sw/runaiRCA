@@ -545,14 +545,19 @@ func (s *Store) resolveAlertRecordLocked(
 // rollback and no trace in memory. loadIncidents reads those columns straight
 // back on restart, so the revert survived one.
 //
-// Making that safe means every one of the twenty-two incident/alert persist
+// Making that safe means every one of the thirty-six incident/alert persist
 // sites must queue on the same mutex WHILE holding s.mu, and one missed site
-// silently corrupts operator state again. Measured benefit under real
-// concurrency was ~2x, not the 24x a single-writer benchmark showed. Batching
-// the two statements into one transaction is the obvious consolation prize and
-// is a pessimisation: BEGIN + 2 + COMMIT is four round trips where autocommit
-// is two. So: two round trips under the lock, and
-// TestWebhookWriteCostsTwoRoundTripsUnderTheStoreLock records what that costs.
+// silently corrupts operator state again. Batching the two statements into one
+// transaction is the obvious consolation prize and is a pessimisation: BEGIN +
+// 2 + COMMIT is four round trips where autocommit is two.
+//
+// What IS safe is overlapping the two statements without letting go of the
+// lock, which upsertAlertResultLocked does: the hold time becomes max(incident,
+// alert) instead of their sum, and no other writer can interleave because the
+// lock never opens. BenchmarkContentionReadDuringWebhooks measured the result —
+// a concurrent reader of the incident list went from 1.66ms to 856us, and
+// webhook throughput doubled. TestWebhookWriteOverlapsItsTwoRoundTripsUnderThe-
+// StoreLock pins both halves of that: overlapped, and still waited for.
 //
 // defer, not an explicit unlock: nothing in this process recovers a panic, so a
 // leaked write lock here is a permanent outage rather than one failed request.
@@ -696,8 +701,24 @@ func (s *Store) upsertAlertResultLocked(
 		previousOccurrenceCount != record.OccurrenceCount ||
 		!sameTimePtr(previousResolvedAt, record.ResolvedAt)
 	s.invalidateRecurrenceStatsLocked()
+	// Concurrently, still under s.mu: these are the webhook's two Postgres round
+	// trips and they are the store's single biggest source of reader latency —
+	// with one webhook in flight the incident list goes from 37us to 1.66ms,
+	// because every reader waits out both. The tables have no foreign key
+	// between them and each statement is a self-contained upsert, so overlapping
+	// them is ordering-neutral: both still complete before the lock is released,
+	// so no other writer can interleave and no reader observes a partial write.
+	// That is the whole reason this is a goroutine pair and not an unlock —
+	// releasing the lock here is what caused the lost update documented on
+	// UpsertAlertResult.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.persistAlertLocked(record)
+	}()
 	s.persistIncidentLocked(incident)
-	s.persistAlertLocked(record)
+	wg.Wait()
 	return AlertUpsertResult{
 		Incident:         cloneIncident(incident),
 		Alert:            cloneAlert(record),
