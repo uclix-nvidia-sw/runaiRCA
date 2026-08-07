@@ -110,6 +110,25 @@ export function useRcaCorrection({
     setPinnedOverride(undefined);
   }, [analysisRun?.run_id]);
 
+  // A draft survives closing the panel on purpose — the seeding effect above
+  // fills pristine fields only so reopening never clobbers an edit. It must NOT
+  // survive switching to a different incident: the workspace is not remounted
+  // between targets, so the draft would otherwise be saved onto the new one.
+  const draftFor = useRef<string | undefined>(incident?.incident_id);
+  useEffect(() => {
+    const id = incident?.incident_id;
+    if (draftFor.current === id) return;
+    draftFor.current = id;
+    setOpen(false);
+    setFamily('');
+    setNewCause('');
+    setSummary('');
+    setActions('');
+    setSuggestions(undefined);
+    setError('');
+    setActionError('');
+  }, [incident?.incident_id]);
+
   const isOperatorRun = analysisRun?.source === 'operator';
   const pinned = isOperatorRun && (pinnedOverride ?? analysisRun?.metadata?.pinned === true);
 

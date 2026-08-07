@@ -654,13 +654,6 @@ def normalize_artifact(
     def metadata(key: str) -> object:
         return raw.get(key) or result_metadata.get(key) or observation_metadata.get(key)
 
-    def declared_metadata(*keys: str) -> tuple[bool, object]:
-        """Read declared scope without replacing malformed values with defaults."""
-        for container in (observation_metadata, result_metadata, raw):
-            for key in keys:
-                if key in container:
-                    return True, container[key]
-        return False, None
     sources = (observation_metadata, result_metadata, raw)
     (
         observed_window_start,

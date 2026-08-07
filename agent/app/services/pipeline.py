@@ -4258,7 +4258,7 @@ def _detail_from(
     runtime_knowledge_hints: list[tuple[str, dict[str, Any]]] | None = None,
     xid_codes: list[int] | None = None,
     *,
-    knowledge: ReportKnowledge = ReportKnowledge(),
+    knowledge: ReportKnowledge,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
     appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
@@ -5707,7 +5707,7 @@ def _numbered_actions(
     missing: list[str],
     request: AlertAnalysisRequest,
     *,
-    knowledge: ReportKnowledge = ReportKnowledge(),
+    knowledge: ReportKnowledge,
     allow_graph_remediation: bool = True,
     allow_cause_specific_actions: bool | None = None,
     self_check_next: str = "",
@@ -7796,7 +7796,7 @@ def _playbook_lines(
     fuzzy_query: str = "",
     component: str = "",
     *,
-    knowledge: ReportKnowledge = ReportKnowledge(),
+    knowledge: ReportKnowledge,
     allow_remediation: bool = True,
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.

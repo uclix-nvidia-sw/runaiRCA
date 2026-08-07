@@ -222,7 +222,9 @@ def test_appendix_omits_drilldown_artifact_dump() -> None:
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
-    )
+    
+                 knowledge=ReportKnowledge(),
+             )
 
     assert "### Evidence" not in detail
     assert "runtime/panic.go:785" not in detail
@@ -252,7 +254,9 @@ def test_root_cause_supporting_evidence_uses_drilldown_after_no_evidence_base() 
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
-    )
+    
+                 knowledge=ReportKnowledge(),
+             )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     assert "scheduler panic at reclaim/reclaim.go:91" in root_cause
@@ -281,7 +285,9 @@ def test_context_only_artifact_stays_out_of_root_cause_evidence() -> None:
         root_cause_candidates=[
             RankedCause(family="node_kubelet_pressure", confidence="medium", score=7.0)
         ],
-    )
+    
+                 knowledge=ReportKnowledge(),
+             )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     assert "container memory was observed" not in root_cause
@@ -314,7 +320,9 @@ def test_contextual_eligibility_blocks_scoped_artifact_from_report() -> None:
         # The blackboard rejected E01 because it belongs to a different target
         # or incident window. It remains available in Collector Evidence Trail.
         eligible_support_ids=set(),
-    )
+    
+                 knowledge=ReportKnowledge(),
+             )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     assert "OOMKilled occurred on unrelated-pod" not in root_cause
@@ -353,7 +361,9 @@ def test_context_only_artifact_cannot_emit_graph_remediation_actions() -> None:
         ),
         # The blackboard rejected every artifact as context/out-of-scope.
         eligible_support_ids=set(),
-    )
+    
+                 knowledge=ReportKnowledge(),
+             )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
@@ -488,6 +498,38 @@ def test_query_intent_is_excluded_from_drilldown_and_self_check_prompts() -> Non
     assert "ErrImagePull" not in digest
 
 
+def test_newest_artifact_always_gets_a_digest_slot() -> None:
+    """The digest ranks by usefulness and caps at six, but the NEWEST artifact
+    is appended unconditionally — a collector's latest observation must reach
+    the refuting model even when six older ranked ones fill the cap.
+
+    This half of a test deleted with the generative-synthesis projection was the
+    only coverage of that guarantee: replacing the "newest first, then rank the
+    rest" term with a plain top-6 leaves all other tests green.
+    """
+    from app.masking import build_masker
+    from app.services import self_check
+
+    result = CollectorResult(agent="loki", status="ok", summary="headline")
+    for index in range(6):
+        result.artifacts.append(
+            artifact(
+                agent="loki", source="loki", type="logs", status="ok", confidence="high",
+                summary=f"old-{index}", highlights=["signal"],
+                result={"observation": {"polarity": "unknown", "coverage": "partial"}},
+            )
+        )
+    result.artifacts.append(
+        artifact(
+            agent="loki", source="loki", type="logs", status="partial", confidence="low",
+            summary="newest",
+            result={"observation": {"polarity": "unknown", "coverage": "partial"}},
+        )
+    )
+
+    assert "newest" in self_check._evidence_digest([result], build_masker(()))
+
+
 def test_ontology_probe_ignores_debug_and_possible_cause_metadata() -> None:
     from app.services import probe_evaluation
 
@@ -526,7 +568,9 @@ def test_unavailable_drilldown_artifact_is_not_report_evidence() -> None:
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
-    )
+    
+                 knowledge=ReportKnowledge(),
+             )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     assert "connection refused" not in root_cause
@@ -564,7 +608,9 @@ def test_appendix_omits_successful_and_failed_artifact_details() -> None:
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
-    )
+    
+                 knowledge=ReportKnowledge(),
+             )
 
     assert "### Evidence" not in detail
     assert "scheduler panic at reclaim/reclaim.go:91" not in detail

@@ -162,3 +162,36 @@ def test_ingest_whitelists_track_families_yaml() -> None:
         assert not missing, f"{name} would drop families.yaml families: {sorted(missing)}"
         assert _INSUFFICIENT_EVIDENCE in whitelist, f"{name} must keep the ranker sentinel"
     assert set(LOAD_ALERTS_FAMILIES) == set(LOAD_KNOWN_ISSUES_FAMILIES)
+
+
+def test_symptom_names_do_not_collide_across_catalogs() -> None:
+    """Symptom identity in TypeDB is the bare name string, and the loaders now
+    share one reconciling `indicates` write — which deletes a symptom's edges to
+    any family other than the one being written. That is correct while each
+    catalog owns its own names, and silently destructive the moment two
+    catalogs use the same one: the last loader to run would retire the other's
+    edge."""
+    catalogs = {
+        "runai_alerts_catalog.yaml": ("alert", lambda d: d),
+        "runai_known_issues.yaml": ("issue", lambda d: d),
+        "failure_modes.yaml": (
+            "name",
+            lambda d: [s for fam in d for s in (fam.get("symptoms") or [])],
+        ),
+    }
+    names: dict[str, set[str]] = {}
+    for filename, (key, entries_of) in catalogs.items():
+        data = yaml.safe_load((_KNOWLEDGE_DIR / filename).read_text())
+        names[filename] = {
+            str(entry[key]) for entry in entries_of(data) if isinstance(entry, dict) and entry.get(key)
+        }
+        assert names[filename], f"{filename} produced no symptom names"
+
+    files = sorted(names)
+    for i, left in enumerate(files):
+        for right in files[i + 1 :]:
+            shared = names[left] & names[right]
+            assert not shared, (
+                f"{left} and {right} both declare {sorted(shared)}; whichever loader "
+                "runs last would retire the other's indicates edge"
+            )
