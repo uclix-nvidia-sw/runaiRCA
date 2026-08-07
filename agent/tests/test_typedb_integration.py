@@ -7,11 +7,13 @@ the failure mode here: when a symptom's family moves in YAML, the old
 counts for two families in the ranker and shows the operator the same guidance
 twice.
 
-Destructive: it writes into TYPEDB_DATABASE. Run it against a scratch instance:
+Destructive: it runs the loaders and plants relations in TYPEDB_DATABASE, so it
+is behind its OWN opt-in rather than TYPEDB_ADDRESS — a developer whose shell
+already points at a real graph must not wipe it by running the suite.
 
     docker run -d --name rca-typedb -p 1729:1729 docker.io/typedb/typedb:3.11.5
-    TYPEDB_ADDRESS=localhost:1729 TYPEDB_USERNAME=admin TYPEDB_PASSWORD=password \\
-      TYPEDB_DATABASE=runai_rca ENABLE_TYPEDB=true \\
+    RCA_TEST_TYPEDB=1 ENABLE_TYPEDB=true TYPEDB_ADDRESS=localhost:1729 \\
+      TYPEDB_USERNAME=admin TYPEDB_PASSWORD=password TYPEDB_DATABASE=runai_rca \\
       .venv/bin/python -m pytest tests/test_typedb_integration.py -v
 """
 
@@ -30,7 +32,7 @@ from app.ontology.typedb_client import escape_typeql as esc
 from app.ontology.typedb_client import open_driver
 
 pytestmark = pytest.mark.skipif(
-    not os.getenv("TYPEDB_ADDRESS"), reason="TYPEDB_ADDRESS not set"
+    not os.getenv("RCA_TEST_TYPEDB"), reason="RCA_TEST_TYPEDB not set (destructive)"
 )
 
 # In every loader's whitelist, and owned by none of the symptoms under test —
@@ -85,8 +87,20 @@ def _run_loader(module: str) -> None:
     assert "skipping" not in done.stderr, f"{module} skipped: {done.stderr.strip()}"
 
 
+def _purge_planted_family() -> None:
+    """The planted family is an entity, not just an edge: leaving it behind
+    accumulates duplicate root_cause rows across runs, which is the very
+    condition the reconciling write exists to prevent."""
+    driver_cm, settings, tx_type = _transaction("write")
+    with driver_cm as driver, driver.transaction(settings.typedb_database, tx_type) as tx:
+        tx.query(
+            f'match $x isa {_STALE_FAMILY}, has subtype "{_STALE_FAMILY}"; delete $x;'
+        ).resolve()
+        tx.commit()
+
+
 @pytest.fixture(scope="module", autouse=True)
-def _loaded_graph() -> None:
+def _loaded_graph():
     for module in (
         "ontology.load_schema",
         "ontology.load_knowledge",
@@ -97,6 +111,8 @@ def _loaded_graph() -> None:
             subprocess.run([sys.executable, "-m", module], check=True, capture_output=True)
             continue
         _run_loader(module)
+    yield
+    _purge_planted_family()
 
 
 def _first_alert_name() -> str:

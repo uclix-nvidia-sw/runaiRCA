@@ -559,16 +559,12 @@ func (s *Store) resolveAlertRecordLocked(
 func (s *Store) UpsertAlertResult(webhook AlertmanagerWebhook, alert Alert) AlertUpsertResult {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	result, write := s.upsertAlertResultLocked(webhook, alert)
-	if write != nil {
-		write()
-	}
-	return result
+	return s.upsertAlertResultLocked(webhook, alert)
 }
 
 func (s *Store) upsertAlertResultLocked(
 	webhook AlertmanagerWebhook, alert Alert,
-) (AlertUpsertResult, func()) {
+) AlertUpsertResult {
 	if alert.Labels == nil {
 		alert.Labels = map[string]string{}
 	}
@@ -582,13 +578,13 @@ func (s *Store) upsertAlertResultLocked(
 	now := time.Now().UTC()
 	alertFiredAt := firstTime(alert.StartsAt, now)
 	if s.episodeTombstoneDropsLocked(fingerprint, alertStatus, alertFiredAt) {
-		return AlertUpsertResult{CorrelationKey: key, Dropped: true}, nil
+		return AlertUpsertResult{CorrelationKey: key, Dropped: true}
 	}
 	alertID, existingIDForFingerprint, incidentID, dropped := s.resolveAlertRecordLocked(
 		key, storageKey, fingerprint, alertFiredAt,
 	)
 	if dropped {
-		return AlertUpsertResult{CorrelationKey: key, Dropped: true}, nil
+		return AlertUpsertResult{CorrelationKey: key, Dropped: true}
 	}
 	newIncident := false
 	if incidentID == "" {
@@ -700,10 +696,8 @@ func (s *Store) upsertAlertResultLocked(
 		previousOccurrenceCount != record.OccurrenceCount ||
 		!sameTimePtr(previousResolvedAt, record.ResolvedAt)
 	s.invalidateRecurrenceStatsLocked()
-	write := func() {
-		s.persistIncidentLocked(incident)
-		s.persistAlertLocked(record)
-	}
+	s.persistIncidentLocked(incident)
+	s.persistAlertLocked(record)
 	return AlertUpsertResult{
 		Incident:         cloneIncident(incident),
 		Alert:            cloneAlert(record),
@@ -712,7 +706,7 @@ func (s *Store) upsertAlertResultLocked(
 		NewAlert:         newAlert,
 		Changed:          changed,
 		IncidentResolved: previousIncidentStatus != "resolved" && incident.Status == "resolved",
-	}, write
+	}
 }
 
 func (s *Store) shouldReuseIncidentForAlertLocked(key string, incident *Incident, firedAt time.Time) bool {

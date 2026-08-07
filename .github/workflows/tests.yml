@@ -99,7 +99,8 @@ jobs:
         run: ENABLE_RCA_OUTPUT_HARNESS=false python -m eval.check_nat_eval --min-avg 1.0
 
   ontology-definitions:
-    # Compiles schema and function definitions only; it does not load knowledge data.
+    # Compiles schema and function definitions, then runs the loader-graph test,
+    # whose fixture loads knowledge/alerts/known-issues into a scratch database.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -136,6 +137,7 @@ jobs:
         # never retired is invisible to them.
         working-directory: agent
         env:
+          RCA_TEST_TYPEDB: "1"
           ENABLE_TYPEDB: "true"
           TYPEDB_ADDRESS: localhost:1729
           TYPEDB_USERNAME: admin

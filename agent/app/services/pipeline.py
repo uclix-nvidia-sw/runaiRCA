@@ -7896,7 +7896,7 @@ def _playbook_lines(
 def _family_supplemental_playbook_lines(
     family: str,
     *,
-    knowledge: ReportKnowledge = ReportKnowledge(),
+    knowledge: ReportKnowledge,
     exclude_symptom: str = "",
 ) -> list[str]:
     """Render sibling symptoms as discriminators, never as executable fixes."""

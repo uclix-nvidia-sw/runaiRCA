@@ -85,20 +85,20 @@ def test_workload_prefix_node_resolution_rejects_multi_node_replicas() -> None:
 
 def test_insufficient_evidence_gets_a_separate_general_guidance_section() -> None:
     detail = pipeline._detail_from(
-                 AlertAnalysisRequest(
+        AlertAnalysisRequest(
             alert=Alert(
                 status="firing",
                 labels={"alertname": "GenericAlert"},
                 annotations={"summary": "OOMKilled was reported by an operator"},
             )
         ),
-                 [],
-                 [],
-                 root_cause_candidates=[
+        [],
+        [],
+        root_cause_candidates=[
             RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
         ],
-                 eligible_support_ids=set(),
-                 knowledge=ReportKnowledge(failure_modes={
+        eligible_support_ids=set(),
+        knowledge=ReportKnowledge(failure_modes={
             "workload_startup_error": [
                 {
                     "symptom": "OOMKilled",
@@ -107,7 +107,7 @@ def test_insufficient_evidence_gets_a_separate_general_guidance_section() -> Non
                 }
             ]
         }),
-             )
+    )
 
     actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
     guidance = detail.split("## General Troubleshooting Guidance", 1)[1].split(
@@ -222,9 +222,9 @@ def test_appendix_omits_drilldown_artifact_dump() -> None:
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
-    
-                 knowledge=ReportKnowledge(),
-             )
+
+        knowledge=ReportKnowledge(),
+    )
 
     assert "### Evidence" not in detail
     assert "runtime/panic.go:785" not in detail
@@ -254,9 +254,9 @@ def test_root_cause_supporting_evidence_uses_drilldown_after_no_evidence_base() 
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
-    
-                 knowledge=ReportKnowledge(),
-             )
+
+        knowledge=ReportKnowledge(),
+    )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     assert "scheduler panic at reclaim/reclaim.go:91" in root_cause
@@ -285,9 +285,9 @@ def test_context_only_artifact_stays_out_of_root_cause_evidence() -> None:
         root_cause_candidates=[
             RankedCause(family="node_kubelet_pressure", confidence="medium", score=7.0)
         ],
-    
-                 knowledge=ReportKnowledge(),
-             )
+
+        knowledge=ReportKnowledge(),
+    )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     assert "container memory was observed" not in root_cause
@@ -320,9 +320,9 @@ def test_contextual_eligibility_blocks_scoped_artifact_from_report() -> None:
         # The blackboard rejected E01 because it belongs to a different target
         # or incident window. It remains available in Collector Evidence Trail.
         eligible_support_ids=set(),
-    
-                 knowledge=ReportKnowledge(),
-             )
+
+        knowledge=ReportKnowledge(),
+    )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     assert "OOMKilled occurred on unrelated-pod" not in root_cause
@@ -361,9 +361,9 @@ def test_context_only_artifact_cannot_emit_graph_remediation_actions() -> None:
         ),
         # The blackboard rejected every artifact as context/out-of-scope.
         eligible_support_ids=set(),
-    
-                 knowledge=ReportKnowledge(),
-             )
+
+        knowledge=ReportKnowledge(),
+    )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
@@ -405,18 +405,21 @@ def test_context_only_artifacts_cannot_emit_catalog_or_historical_actions() -> N
         ]
     }
     detail = pipeline._detail_from(
-                 request,
-                 [CollectorResult(agent="kubernetes", status="ok", summary="current snapshot")],
-                 [],
-                 root_cause_candidates=[
+        request,
+        [CollectorResult(agent="kubernetes", status="ok", summary="current snapshot")],
+        [],
+        root_cause_candidates=[
             RankedCause(family="node_kubelet_pressure", confidence="medium", score=7.0)
         ],
-                 kg_context={"enabled": True, "available": True, "knowledge": modes},
-                 plan=plan,
-                 graph_fixes=GraphRemediation(family_fixes=["GRAPH-REMEDY reset the node"]),
-                 eligible_support_ids=set(),
-                 knowledge=ReportKnowledge(failure_modes=modes, components={"component-a": {"checks": ["COMPONENT-REMEDY restart it"]}}),
-             )
+        kg_context={"enabled": True, "available": True, "knowledge": modes},
+        plan=plan,
+        graph_fixes=GraphRemediation(family_fixes=["GRAPH-REMEDY reset the node"]),
+        eligible_support_ids=set(),
+        knowledge=ReportKnowledge(
+            failure_modes=modes,
+            components={"component-a": {"checks": ["COMPONENT-REMEDY restart it"]}},
+        ),
+    )
 
     actions = detail.split("## 3. Recommended Actions", 1)[1].split("## Appendix", 1)[0]
     assert "Not enough evidence for concrete actions" in actions
@@ -568,9 +571,9 @@ def test_unavailable_drilldown_artifact_is_not_report_evidence() -> None:
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
-    
-                 knowledge=ReportKnowledge(),
-             )
+
+        knowledge=ReportKnowledge(),
+    )
 
     root_cause = detail.split("## 2. Root Cause", 1)[1].split("## 3.", 1)[0]
     assert "connection refused" not in root_cause
@@ -608,9 +611,9 @@ def test_appendix_omits_successful_and_failed_artifact_details() -> None:
         root_cause_candidates=[
             RankedCause(family="platform_version_bug", confidence="medium", score=7.0)
         ],
-    
-                 knowledge=ReportKnowledge(),
-             )
+
+        knowledge=ReportKnowledge(),
+    )
 
     assert "### Evidence" not in detail
     assert "scheduler panic at reclaim/reclaim.go:91" not in detail
@@ -1119,7 +1122,7 @@ async def test_evidence_stage_accepts_sufficient_subset_and_skips_optional_work(
                             "observed_entity": f"pod:{target.pod}",
                         },
                     },
-                )
+    )
             ],
         )
 
@@ -1236,7 +1239,7 @@ async def test_re_resolved_live_target_drives_blackboard_eligibility(monkeypatch
                                 },
                             },
                         },
-                    )
+    )
                 ],
             )
 
@@ -1448,7 +1451,7 @@ async def test_alert_only_known_issue_is_auditable_harness_support(monkeypatch) 
                 "summary": (
                     "runai-scheduler-default panic: reclaim.go runtime/panic.go "
                     "reclaim] attempting to reclaim large GPU job"
-                )
+    )
             },
         ),
     )
@@ -1520,7 +1523,7 @@ async def test_rank_stage_approved_match_seed_without_current_evidence_is_not_fo
                     similarity=0.91,
                     approved=True,
                     root_cause_family="gpu_hardware_error",
-                )
+    )
             ],
         ),
         collectors=[],

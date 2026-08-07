@@ -117,7 +117,10 @@ export function useRcaCorrection({
   const draftFor = useRef<string | undefined>(incident?.incident_id);
   useEffect(() => {
     const id = incident?.incident_id;
-    if (draftFor.current === id) return;
+    // Skip the null transition rather than recording it: closing the workspace
+    // sets incident to null, and reopening the SAME one must still find the
+    // draft. Only an actual switch to another incident resets.
+    if (!id || draftFor.current === id) return;
     draftFor.current = id;
     setOpen(false);
     setFamily('');
