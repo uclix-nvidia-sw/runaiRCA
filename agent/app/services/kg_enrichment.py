@@ -1448,8 +1448,33 @@ def _matched_external_cases(
     return sorted(matched, key=lambda match: (-len(match[2]), match[0]))
 
 
+def _evidence_summaries_by_id(card: dict[str, Any]) -> dict[str, str]:
+    """evidence_id -> masked summary, from the loader's bounded evidence_refs
+    projection (ontology/load_external_cases.py). Cards written before that
+    field existed carry no `evidence_refs` key -- must degrade to {}, never
+    KeyError, so a stale graph load still yields plain (unobserved) hints."""
+    refs = card.get("evidence_refs")
+    if not isinstance(refs, list):
+        return {}
+    out: dict[str, str] = {}
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        evidence_id = str(ref.get("evidence_id") or "").strip()
+        summary = str(ref.get("summary") or "").strip()
+        if evidence_id and summary:
+            out[evidence_id] = summary
+    return out
+
+
 def _external_case_hint_projection(run: Any, case_id: str) -> list[dict[str, Any]]:
-    """Extract only diagnostic/preventive CaseCard actions for drill-down."""
+    """Extract only diagnostic/preventive CaseCard actions for drill-down.
+
+    Each hint carries the support thread's own narrative: `order` (its 1-based
+    position among this case's diagnostic/preventive steps), `outcome`, and up
+    to 2 `observed` evidence summaries -- so a lead reads as "step 2, a
+    preventive check, which found X" instead of a bare imperative.
+    """
     if not case_id:
         return []
     try:
@@ -1471,24 +1496,36 @@ def _external_case_hint_projection(run: Any, case_id: str) -> list[dict[str, Any
         for token in raw_tokens
         if str(token).strip()
     ][:12] if isinstance(raw_tokens, list) else []
+    evidence_summaries = _evidence_summaries_by_id(card)
     hints: list[dict[str, Any]] = []
+    order = 0
     for action in card.get("historical_actions") or []:
         if not isinstance(action, dict):
             continue
-        if str(action.get("outcome") or "").strip().lower() not in {
-            "diagnostic",
-            "preventive",
-        }:
+        outcome = str(action.get("outcome") or "").strip().lower()
+        if outcome not in {"diagnostic", "preventive"}:
             continue
+        order += 1
         normalized_action = " ".join(str(action.get("normalized_action") or "").split())[:500]
-        if normalized_action:
-            hints.append(
-                {
-                    "case_id": case_id,
-                    "normalized_action": normalized_action,
-                    "canonical_component_tokens": tokens,
-                }
-            )
+        if not normalized_action:
+            continue
+        hint: dict[str, Any] = {
+            "case_id": case_id,
+            "normalized_action": normalized_action,
+            "canonical_component_tokens": tokens,
+            "order": order,
+            "outcome": outcome,
+        }
+        evidence_ids = action.get("evidence_ids")
+        if isinstance(evidence_ids, list):
+            observed = [
+                evidence_summaries[key]
+                for eid in evidence_ids
+                if (key := str(eid)) in evidence_summaries
+            ]
+            if observed:
+                hint["observed"] = [summary[:200] for summary in observed[:2]]
+        hints.append(hint)
     return hints[:4]
 
 

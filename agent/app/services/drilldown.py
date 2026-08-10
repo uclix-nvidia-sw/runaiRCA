@@ -1733,9 +1733,9 @@ _EXTERNAL_HINT_ROUTING = {
 
 def _external_case_hints_for_domain(
     agent: str, hints: list[dict[str, Any]] | None
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     """Route leads by canonical component token; unknown tokens remain advisory to all."""
-    routed: list[dict[str, str]] = []
+    routed: list[dict[str, Any]] = []
     for hint in hints or []:
         if not isinstance(hint, dict):
             continue
@@ -1755,7 +1755,16 @@ def _external_case_hints_for_domain(
         if not destinations:
             destinations = set(_EXTERNAL_HINT_DOMAINS)
         if action and case_id and agent in destinations:
-            routed.append({"case_id": case_id, "normalized_action": action})
+            routed_hint: dict[str, Any] = {"case_id": case_id, "normalized_action": action}
+            # order/outcome/observed are absent on a CaseCard predating
+            # evidence_refs -- carry through only what the hint actually has.
+            if isinstance(hint.get("order"), int):
+                routed_hint["order"] = hint["order"]
+            if outcome := str(hint.get("outcome") or "").strip():
+                routed_hint["outcome"] = outcome
+            if isinstance(observed := hint.get("observed"), list) and observed:
+                routed_hint["observed"] = observed
+            routed.append(routed_hint)
     return routed[:3]
 
 
@@ -1804,9 +1813,23 @@ def _ontology_guidance(
 
 def _external_case_hints_for_guidance(
     hints: list[dict[str, Any]] | None,
-) -> list[dict[str, str]]:
-    return [
-        {
+) -> list[dict[str, Any]]:
+    """Project each routed lead into a prompt-ready dict.
+
+    order/outcome/observed are the support thread's own narrative (thread
+    position, step type, what it found) and are optional: a hint sourced from
+    a CaseCard written before evidence_refs existed has none of them, and must
+    still render as a plain lead rather than being dropped.
+    """
+    projected: list[dict[str, Any]] = []
+    for hint in (hints or [])[:3]:
+        if not (
+            isinstance(hint, dict)
+            and isinstance(hint.get("case_id"), str)
+            and isinstance(hint.get("normalized_action"), str)
+        ):
+            continue
+        entry: dict[str, Any] = {
             "label": (
                 "Investigation leads from a similar historical external case — "
                 "unverified hypotheses, not evidence"
@@ -1814,11 +1837,17 @@ def _external_case_hints_for_guidance(
             "case_id": hint["case_id"],
             "normalized_action": hint["normalized_action"],
         }
-        for hint in (hints or [])[:3]
-        if isinstance(hint, dict)
-        and isinstance(hint.get("case_id"), str)
-        and isinstance(hint.get("normalized_action"), str)
-    ]
+        if isinstance(hint.get("order"), int):
+            entry["order"] = hint["order"]
+        if isinstance(outcome := hint.get("outcome"), str) and outcome:
+            entry["outcome"] = outcome
+        observed = hint.get("observed")
+        if isinstance(observed, list):
+            trimmed = [str(item)[:200] for item in observed if str(item).strip()][:2]
+            if trimmed:
+                entry["observed"] = trimmed
+        projected.append(entry)
+    return projected
 
 
 def _capped_json_prompt(

@@ -383,6 +383,19 @@ def _to_incident(
         "approved_by": approved_by,
         "searchable_context": payload.get("searchable_context") or {},
         "historical_actions": payload.get("historical_actions") or [],
+        # Bounded evidence projection so a hint can say what an action found,
+        # not just what it was. No `supports`/`source_message_ids`: those name
+        # F00x/H00x/M00x ids that are never shipped in this payload.
+        "evidence_refs": [
+            {
+                "evidence_id": str(e.get("evidence_id") or ""),
+                "source": str(e.get("source_actor") or "external"),
+                "kind": str(e.get("evidence_kind") or "statement"),
+                "summary": " ".join(str(e.get("masked_summary") or "").split())[:240],
+            }
+            for e in payload.get("evidence_refs") or []
+            if e.get("evidence_id")
+        ],
         "context": {"incident_status_at_approval": status},
         "family_candidates": _family_candidates(payload),
         "failure_mode_matches": _knowledge_links_matches(

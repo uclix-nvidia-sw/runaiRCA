@@ -265,6 +265,63 @@ def test_knowledge_links_matches_default_to_empty_list_without_knowledge_links()
     assert inc.case_card["known_issue_matches"] == []
 
 
+# --- case_card.evidence_refs (bounded projection for hint narration in
+# kg_enrichment._external_case_hint_projection) -----------------------------
+
+
+def test_evidence_refs_reach_the_case_card_bounded() -> None:
+    """Only evidence_id/source/kind/summary survive -- never `supports` or
+    `source_message_ids` (those name F00x/H00x/M00x ids this payload never
+    ships)."""
+    inc = lx._to_incident(_payload(), "op", "t")
+
+    assert inc.case_card["evidence_refs"] == [
+        {"evidence_id": "E002", "source": "customer", "kind": "transcript_quote",
+         "summary": "QP transition failure."},
+        {"evidence_id": "E018", "source": "customer", "kind": "statement",
+         "summary": "Switch L3 routing corrected."},
+        {"evidence_id": "E011", "source": "nvidia_support", "kind": "statement",
+         "summary": "Repeated QP transition failures."},
+    ]
+
+
+def test_evidence_refs_collapse_whitespace_in_summary() -> None:
+    p = _payload(evidence_refs=[
+        {"evidence_id": "E900", "source_actor": "customer", "evidence_kind": "statement",
+         "masked_summary": "line one\n   line   two  "},
+    ])
+    inc = lx._to_incident(p, "op", "t")
+    assert inc.case_card["evidence_refs"][0]["summary"] == "line one line two"
+
+
+def test_evidence_refs_trim_summary_to_240_chars() -> None:
+    p = _payload(evidence_refs=[
+        {"evidence_id": "E901", "source_actor": "customer", "evidence_kind": "statement",
+         "masked_summary": "x" * 300},
+    ])
+    inc = lx._to_incident(p, "op", "t")
+    summary = inc.case_card["evidence_refs"][0]["summary"]
+    assert summary == "x" * 240
+    assert len(summary) == 240
+
+
+def test_evidence_refs_entries_without_evidence_id_are_dropped() -> None:
+    p = _payload(evidence_refs=[
+        {"evidence_id": "E100", "source_actor": "customer", "evidence_kind": "statement",
+         "masked_summary": "kept"},
+        {"source_actor": "customer", "evidence_kind": "statement", "masked_summary": "no id"},
+        {"evidence_id": "", "source_actor": "customer", "evidence_kind": "statement",
+         "masked_summary": "blank id"},
+    ])
+    inc = lx._to_incident(p, "op", "t")
+    assert [r["evidence_id"] for r in inc.case_card["evidence_refs"]] == ["E100"]
+
+
+def test_evidence_refs_default_to_empty_list_without_evidence_refs() -> None:
+    inc = lx._to_incident(_payload(evidence_refs=[]), "op", "t")
+    assert inc.case_card["evidence_refs"] == []
+
+
 def test_unconfirmed_mechanism_is_prefixed_and_fingerprinted() -> None:
     p = _payload()
     p["incident"] = {**p["incident"], "confirmed_mechanism": None}
