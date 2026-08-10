@@ -7,6 +7,7 @@ from dataclasses import replace
 from app.collectors.base import AnalysisTarget
 from app.config import load_settings
 from app.knowledge import match_failure_mode_symptoms
+from app.masking import MASK_TOKEN, build_masker
 from app.services.kg_enrichment import (
     _EXTERNAL_CASE_QUERY,
     KGContext,
@@ -1361,3 +1362,275 @@ def test_kg_context_as_dict_includes_probe_history() -> None:
     assert ctx.as_dict()["probe_history"] == {
         "k8s_storage_error": {"probe-a": {"inconclusive": 3, "total": 3}}
     }
+
+
+# --- insufficient_evidence playbook: reference actions, not a dead end ----------
+#
+# Owner ask: when the run never settles on a cause family, the playbook must
+# stop returning only "no playbook matched" -- it should offer knowledge-
+# grounded reference actions (cross-family curated symptoms + the best-matched
+# external vendor case), explicitly framed as unconfirmed. These pin that
+# framing, its bounds, the masker, and that every other branch is untouched.
+
+
+def test_insufficient_evidence_playbook_renders_hedged_cross_family_match() -> None:
+    failure_modes = {
+        "gpu_hardware_error": [
+            {
+                "symptom": "Xid 79 GPU Fell Off The Bus",
+                "keywords": ["fell off the bus"],
+                "actions": [
+                    "Reset or replace the GPU.",
+                    "Check the PCIe riser.",
+                    "File a vendor RMA.",
+                    "A fourth action past the cap must not render.",
+                ],
+                "reason": "A failing GPU or PCIe link drops off the bus under load.",
+            }
+        ]
+    }
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+
+    lines = _playbook_lines(
+        candidates,
+        "node reported the gpu fell off the bus during training",
+        knowledge=ReportKnowledge(failure_modes=failure_modes, known_issues=[], cases=""),
+    )
+    joined = "\n".join(lines)
+
+    assert "The available evidence cannot confirm a root cause" in joined
+    assert "(knowledge match — unconfirmed)" in joined
+    assert "GPU hardware error" in joined  # family_label(gpu_hardware_error)
+    assert "Reset or replace the GPU." in joined
+    assert "File a vendor RMA." in joined
+    assert "A fourth action past the cap must not render." not in joined
+    assert "A failing GPU or PCIe link drops off the bus under load." in joined
+
+
+def test_insufficient_evidence_hedged_block_survives_component_identity_lines() -> None:
+    # Reviewer regression (2026-08-10): the component-identity layer fills
+    # `lines`, and the old early `if lines: return` swallowed the hedged
+    # reference block on exactly the evidence-poor runs that carry a component
+    # identity. Both must render, identity first.
+    components = {
+        "cluster-sync": {
+            "failure_effect": "Workload status stops syncing.",
+            "depends_on": [],
+            "checks": ["kubectl logs -n runai deploy/cluster-sync"],
+        }
+    }
+    failure_modes = {
+        "gpu_hardware_error": [
+            {
+                "symptom": "Xid 79 GPU Fell Off The Bus",
+                "keywords": ["fell off the bus"],
+                "actions": ["Reset or replace the GPU."],
+            }
+        ]
+    }
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+
+    lines = _playbook_lines(
+        candidates,
+        "gpu fell off the bus",
+        component="cluster-sync",
+        knowledge=ReportKnowledge(
+            failure_modes=failure_modes, known_issues=[], cases="", components=components
+        ),
+    )
+    joined = "\n".join(lines)
+
+    assert "(the alert target itself)" in joined
+    assert "The available evidence cannot confirm a root cause" in joined
+    assert "(knowledge match — unconfirmed)" in joined
+    assert joined.index("(the alert target itself)") < joined.index("cannot confirm a root cause")
+
+
+def test_insufficient_evidence_component_only_keeps_identity_lines_without_hedge() -> None:
+    # Component identity but nothing to reference: identity lines stay, and
+    # neither the hedge header nor the bare "no playbook" fallback is appended.
+    components = {
+        "cluster-sync": {
+            "failure_effect": "Workload status stops syncing.",
+            "depends_on": [],
+            "checks": ["kubectl logs -n runai deploy/cluster-sync"],
+        }
+    }
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+
+    lines = _playbook_lines(
+        candidates,
+        "nothing matches this text",
+        component="cluster-sync",
+        knowledge=ReportKnowledge(
+            failure_modes={}, known_issues=[], cases="", components=components
+        ),
+    )
+    joined = "\n".join(lines)
+
+    assert "(the alert target itself)" in joined
+    assert "cannot confirm a root cause" not in joined
+    assert "No troubleshooting playbook matched" not in joined
+
+
+def test_insufficient_evidence_playbook_renders_external_case_with_failed_actions() -> None:
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+    card = {
+        "kind": "external",
+        "mechanism": "Thanos Receive repeatedly hit a 64 GB memory ceiling under bursty ingest.",
+        "matched_error_signatures": ["oomkilled"],
+        "successful_actions": [
+            {
+                "statement": "Increase CPU request/limit while leaving memory unchanged.",
+                "outcome": "mitigated",
+            }
+        ],
+        "failed_actions": [
+            {"statement": "Raising the memory limit alone.", "outcome": "ineffective"}
+        ],
+    }
+
+    lines = _playbook_lines(
+        candidates,
+        "pod repeatedly oomkilled with no obvious trigger",
+        knowledge=ReportKnowledge(failure_modes={}, known_issues=[], cases=""),
+        case_cards=[card],
+    )
+    joined = "\n".join(lines)
+
+    assert "A similar past case (external support case, reference only):" in joined
+    assert "Thanos Receive repeatedly hit a 64 GB memory ceiling" in joined
+    assert (
+        "Action that helped then: Increase CPU request/limit while leaving memory unchanged."
+        in joined
+    )
+    assert "Actions that did not help then: Raising the memory limit alone." in joined
+
+
+def test_insufficient_evidence_playbook_unresolved_case_cites_diagnostic_leads() -> None:
+    # No successful_actions recorded -- must not fabricate a fix.
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+    card = {
+        "kind": "external",
+        "mechanism": "Scheduler panicked in the proportion plugin under a large queue.",
+        "matched_error_signatures": ["panic"],
+    }
+
+    lines = _playbook_lines(
+        candidates,
+        "scheduler logged a panic",
+        knowledge=ReportKnowledge(failure_modes={}, known_issues=[], cases=""),
+        case_cards=[card],
+    )
+    joined = "\n".join(lines)
+
+    assert "That case's support-team diagnostic steps may be worth reviewing" in joined
+    assert "Action that helped then" not in joined
+
+
+def test_insufficient_evidence_playbook_falls_back_when_nothing_matches() -> None:
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+    observed = "pod recovered after a transient retry; no other signal was observed"
+
+    lines_en = _playbook_lines(
+        candidates,
+        observed,
+        knowledge=ReportKnowledge(failure_modes={}, known_issues=[], cases=""),
+    )
+    assert lines_en == ["- No troubleshooting playbook matched the available evidence yet."]
+
+    lines_ko = _playbook_lines(
+        candidates,
+        observed,
+        knowledge=ReportKnowledge(failure_modes={}, known_issues=[], cases="", language="ko"),
+    )
+    assert lines_ko == ["- 현재 증거와 정확히 일치하는 트러블슈팅 playbook이 없습니다."]
+
+
+def test_insufficient_evidence_playbook_still_withheld_by_allow_remediation() -> None:
+    # allow_remediation=False must short-circuit before any of the new content,
+    # even when a symptom match and an external case are both available.
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+    failure_modes = {
+        "gpu_hardware_error": [
+            {"symptom": "X", "keywords": ["fell off the bus"], "actions": ["do X"]}
+        ]
+    }
+    card = {
+        "kind": "external",
+        "mechanism": "m",
+        "matched_error_signatures": ["x"],
+        "successful_actions": [{"statement": "s", "outcome": "resolved"}],
+    }
+
+    lines = _playbook_lines(
+        candidates,
+        "node reported the gpu fell off the bus",
+        knowledge=ReportKnowledge(failure_modes=failure_modes, known_issues=[], cases=""),
+        allow_remediation=False,
+        case_cards=[card],
+    )
+
+    assert lines == [
+        "- Specific playbook remediation is withheld until a current "
+        "target/window-scoped observation is available."
+    ]
+
+
+def test_insufficient_evidence_playbook_masks_matched_action_and_mechanism_text() -> None:
+    masker = build_masker((r"gpu-worker-7",))
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+    failure_modes = {
+        "gpu_hardware_error": [
+            {
+                "symptom": "Xid 79 GPU Fell Off The Bus",
+                "keywords": ["fell off the bus"],
+                "actions": ["Drain and reboot gpu-worker-7 before re-scheduling."],
+            }
+        ]
+    }
+    card = {
+        "kind": "external",
+        "mechanism": "A similar failure was previously seen on gpu-worker-7 under load.",
+        "matched_error_signatures": ["fell off the bus"],
+    }
+
+    lines = _playbook_lines(
+        candidates,
+        "node gpu-worker-7 reported the gpu fell off the bus",
+        knowledge=ReportKnowledge(
+            failure_modes=failure_modes, known_issues=[], cases="", masker=masker
+        ),
+        case_cards=[card],
+    )
+    joined = "\n".join(lines)
+
+    assert "gpu-worker-7" not in joined
+    assert MASK_TOKEN in joined
+
+
+def test_non_insufficient_top_family_playbook_unchanged_by_new_branch() -> None:
+    # Regression guard: a settled top family must still get the old, unhedged
+    # single-match rendering -- none of the insufficient_evidence-only literals.
+    failure_modes = {
+        "workload_startup_error": [
+            {
+                "symptom": "OOMKilled",
+                "keywords": ["oomkilled"],
+                "actions": ["Raise the memory limit."],
+            }
+        ]
+    }
+    candidates = [RankedCause(family="workload_startup_error", confidence="high", score=9.0)]
+
+    lines = _playbook_lines(
+        candidates,
+        "container was oomkilled",
+        knowledge=ReportKnowledge(failure_modes=failure_modes, known_issues=[], cases=""),
+    )
+    joined = "\n".join(lines)
+
+    assert "- **OOMKilled** (workload startup/config/crash)" in joined
+    assert "Raise the memory limit." in joined
+    assert "(knowledge match — unconfirmed)" not in joined
+    assert "confirmed diagnosis" not in joined
