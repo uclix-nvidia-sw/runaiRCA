@@ -708,11 +708,13 @@ def load_architecture(path: str) -> dict[str, dict[str, Any]]:
 def load_xid_catalog(path: str) -> dict[int, dict[str, Any]]:
     """Parse xid_catalog.yaml into {xid_code: entry}.
 
-    Each entry: {code, mnemonic, description, severity, trigger, gpu_models[]}
-    -- an NVIDIA XID's own catalog identity, not just its fix. ontology/load_xids.py
-    loads the same file into TypeDB (the runtime source of truth); this is the
-    fallback for when the graph is unavailable, so the catalog stays reachable
-    without it, the same way known issues/architecture/alerts already do.
+    Each entry: {code, mnemonic, description, severity, trigger, gpu_models[],
+    immediate_action, investigatory_action, leads_to[], linkage_note} -- an
+    NVIDIA XID's own catalog identity, its resolution guidance, and its causal
+    escalation edges (leads_to). ontology/load_xids.py loads the same file into
+    TypeDB (the runtime source of truth); this is the fallback for when the
+    graph is unavailable, so the catalog stays reachable without it, the same
+    way known issues/architecture/alerts already do.
     """
     if not path:
         return {}
@@ -730,6 +732,12 @@ def load_xid_catalog(path: str) -> dict[int, dict[str, Any]]:
             code = int(entry.get("code"))
         except (TypeError, ValueError):
             continue
+        leads_to: list[int] = []
+        for target in entry.get("leads_to") or []:
+            try:
+                leads_to.append(int(target))
+            except (TypeError, ValueError):
+                continue
         out[code] = {
             "code": code,
             "mnemonic": str(entry.get("mnemonic") or ""),
@@ -739,6 +747,10 @@ def load_xid_catalog(path: str) -> dict[int, dict[str, Any]]:
             "gpu_models": [
                 str(m).strip() for m in (entry.get("gpu_models") or []) if str(m).strip()
             ],
+            "immediate_action": str(entry.get("immediate_action") or ""),
+            "investigatory_action": str(entry.get("investigatory_action") or ""),
+            "leads_to": leads_to,
+            "linkage_note": str(entry.get("linkage_note") or ""),
         }
     return out
 

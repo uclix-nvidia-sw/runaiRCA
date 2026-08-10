@@ -108,6 +108,7 @@ _RESULT_CHARS = 1500  # per-query result excerpt fed back into the loop
 # cluster had reported it, which is how query strings once produced a
 # control-plane misdiagnosis on a run that observed nothing.
 _KNOWLEDGE_TOOL = "knowledge_lookup"
+_KNOWLEDGE_TOOLS = frozenset({"knowledge_lookup", "case_lookup", "xid_lookup", "component_checks"})
 _KNOWLEDGE_MATCH_CAP = 5
 _RUNAI_PROJECT_ID_CACHE: dict[tuple[str, str], str] = {}
 _USER_PROMPT_CHARS = 6000
@@ -832,7 +833,7 @@ async def _run_query(
             "outcome": json.dumps(history_outcome, default=str)[:_RESULT_CHARS],
         }
     )
-    if name == _KNOWLEDGE_TOOL:
+    if name in _KNOWLEDGE_TOOLS:
         # The agent gets the answer (history, above) and the run keeps a receipt
         # (details, below) — but NO artifact. An artifact would put curated
         # wording into _observed_text, where the signature matchers would read
@@ -841,7 +842,14 @@ async def _run_query(
         if isinstance(lookups, list):
             lookups.append(
                 {
-                    "query": str(args.get("hypothesis") or "")[:200],
+                    "tool": name,
+                    "query": str(
+                        args.get("hypothesis")
+                        or args.get("text")
+                        or args.get("xid")
+                        or args.get("component")
+                        or ""
+                    )[:200],
                     "summary": str(outcome.get("summary") or error or ""),
                 }
             )
@@ -2117,6 +2125,164 @@ async def _tool_knowledge_lookup(settings: Settings, target: AnalysisTarget, arg
     }
 
 
+async def _tool_case_lookup(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    """External vendor-support case retrieval, by error-signature match — a
+    historical prior, never proof for THIS incident.
+
+    Delegates entirely to the same TypeDB-backed retrieval the synthesis
+    prompt's external-case cards use; both already degrade to empty (never an
+    exception) when TypeDB is off, unreachable, or times out.
+    """
+    from app.services.kg_enrichment import external_case_cards, external_case_hints
+
+    text = str(args.get("text") or args.get("error_text") or "").strip()
+    if not text:
+        return {"error": "text is required — pass verbatim error/log lines you observed"}
+    cards, _warnings = await external_case_cards(settings, text, limit=2)
+    hints = await external_case_hints(settings, text, limit=2)
+    if not cards and not hints:
+        return {
+            "summary": "no external support case matches that text",
+            "result": {"cases": [], "investigation_leads": []},
+        }
+    cases = []
+    for card in cards:
+        entry = {
+            key: card[key]
+            for key in (
+                "case_id",
+                "family",
+                "mechanism",
+                "context_class",
+                "matched_error_signatures",
+                "successful_actions",
+                "failed_actions",
+            )
+            if card.get(key)
+        }
+        if summary := str(card.get("analysis_summary") or "")[:400]:
+            entry["analysis_summary"] = summary
+        cases.append(entry)
+    return {
+        "summary": (
+            f"{len(cases)} external case(s) matched — historical reference, "
+            "not proof for this incident"
+        ),
+        "result": {"cases": cases, "investigation_leads": hints},
+    }
+
+
+async def _tool_xid_lookup(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    """NVIDIA XID catalog lookup: identity, resolution guidance, and the
+    causal leads_to escalation graph (both directions)."""
+    import os
+
+    from app.knowledge import load_xid_catalog
+
+    try:
+        code = int(str(args.get("xid")).strip())
+    except (TypeError, ValueError):
+        return {"error": "xid must be a numeric XID code"}
+    if not 0 < code < 1000:
+        return {"error": "xid must be between 1 and 999"}
+    catalog = load_xid_catalog(os.getenv("XID_CATALOG_FILE", "knowledge/xid_catalog.yaml"))
+    entry = catalog.get(code)
+    if not entry:
+        return {"summary": f"XID {code} is not in the catalog", "result": {}}
+    result: dict[str, Any] = {
+        "code": code,
+        "mnemonic": entry.get("mnemonic", ""),
+        "description": entry.get("description", ""),
+        "severity": entry.get("severity", ""),
+        "gpu_models": entry.get("gpu_models", []),
+        "immediate_action": entry.get("immediate_action", ""),
+        "investigatory_action": entry.get("investigatory_action", ""),
+        "trigger": str(entry.get("trigger") or "")[:800],
+        "linkage_note": entry.get("linkage_note", ""),
+        "escalates_to": [
+            {"code": target_code, "mnemonic": catalog.get(target_code, {}).get("mnemonic", "")}
+            for target_code in entry.get("leads_to") or []
+        ],
+    }
+    # Transitive reverse walk: every entry whose leads_to chain reaches `code`,
+    # breadth-first from `code`. `visited` both dedupes and blocks cycles.
+    roots: dict[int, dict[str, Any]] = {}
+    frontier = {code}
+    visited = {code}
+    for _ in range(5):
+        callers = {
+            other
+            for other, other_entry in catalog.items()
+            if other not in visited and frontier & set(other_entry.get("leads_to") or [])
+        }
+        if not callers:
+            break
+        for other in callers:
+            roots[other] = {
+                "code": other,
+                "mnemonic": catalog[other].get("mnemonic", ""),
+                "severity": catalog[other].get("severity", ""),
+            }
+        visited |= callers
+        frontier = callers
+    result["escalation_roots"] = sorted(roots.values(), key=lambda r: r["code"])
+    identity = entry.get("description") or entry.get("mnemonic") or ""
+    return {
+        "summary": f"XID {code}: {identity} ({entry.get('severity', '')}) — catalog reference only",
+        "result": result,
+    }
+
+
+async def _tool_component_checks(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    """Platform component topology: purpose, failure effect, ready-to-run
+    checks, and its direct (one-hop) dependencies."""
+    from app.knowledge import component_for_target, load_architecture
+
+    component = str(args.get("component") or "").strip()
+    if not component:
+        return {"error": "component is required"}
+    components = load_architecture(getattr(settings, "architecture_file", ""))
+    entry = components.get(component)
+    if entry is None:
+        lowered = component.lower()
+        entry = next((c for name, c in components.items() if name.lower() == lowered), None)
+    if entry is None:
+        # Agents pass pod/workload names here too (runai-scheduler-abc12):
+        # resolve through the same identity entry point the playbook uses
+        # instead of failing on the controller suffix.
+        entry = component_for_target(components, component)
+    if entry is None:
+        lowered = component.lower()
+        matches = sorted(name for name in components if lowered in name.lower())
+        return {
+            "summary": f"unknown component {component}",
+            "result": {"known_components": (matches or sorted(components))[:10]},
+        }
+    dependencies = [
+        {
+            "name": dep,
+            "failure_effect": components[dep].get("failure_effect", ""),
+            "checks": components[dep].get("checks", []),
+        }
+        for dep in entry.get("depends_on") or []
+        if dep in components
+    ]
+    dep_word = "dependency" if len(dependencies) == 1 else "dependencies"
+    return {
+        "summary": f"{entry.get('component', component)}: {len(dependencies)} direct {dep_word}",
+        "result": {
+            "component": entry.get("component", component),
+            "namespace": entry.get("namespace", ""),
+            "kind": entry.get("kind", ""),
+            "purpose": entry.get("purpose", ""),
+            "failure_effect": entry.get("failure_effect", ""),
+            "checks": entry.get("checks", []),
+            "depends_on": entry.get("depends_on", []),
+            "dependencies": dependencies,
+        },
+    }
+
+
 def _domain_tools(
     settings: Settings, loki_labels: dict[str, list[str]] | None = None
 ) -> dict[str, dict[str, dict[str, Any]]]:
@@ -2394,6 +2560,35 @@ def _domain_tools(
                 "args: hypothesis (the text you want to look up)"
             ),
             "call": _tool_knowledge_lookup,
+        }
+        agent_tools["case_lookup"] = {
+            "description": (
+                "Look up external vendor-support cases whose error signature matches your "
+                "text: root-cause family, mechanism, and what was tried (including what did "
+                "NOT work). Known-knowledge guidance to TEST with your own domain tools — "
+                "never evidence for THIS incident. args: text (verbatim error/log lines you "
+                "OBSERVED — never a paraphrase)"
+            ),
+            "call": _tool_case_lookup,
+        }
+        agent_tools["xid_lookup"] = {
+            "description": (
+                "Look up an NVIDIA XID code in the GPU-error catalog: what it means, its "
+                "severity, immediate/investigatory action, and which other XIDs it escalates "
+                "to or from. Known-knowledge guidance to TEST with your own domain tools — "
+                "never evidence for THIS incident. args: xid (numeric XID code you saw in "
+                "dmesg/logs)"
+            ),
+            "call": _tool_xid_lookup,
+        }
+        agent_tools["component_checks"] = {
+            "description": (
+                "Look up a Run:ai platform component's purpose, failure effect, ready-to-run "
+                "checks, and its direct dependencies. Known-knowledge guidance to TEST with "
+                "your own domain tools — never evidence for THIS incident. args: component "
+                "(platform component name, e.g. runai-scheduler)"
+            ),
+            "call": _tool_component_checks,
         }
     return registry
 
