@@ -12,9 +12,12 @@ localhost:1729 so it works against a local `docker run typedb/typedb`.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 from app.config import load_settings
+from app.ontology.typedb_client import open_driver
 
 SCHEMA_FILE = Path(__file__).resolve().parent / "schema.tql"
 
@@ -117,6 +120,38 @@ DATA_MIGRATIONS = [
 ]
 
 
+def _wait_until_ready(settings: Any, budget_seconds: float = 90.0) -> bool:
+    """Poll until TypeDB accepts a real connection, not just a TCP handshake.
+
+    The chart's initContainer only proves `typedb:1729` accepts a TCP connect;
+    the TypeDB JVM opens that port before the query engine/auth can actually
+    create a database or commit a transaction, so a premature gate pass can
+    land here before the server is truly ready. Self-heal with a bounded,
+    capped-backoff retry instead of burning a chart backoffLimit attempt on
+    every cold start. Scope: this job entry only — runtime/agent query paths
+    must keep failing fast to their fallbacks.
+    """
+    deadline = time.monotonic() + budget_seconds
+    attempt = 0
+    delay = 1.0
+    while True:
+        attempt += 1
+        try:
+            with open_driver(settings) as driver:
+                driver.databases.contains(settings.typedb_database)
+            return True
+        except Exception as exc:  # noqa: BLE001 - anything here just means "not ready yet"
+            print(
+                f"waiting for TypeDB (attempt {attempt}): {exc.__class__.__name__}",
+                file=sys.stderr,
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2.0, 8.0)
+
+
 def main() -> int:
     settings = load_settings()
     address = settings.typedb_address or "localhost:1729"
@@ -124,11 +159,13 @@ def main() -> int:
 
     try:
         from typedb.driver import TransactionType
-
-        from app.ontology.typedb_client import open_driver
     except ImportError:
         print("typedb-driver is not installed. `pip install typedb-driver`.", file=sys.stderr)
         return 2
+
+    if not _wait_until_ready(settings):
+        print(f"gave up waiting for TypeDB at {address} to become ready", file=sys.stderr)
+        return 1
 
     with open_driver(settings) as driver:
         if not driver.databases.contains(settings.typedb_database):

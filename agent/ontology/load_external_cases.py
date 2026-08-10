@@ -35,7 +35,7 @@ import argparse
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -751,7 +751,7 @@ def main() -> int:
         return 2
 
     paths = args.paths or [_DEFAULT_DIR]
-    approved_at = datetime.now().astimezone().isoformat()
+    approved_at = datetime.now(UTC).isoformat()
     prepared: list[tuple[OntologyIncident, dict[str, Any], list[str]]] = []
     seen_cases: set[str] = set()
     for path in _find_payloads(paths):

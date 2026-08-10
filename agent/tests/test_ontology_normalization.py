@@ -63,10 +63,29 @@ def test_evidence_upsert_reuses_a_legacy_generic_evidence_entity() -> None:
     assert "insert $x isa state_evidence" not in emitted
 
 
-def test_iso_or_empty_rejects_non_utc_and_malformed_values() -> None:
-    assert ingest._iso_or_empty("2026-07-27T00:00:00Z") == "2026-07-27T00:00:00Z"
-    assert ingest._iso_or_empty("2026-07-27T09:00:00+09:00") == ""
-    assert ingest._iso_or_empty("not-a-time") == ""
+def test_iso_or_empty_utc_passthrough_is_byte_identical(caplog) -> None:
+    with caplog.at_level("WARNING"):
+        assert ingest._iso_or_empty("2026-07-27T00:00:00Z") == "2026-07-27T00:00:00Z"
+        assert ingest._iso_or_empty("2026-07-27T00:00:00+00:00") == "2026-07-27T00:00:00+00:00"
+    assert caplog.text == ""
+
+
+def test_iso_or_empty_converts_an_aware_non_utc_offset_to_utc(caplog) -> None:
+    """An operator's local +09:00 is a real, unambiguous instant -- convert it
+    instead of silently dropping the approval provenance."""
+    with caplog.at_level("WARNING"):
+        assert ingest._iso_or_empty("2026-07-27T09:00:00+09:00") == "2026-07-27T00:00:00+00:00"
+    assert caplog.text == ""
+
+
+def test_iso_or_empty_rejects_naive_and_malformed_values(caplog) -> None:
+    """A naive timestamp is genuinely ambiguous (no zone to convert from), and a
+    malformed string never parses -- both still warn-and-drop."""
+    with caplog.at_level("WARNING"):
+        assert ingest._iso_or_empty("2026-07-27T00:00:00") == ""
+        assert ingest._iso_or_empty("not-a-time") == ""
+    assert "dropping non-UTC ontology timestamp" in caplog.text
+    assert "dropping malformed ontology timestamp" in caplog.text
 
 
 def test_schema_migrations_cover_new_keys_and_signal_supertype() -> None:
