@@ -4,9 +4,13 @@ reachable by every agent, mirror knowledge_lookup's contract, never evidence."""
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+from dataclasses import replace
 
+import app.ontology.typedb_client as typedb_client_module
 import app.services.kg_enrichment as kg_enrichment
 from app.collectors.base import AnalysisTarget, CollectorResult
+from app.ontology.typedb_client import escape_typeql
 from app.services import drilldown
 from tests.test_orchestrator import make_settings
 
@@ -35,6 +39,42 @@ class _NullMasker:
         return value
 
 
+# --- ontology-mode test scaffolding (offline; never touches real TypeDB) ---
+
+
+def _typedb_settings():
+    """TypeDB "on" — paired with a monkeypatched TypeDBClient, never a real socket."""
+    return replace(make_settings(), enable_typedb=True, typedb_address="fake:1729")
+
+
+class _DirectClient:
+    """Drop-in TypeDBClient double: wraps a canned `run(query) -> rows` callable.
+
+    Passed directly as the `client` arg to the `_*_via_graph` helpers — the
+    same dependency-injection style test_kg_enrichment.py's FakeClient uses
+    for `_query_remediation`/`_query_kg`, so no monkeypatching is needed to
+    exercise the query-building logic in isolation.
+    """
+
+    def __init__(self, run):
+        self._run = run
+
+    @contextmanager
+    def open_reader(self):
+        yield self._run
+
+
+def _typedb_client_factory(run):
+    """A `TypeDBClient(settings)`-shaped constructor, for monkeypatching the
+    class itself so a full `_tool_*` call (gate + thread + timeout) is
+    exercised end to end."""
+
+    def _construct(settings):
+        return _DirectClient(run)
+
+    return _construct
+
+
 # --- registry -----------------------------------------------------------
 
 
@@ -46,14 +86,74 @@ def test_every_domain_agent_can_reach_all_four_knowledge_tools() -> None:
             assert name in tools, f"{agent} cannot consult {name}"
 
 
+# --- knowledge_lookup -------------------------------------------------------
+
+
+def test_knowledge_lookup_fallback_source_tag() -> None:
+    # TypeDB off (make_settings default): must hit the catalog fallback.
+    out = asyncio.run(
+        drilldown._tool_knowledge_lookup(make_settings(), _target(), {"hypothesis": "OOMKilled"})
+    )
+    assert out["source"] == "catalog_fallback"
+    assert out["result"]["symptoms"]
+
+
+def test_knowledge_lookup_graph_mode_surfaces_external_case(monkeypatch) -> None:
+    """Proves external cases (symptom name `ext:...`) are now reachable
+    through knowledge_lookup, unified with curated/known-issue symptoms."""
+
+    def fake_run(query: str) -> list[dict]:
+        if query == kg_enrichment._KNOWLEDGE_QUERY:
+            return [
+                {
+                    "fam": "gpu_hardware_error",
+                    "sn": "ext:vendor-case-1",
+                    "kw": "ecc double bit",
+                    "st": "reseat the gpu",
+                },
+                {
+                    "fam": "workload_runtime_error",
+                    "sn": "OOMKilled",
+                    "kw": "oomkilled",
+                    "st": "raise the memory limit",
+                },
+            ]
+        if query in (
+            kg_enrichment._KNOWLEDGE_ACTIONLESS_QUERY,
+            kg_enrichment._KNOWLEDGE_AFFECTED_VERSION_QUERY,
+            kg_enrichment._KNOWLEDGE_FIXED_VERSION_QUERY,
+        ):
+            return []
+        if query == kg_enrichment._KNOWLEDGE_REASON_QUERY:
+            return [{"sn": "OOMKilled", "reason": "container exceeded its memory limit"}]
+        return []
+
+    monkeypatch.setattr(typedb_client_module, "TypeDBClient", _typedb_client_factory(fake_run))
+    out = asyncio.run(
+        drilldown._tool_knowledge_lookup(
+            _typedb_settings(),
+            _target(),
+            {"hypothesis": "pod OOMKilled with ecc double bit error"},
+        )
+    )
+    assert out["source"] == "ontology"
+    sources = {s["symptom"]: s["source"] for s in out["result"]["symptoms"]}
+    assert sources == {"ext:vendor-case-1": "external_case", "OOMKilled": "ontology"}
+    assert out["result"]["known_issues"] == []
+
+
 # --- xid_lookup -----------------------------------------------------------
 
 
 def test_xid_lookup_happy_path() -> None:
     out = asyncio.run(drilldown._tool_xid_lookup(make_settings(), _target(), {"xid": 79}))
+    assert out["source"] == "catalog_fallback"
     assert out["result"]["code"] == 79
     assert out["result"]["severity"] == "fatal"
     assert "fallen off the bus" in out["result"]["description"].lower()
+    # `fixes` is the stable key across both modes, composed here from the
+    # YAML immediate/investigatory split (both of which remain present too).
+    assert out["result"]["fixes"]
     assert out["summary"]
 
 
@@ -73,7 +173,58 @@ def test_xid_lookup_rejects_invalid_or_missing_args() -> None:
 
 def test_xid_lookup_unknown_code() -> None:
     out = asyncio.run(drilldown._tool_xid_lookup(make_settings(), _target(), {"xid": 999}))
-    assert out == {"summary": "XID 999 is not in the catalog", "result": {}}
+    assert out == {
+        "source": "catalog_fallback",
+        "summary": "XID 999 is not in the catalog",
+        "result": {},
+    }
+
+
+def test_xid_lookup_graph_mode_reads_ontology(monkeypatch) -> None:
+    def fake_run(query: str) -> list[dict]:
+        if "detail_for_xid(79)" in query:
+            return [{"m": "Xid", "d": "GPU has fallen off the bus", "s": "fatal"}]
+        if "fixes_for_xid(79)" in query:
+            return [{"x": "Reset the GPU."}]
+        if "trigger_for_xid(79)" in query:
+            return [{"x": "seen after an ECC failure"}]
+        if "applies_to" in query:
+            return [{"n": "H100"}]
+        return []
+
+    monkeypatch.setattr(typedb_client_module, "TypeDBClient", _typedb_client_factory(fake_run))
+    out = asyncio.run(drilldown._tool_xid_lookup(_typedb_settings(), _target(), {"xid": 79}))
+    assert out["source"] == "ontology"
+    result = out["result"]
+    assert result["code"] == 79
+    assert result["severity"] == "fatal"
+    assert result["fixes"] == ["Reset the GPU."]
+    assert result["gpu_models"] == ["H100"]
+    assert result["escalates_to"] == []
+    assert result["escalation_roots"] == []
+    # Graph mode has no immediate/investigatory split; `fixes` is the only key.
+    assert "immediate_action" not in result
+    assert "investigatory_action" not in result
+
+
+def test_xid_lookup_graph_mode_not_in_catalog(monkeypatch) -> None:
+    monkeypatch.setattr(
+        typedb_client_module, "TypeDBClient", _typedb_client_factory(lambda query: [])
+    )
+    out = asyncio.run(drilldown._tool_xid_lookup(_typedb_settings(), _target(), {"xid": 999}))
+    assert out == {"source": "ontology", "summary": "XID 999 is not in the catalog", "result": {}}
+
+
+def test_xid_lookup_graph_failure_falls_back_to_catalog(monkeypatch, caplog) -> None:
+    def boom(query: str) -> list[dict]:
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(typedb_client_module, "TypeDBClient", _typedb_client_factory(boom))
+    with caplog.at_level("WARNING"):
+        out = asyncio.run(drilldown._tool_xid_lookup(_typedb_settings(), _target(), {"xid": 79}))
+    assert out["source"] == "catalog_fallback"
+    assert out["result"]["code"] == 79
+    assert "xid_lookup ontology query failed" in caplog.text
 
 
 def test_xid_escalation_roots_reverse_walk(tmp_path, monkeypatch) -> None:
@@ -160,6 +311,105 @@ def test_component_checks_unknown_component_substring_match() -> None:
         drilldown._tool_component_checks(make_settings(), _target(), {"component": "runai-agen"})
     )
     assert "runai-agent" in out["result"]["known_components"]
+
+
+def test_component_checks_fallback_source_tag() -> None:
+    out = asyncio.run(
+        drilldown._tool_component_checks(make_settings(), _target(), {"component": "runai-agent"})
+    )
+    assert out["source"] == "catalog_fallback"
+
+
+def test_component_checks_graph_mode_reads_ontology(monkeypatch) -> None:
+    from app.knowledge import load_architecture
+
+    expected_kind = load_architecture("knowledge/runai_architecture.yaml")["runai-agent"]["kind"]
+
+    def fake_run(query: str) -> list[dict]:
+        if 'has name "runai-agent"' not in query:
+            return []
+        if "has description $v" in query:
+            return [{"v": "graph purpose"}]
+        if "has failure_effect $v" in query:
+            return [{"v": "graph failure effect"}]
+        if "has k8s_namespace $v" in query:
+            return [{"v": "graph-namespace"}]
+        if "has check_command $k" in query:
+            return [{"k": "graph check"}]
+        if "isa depends_on" in query:
+            return []
+        return []
+
+    monkeypatch.setattr(typedb_client_module, "TypeDBClient", _typedb_client_factory(fake_run))
+    out = asyncio.run(
+        drilldown._tool_component_checks(
+            _typedb_settings(), _target(), {"component": "runai-agent"}
+        )
+    )
+    assert out["source"] == "ontology"
+    result = out["result"]
+    assert result == {
+        "component": "runai-agent",
+        "namespace": "graph-namespace",
+        "kind": expected_kind,
+        "purpose": "graph purpose",
+        "failure_effect": "graph failure effect",
+        "checks": ["graph check"],
+        "depends_on": [],
+        "dependencies": [],
+    }
+
+
+def test_component_checks_graph_failure_falls_back_to_catalog(monkeypatch, caplog) -> None:
+    def boom(query: str) -> list[dict]:
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(typedb_client_module, "TypeDBClient", _typedb_client_factory(boom))
+    with caplog.at_level("WARNING"):
+        out = asyncio.run(
+            drilldown._tool_component_checks(
+                _typedb_settings(), _target(), {"component": "runai-agent"}
+            )
+        )
+    assert out["source"] == "catalog_fallback"
+    assert out["result"]["component"] == "runai-agent"
+    assert "component_checks ontology query failed" in caplog.text
+
+
+def test_component_checks_unknown_component_never_touches_the_graph(monkeypatch) -> None:
+    """Resolution failure stays local-map-based even when TypeDB is enabled —
+    there is no canonical name to send to the graph."""
+
+    def explode(query: str) -> list[dict]:
+        raise AssertionError("the graph must not be queried for an unresolved component")
+
+    monkeypatch.setattr(typedb_client_module, "TypeDBClient", _typedb_client_factory(explode))
+    out = asyncio.run(
+        drilldown._tool_component_checks(
+            _typedb_settings(), _target(), {"component": "totally-bogus-xyz"}
+        )
+    )
+    assert out["summary"] == "unknown component totally-bogus-xyz"
+    # Neither knowledge source was consulted, and the envelope stays
+    # source-labelled in every non-error shape.
+    assert out["source"] == "unresolved"
+
+
+def test_component_checks_graph_query_escapes_component_name() -> None:
+    """Injection guard: a component name containing a double quote must reach
+    TypeQL only through escape_typeql, never interpolated raw."""
+    malicious = 'runai-agent" ; insert $x isa node;'
+    captured: list[str] = []
+
+    def fake_run(query: str) -> list[dict]:
+        captured.append(query)
+        return []
+
+    drilldown._component_checks_via_graph(_DirectClient(fake_run), malicious, "")
+    joined = "\n".join(captured)
+    assert captured, "the graph helper must have issued at least one query"
+    assert f'has name "{escape_typeql(malicious)}"' in joined
+    assert f'has name "{malicious}"' not in joined
 
 
 # --- case_lookup -----------------------------------------------------------

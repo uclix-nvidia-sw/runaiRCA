@@ -2089,8 +2089,13 @@ def _loki_label_reference(catalog: dict[str, list[str]]) -> str:
     return "; ".join(parts)[:1500]
 
 
-async def _tool_knowledge_lookup(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
-    """Answer 'what is known about this?' from the catalogs — no cluster call.
+def _typedb_enabled(settings: Settings) -> bool:
+    """Same gate as kg_enrichment/external_case_cards: flag AND address."""
+    return bool(settings.enable_typedb and settings.typedb_address)
+
+
+def _knowledge_lookup_from_catalogs(settings: Settings, text: str) -> dict[str, Any]:
+    """Version-controlled catalog + operator-approved runtime knowledge (no TypeDB).
 
     Reads the same merged map the ranker uses: the version-controlled catalog
     PLUS operator-approved runtime knowledge (including matcher-only novel
@@ -2105,9 +2110,6 @@ async def _tool_knowledge_lookup(settings: Settings, target: AnalysisTarget, arg
         match_runai_known_issues,
     )
 
-    text = str(args.get("hypothesis") or args.get("text") or args.get("query") or "").strip()
-    if not text:
-        return {"error": "hypothesis text is required"}
     lowered = text.lower()
     symptoms: list[dict[str, Any]] = []
     for family, symptom in match_failure_mode_symptoms(
@@ -2142,16 +2144,113 @@ async def _tool_knowledge_lookup(settings: Settings, target: AnalysisTarget, arg
     ]
     if not symptoms and not issues:
         return {
+            "source": "catalog_fallback",
             "summary": "no catalog or approved knowledge matches that text",
             "result": {"symptoms": [], "known_issues": []},
         }
     return {
+        "source": "catalog_fallback",
         "summary": (
             f"{len(symptoms)} known symptom(s), {len(issues)} known issue(s) "
             "— guidance to test, not evidence"
         ),
         "result": {"symptoms": symptoms, "known_issues": issues},
     }
+
+
+def _knowledge_lookup_via_graph(client: Any, text: str) -> dict[str, Any]:
+    """Unified TypeDB knowledge chain: curated + learned + known-issue symptoms,
+    all reachable through one `indicates` traversal — no catalog-type split.
+
+    Bulk-pulls the graph's symptom projection on one reader, then matches
+    ``text`` in Python via ``_keyword_hits`` (TypeQL has no text search), so
+    the LLM's free-text hypothesis is never interpolated into TypeQL.
+    """
+    from app.knowledge import _keyword_hits, is_matcher_only_family
+    from app.services import kg_enrichment as kg
+
+    with client.open_reader() as run:
+        rows = {
+            "symptoms": [*run(kg._KNOWLEDGE_QUERY), *run(kg._KNOWLEDGE_ACTIONLESS_QUERY)],
+            "reason": run(kg._KNOWLEDGE_REASON_QUERY),
+            # ko/lifecycle/exclusive/component are skipped here (bounded
+            # latency): this tool needs neither i18n nor lifecycle gating.
+            "exclusive_actions": [],
+            "lifecycle": [],
+            "reason_ko": [],
+            "component": [],
+            "name_ko": [],
+            "actions_ko": [],
+            "affected_version": run(kg._KNOWLEDGE_AFFECTED_VERSION_QUERY),
+            "fixed_version": run(kg._KNOWLEDGE_FIXED_VERSION_QUERY),
+        }
+    knowledge = kg._project_knowledge(rows)
+    matches: list[dict[str, Any]] = []
+    for family, entries in knowledge.items():
+        for entry in entries:
+            hits, _negated = _keyword_hits(text, entry.get("keywords") or [])
+            if not hits:
+                continue
+            name = str(entry.get("symptom") or "")
+            item: dict[str, Any] = {
+                "symptom": name,
+                "family": family,
+                "source": "external_case" if name.startswith("ext:") else "ontology",
+                "matched_keywords": hits,
+                "actions": list(entry.get("actions") or [])[:3],
+                "matcher_only": is_matcher_only_family(family),
+            }
+            if reason := str(entry.get("reason") or "")[:300]:
+                item["reason"] = reason
+            if affected := str(entry.get("affected_version") or ""):
+                item["affected_version"] = affected
+            if fixed := str(entry.get("fixed_version") or ""):
+                item["fixed_version"] = fixed
+            matches.append(item)
+    matches.sort(key=lambda item: -len(item["matched_keywords"]))
+    matches = matches[:_KNOWLEDGE_MATCH_CAP]
+    if not matches:
+        return {
+            "source": "ontology",
+            "summary": "no catalog or approved knowledge matches that text",
+            "result": {"symptoms": [], "known_issues": []},
+        }
+    return {
+        "source": "ontology",
+        "summary": (
+            f"{len(matches)} known symptom(s), 0 known issue(s) "
+            "— guidance to test, not evidence"
+        ),
+        "result": {"symptoms": matches, "known_issues": []},
+    }
+
+
+async def _tool_knowledge_lookup(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    """Answer 'what is known about this?' — the live ontology first, catalog fallback.
+
+    Queries the TypeDB knowledge graph (curated + operator-approved learned
+    symptoms + known issues, all one `indicates` chain — including
+    cron-refreshed external cases) when TypeDB is enabled and reachable;
+    degrades to the version-controlled YAML catalogs on any failure or when
+    TypeDB is disabled. Every entry is labelled with where it came from.
+    """
+    text = str(args.get("hypothesis") or args.get("text") or args.get("query") or "").strip()
+    if not text:
+        return {"error": "hypothesis text is required"}
+    if _typedb_enabled(settings):
+        from app.ontology.typedb_client import TypeDBClient
+
+        client = TypeDBClient(settings)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_knowledge_lookup_via_graph, client, text.lower()),
+                timeout=settings.typedb_timeout_seconds + 1,
+            )
+        except Exception:  # noqa: BLE001 - ontology lookup is best-effort
+            _log.warning(
+                "knowledge_lookup ontology query failed; using catalog fallback", exc_info=True
+            )
+    return _knowledge_lookup_from_catalogs(settings, text)
 
 
 async def _tool_case_lookup(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
@@ -2201,31 +2300,44 @@ async def _tool_case_lookup(settings: Settings, target: AnalysisTarget, args: di
     }
 
 
-async def _tool_xid_lookup(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
-    """NVIDIA XID catalog lookup: identity, resolution guidance, and the
-    causal leads_to escalation graph (both directions)."""
+_XID_ESCALATES_TO_QUERY = (
+    "match $x isa xid_error, has xid_code {code}; "
+    "(cause_fault: $x, effect_fault: $e) isa leads_to; $e has xid_code $c; select $c;"
+)
+_XID_MNEMONIC_QUERY = "match $x isa xid_error, has xid_code {code}, has mnemonic $m; select $m;"
+_XID_GPU_MODELS_QUERY = (
+    "match $x isa xid_error, has xid_code {code}; "
+    "(fault: $x, model: $g) isa applies_to; $g has name $n; select $n;"
+)
+
+
+def _xid_from_catalog(code: int) -> dict[str, Any]:
+    """NVIDIA XID catalog lookup from the version-controlled YAML (no TypeDB)."""
     import os
 
     from app.knowledge import load_xid_catalog
 
-    try:
-        code = int(str(args.get("xid")).strip())
-    except (TypeError, ValueError):
-        return {"error": "xid must be a numeric XID code"}
-    if not 0 < code < 1000:
-        return {"error": "xid must be between 1 and 999"}
     catalog = load_xid_catalog(os.getenv("XID_CATALOG_FILE", "knowledge/xid_catalog.yaml"))
     entry = catalog.get(code)
     if not entry:
-        return {"summary": f"XID {code} is not in the catalog", "result": {}}
+        return {
+            "source": "catalog_fallback",
+            "summary": f"XID {code} is not in the catalog",
+            "result": {},
+        }
+    immediate = entry.get("immediate_action", "")
+    investigatory = entry.get("investigatory_action", "")
     result: dict[str, Any] = {
         "code": code,
         "mnemonic": entry.get("mnemonic", ""),
         "description": entry.get("description", ""),
         "severity": entry.get("severity", ""),
         "gpu_models": entry.get("gpu_models", []),
-        "immediate_action": entry.get("immediate_action", ""),
-        "investigatory_action": entry.get("investigatory_action", ""),
+        "immediate_action": immediate,
+        "investigatory_action": investigatory,
+        # `fixes` is the stable key across both modes; graph mode has no
+        # immediate/investigatory split, only resolved_by statements.
+        "fixes": [action for action in (immediate, investigatory) if action],
         "trigger": str(entry.get("trigger") or "")[:800],
         "linkage_note": entry.get("linkage_note", ""),
         "escalates_to": [
@@ -2257,14 +2369,231 @@ async def _tool_xid_lookup(settings: Settings, target: AnalysisTarget, args: dic
     result["escalation_roots"] = sorted(roots.values(), key=lambda r: r["code"])
     identity = entry.get("description") or entry.get("mnemonic") or ""
     return {
+        "source": "catalog_fallback",
         "summary": f"XID {code}: {identity} ({entry.get('severity', '')}) — catalog reference only",
+        "result": result,
+    }
+
+
+def _xid_mnemonic(run: Any, code: int) -> str:
+    rows = run(_XID_MNEMONIC_QUERY.format(code=code))
+    return str(rows[0].get("m") or "") if rows else ""
+
+
+def _xid_lookup_via_graph(client: Any, code: int) -> dict[str, Any]:
+    """XID identity, resolved_by fixes, and the leads_to escalation graph (both
+    directions), read from TypeDB on one reader. `code` is caller-validated int."""
+    from app.services import kg_enrichment as kg
+
+    with client.open_reader() as run:
+        detail_rows = run(kg._FN_XID_DETAIL.format(code=code))
+        if not detail_rows:
+            return {
+                "source": "ontology",
+                "summary": f"XID {code} is not in the catalog",
+                "result": {},
+            }
+        detail = detail_rows[0]
+        mnemonic = str(detail.get("m") or "")
+        description = str(detail.get("d") or "")
+        severity = str(detail.get("s") or "")
+        fixes = kg._statements(run(kg._FN_FIXES_FOR_XID.format(code=code)))
+        triggers = kg._statements(run(kg._FN_TRIGGER_FOR_XID.format(code=code)))
+        linkage_notes = kg._statements(run(kg._FN_LINKAGE_NOTE_FOR_XID.format(code=code)))
+        gpu_models = sorted(
+            {
+                str(row["n"])
+                for row in run(_XID_GPU_MODELS_QUERY.format(code=code))
+                if row.get("n")
+            }
+        )
+        target_codes = sorted(
+            {
+                int(row["c"])
+                for row in run(_XID_ESCALATES_TO_QUERY.format(code=code))
+                if kg._is_int(row.get("c"))
+            }
+        )
+        escalates_to = [
+            {"code": target_code, "mnemonic": _xid_mnemonic(run, target_code)}
+            for target_code in target_codes
+        ]
+        root_codes = sorted(
+            {
+                int(value)
+                for value in kg._values(run(kg._FN_ROOT_XID_CHAIN_FOR.format(code=code)))
+                if kg._is_int(value)
+            }
+        )
+        escalation_roots = []
+        for root_code in root_codes:
+            root_rows = run(kg._FN_XID_DETAIL.format(code=root_code))
+            if root_rows:
+                escalation_roots.append(
+                    {
+                        "code": root_code,
+                        "mnemonic": str(root_rows[0].get("m") or ""),
+                        "severity": str(root_rows[0].get("s") or ""),
+                    }
+                )
+    result = {
+        "code": code,
+        "mnemonic": mnemonic,
+        "description": description,
+        "severity": severity,
+        "gpu_models": gpu_models,
+        "fixes": fixes,
+        "trigger": (triggers[0] if triggers else "")[:800],
+        "linkage_note": linkage_notes[0] if linkage_notes else "",
+        "escalates_to": escalates_to,
+        "escalation_roots": escalation_roots,
+    }
+    identity = description or mnemonic
+    return {
+        "source": "ontology",
+        "summary": f"XID {code}: {identity} ({severity}) — catalog reference only",
+        "result": result,
+    }
+
+
+async def _tool_xid_lookup(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    """NVIDIA XID lookup: identity, resolution guidance, and the causal
+    leads_to escalation graph (both directions) — the live ontology first,
+    catalog fallback."""
+    try:
+        code = int(str(args.get("xid")).strip())
+    except (TypeError, ValueError):
+        return {"error": "xid must be a numeric XID code"}
+    if not 0 < code < 1000:
+        return {"error": "xid must be between 1 and 999"}
+    if _typedb_enabled(settings):
+        from app.ontology.typedb_client import TypeDBClient
+
+        client = TypeDBClient(settings)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(_xid_lookup_via_graph, client, code),
+                timeout=settings.typedb_timeout_seconds + 1,
+            )
+        except Exception:  # noqa: BLE001 - ontology lookup is best-effort
+            _log.warning("xid_lookup ontology query failed; using catalog fallback", exc_info=True)
+    return _xid_from_catalog(code)
+
+
+_COMPONENT_SPARSE_ATTR_QUERIES = {
+    # Each attribute is sparse (the loader skips it when the YAML value is
+    # empty — see ontology/load_architecture.py), so a component missing any
+    # ONE of them would drop out of a combined match. Read separately, exactly
+    # like kg_enrichment's per-attribute knowledge queries.
+    "description": (
+        'match $c isa control_plane_component, has name "{n}", has description $v; select $v;'
+    ),
+    "failure_effect": (
+        'match $c isa control_plane_component, has name "{n}", has failure_effect $v; select $v;'
+    ),
+    "k8s_namespace": (
+        'match $c isa control_plane_component, has name "{n}", has k8s_namespace $v; select $v;'
+    ),
+}
+_COMPONENT_CHECKS_QUERY = (
+    'match $c isa control_plane_component, has name "{n}", has check_command $k; select $k;'
+)
+_COMPONENT_DEPENDS_ON_QUERY = (
+    'match $c isa control_plane_component, has name "{n}"; '
+    "(dependent: $c, dependency: $d) isa depends_on; $d has name $dn; select $dn;"
+)
+
+
+def _component_checks_from_catalog(
+    components: dict[str, dict[str, Any]], entry: dict[str, Any], canonical: str
+) -> dict[str, Any]:
+    dependencies = [
+        {
+            "name": dep,
+            "failure_effect": components[dep].get("failure_effect", ""),
+            "checks": components[dep].get("checks", []),
+        }
+        for dep in entry.get("depends_on") or []
+        if dep in components
+    ]
+    dep_word = "dependency" if len(dependencies) == 1 else "dependencies"
+    return {
+        "source": "catalog_fallback",
+        "summary": f"{canonical}: {len(dependencies)} direct {dep_word}",
+        "result": {
+            "component": canonical,
+            "namespace": entry.get("namespace", ""),
+            "kind": entry.get("kind", ""),
+            "purpose": entry.get("purpose", ""),
+            "failure_effect": entry.get("failure_effect", ""),
+            "checks": entry.get("checks", []),
+            "depends_on": entry.get("depends_on", []),
+            "dependencies": dependencies,
+        },
+    }
+
+
+def _component_attr(run: Any, escaped_name: str, attr: str) -> str:
+    rows = run(_COMPONENT_SPARSE_ATTR_QUERIES[attr].format(n=escaped_name))
+    return str(rows[0].get("v") or "") if rows else ""
+
+
+def _component_checks_list(run: Any, escaped_name: str) -> list[str]:
+    rows = run(_COMPONENT_CHECKS_QUERY.format(n=escaped_name))
+    return sorted({str(row["k"]) for row in rows if row.get("k")})
+
+
+def _component_checks_via_graph(client: Any, canonical: str, kind: str) -> dict[str, Any]:
+    """Component purpose/failure-effect/namespace/checks/depends_on from TypeDB.
+
+    `canonical` is the RESOLVED component name (local alias/substring matching
+    already happened); `kind` comes from the local architecture map — the
+    graph has no such attribute. The name is escaped before every
+    interpolation, including each direct dependency's name.
+    """
+    from app.ontology.typedb_client import escape_typeql
+
+    escaped = escape_typeql(canonical)
+    with client.open_reader() as run:
+        purpose = _component_attr(run, escaped, "description")
+        failure_effect = _component_attr(run, escaped, "failure_effect")
+        namespace = _component_attr(run, escaped, "k8s_namespace")
+        checks = _component_checks_list(run, escaped)
+        dep_rows = run(_COMPONENT_DEPENDS_ON_QUERY.format(n=escaped))
+        dep_names = sorted({str(row["dn"]) for row in dep_rows if row.get("dn")})
+        dependencies = []
+        for dep_name in dep_names[:8]:
+            dep_escaped = escape_typeql(dep_name)
+            dependencies.append(
+                {
+                    "name": dep_name,
+                    "failure_effect": _component_attr(run, dep_escaped, "failure_effect"),
+                    "checks": _component_checks_list(run, dep_escaped),
+                }
+            )
+    dep_word = "dependency" if len(dependencies) == 1 else "dependencies"
+    result = {
+        "component": canonical,
+        "namespace": namespace,
+        "kind": kind,
+        "purpose": purpose,
+        "failure_effect": failure_effect,
+        "checks": checks,
+        "depends_on": dep_names,
+        "dependencies": dependencies,
+    }
+    return {
+        "source": "ontology",
+        "summary": f"{canonical}: {len(dependencies)} direct {dep_word}",
         "result": result,
     }
 
 
 async def _tool_component_checks(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
     """Platform component topology: purpose, failure effect, ready-to-run
-    checks, and its direct (one-hop) dependencies."""
+    checks, and its direct (one-hop) dependencies — the live ontology first,
+    catalog fallback. Name resolution always stays local (alias matching);
+    only the resolved canonical name is sent to the graph."""
     from app.knowledge import component_for_target, load_architecture
 
     component = str(args.get("component") or "").strip()
@@ -2284,32 +2613,29 @@ async def _tool_component_checks(settings: Settings, target: AnalysisTarget, arg
         lowered = component.lower()
         matches = sorted(name for name in components if lowered in name.lower())
         return {
+            # Resolution failed locally — no knowledge source was consulted,
+            # so neither "ontology" nor "catalog_fallback" would be honest.
+            "source": "unresolved",
             "summary": f"unknown component {component}",
             "result": {"known_components": (matches or sorted(components))[:10]},
         }
-    dependencies = [
-        {
-            "name": dep,
-            "failure_effect": components[dep].get("failure_effect", ""),
-            "checks": components[dep].get("checks", []),
-        }
-        for dep in entry.get("depends_on") or []
-        if dep in components
-    ]
-    dep_word = "dependency" if len(dependencies) == 1 else "dependencies"
-    return {
-        "summary": f"{entry.get('component', component)}: {len(dependencies)} direct {dep_word}",
-        "result": {
-            "component": entry.get("component", component),
-            "namespace": entry.get("namespace", ""),
-            "kind": entry.get("kind", ""),
-            "purpose": entry.get("purpose", ""),
-            "failure_effect": entry.get("failure_effect", ""),
-            "checks": entry.get("checks", []),
-            "depends_on": entry.get("depends_on", []),
-            "dependencies": dependencies,
-        },
-    }
+    canonical = entry.get("component", component)
+    if _typedb_enabled(settings):
+        from app.ontology.typedb_client import TypeDBClient
+
+        client = TypeDBClient(settings)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    _component_checks_via_graph, client, canonical, entry.get("kind", "")
+                ),
+                timeout=settings.typedb_timeout_seconds + 1,
+            )
+        except Exception:  # noqa: BLE001 - ontology lookup is best-effort
+            _log.warning(
+                "component_checks ontology query failed; using catalog fallback", exc_info=True
+            )
+    return _component_checks_from_catalog(components, entry, canonical)
 
 
 def _domain_tools(
@@ -2583,10 +2909,11 @@ def _domain_tools(
             "description": (
                 "Look up what is ALREADY KNOWN about a symptom or hypothesis: matching "
                 "catalog symptoms and operator-approved knowledge, each with its root-cause "
-                "family and confirmed remediation, plus matching Run:ai known issues. This "
-                "is guidance to TEST with your own domain tools — it is never evidence, and "
-                "an entry marked matcher_only must not be reported as the root cause. "
-                "args: hypothesis (the text you want to look up)"
+                "family and confirmed remediation, plus matching Run:ai known issues. Consults "
+                "the live knowledge ontology in TypeDB first, falling back to the built-in "
+                "catalog. This is guidance to TEST with your own domain tools — it is never "
+                "evidence, and an entry marked matcher_only must not be reported as the root "
+                "cause. args: hypothesis (the text you want to look up)"
             ),
             "call": _tool_knowledge_lookup,
         }
@@ -2603,17 +2930,18 @@ def _domain_tools(
         agent_tools["xid_lookup"] = {
             "description": (
                 "Look up an NVIDIA XID code in the GPU-error catalog: what it means, its "
-                "severity, immediate/investigatory action, and which other XIDs it escalates "
-                "to or from. Known-knowledge guidance to TEST with your own domain tools — "
-                "never evidence for THIS incident. args: xid (numeric XID code you saw in "
-                "dmesg/logs)"
+                "severity, resolution guidance, and which other XIDs it escalates to or from. "
+                "Queries the live TypeDB ontology first, falling back to the built-in catalog. "
+                "Known-knowledge guidance to TEST with your own domain tools — never evidence "
+                "for THIS incident. args: xid (numeric XID code you saw in dmesg/logs)"
             ),
             "call": _tool_xid_lookup,
         }
         agent_tools["component_checks"] = {
             "description": (
                 "Look up a Run:ai platform component's purpose, failure effect, ready-to-run "
-                "checks, and its direct dependencies. Known-knowledge guidance to TEST with "
+                "checks, and its direct dependencies. Queries the live TypeDB ontology first, "
+                "falling back to the built-in catalog. Known-knowledge guidance to TEST with "
                 "your own domain tools — never evidence for THIS incident. args: component "
                 "(platform component name, e.g. runai-scheduler)"
             ),
