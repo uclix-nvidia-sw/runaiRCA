@@ -108,6 +108,7 @@ def test_schema_models_executable_runbook_relations() -> None:
         "entity diagnostic_step",
         "relation runbook_contains",
         "relation runbook_entry",
+        "relation runbook_for",
         "relation diagnostic_transition",
         "relation diagnostic_outcome",
         "relation diagnostic_recommendation",

@@ -523,6 +523,99 @@ def test_write_case_projects_support_thread_as_diagnostic_playbook(monkeypatch: 
     assert 'has question "Correct switch routing."' not in emitted
 
 
+# --- playbook step outcome/interpretation + runbook_for case link ----------
+
+
+def test_playbook_step_carries_outcome_and_resolved_interpretation(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        ingest, "load_family_catalog",
+        lambda _: SimpleNamespace(families={"network_fabric_error"}),
+    )
+    p = _payload(historical_actions=[
+        {"action_id": "A003", "normalized_action": "Run inter-node ping.",
+         "outcome": "diagnostic", "evidence_ids": ["E002", "E011"]},
+    ])
+    inc = lx._to_incident(p, "op", "t")
+
+    tx = _Tx()
+    lx._write_case(tx, inc, lx._symptom_keywords(p))
+    emitted = "\n".join(tx.queries)
+
+    assert 'has outcome "diagnostic"' in emitted
+    assert (
+        'has interpretation "QP transition failure. / Repeated QP transition failures."'
+        in emitted
+    )
+
+
+def test_playbook_step_interpretation_empty_when_no_evidence_resolves(monkeypatch: Any) -> None:
+    # Default fixture's only diagnostic/preventive action (A003) cites no
+    # evidence -- current behavior (empty interpretation) must survive the
+    # new outcome/interpretation stamping.
+    monkeypatch.setattr(
+        ingest, "load_family_catalog",
+        lambda _: SimpleNamespace(families={"network_fabric_error"}),
+    )
+    inc = lx._to_incident(_payload(), "op", "t")
+
+    tx = _Tx()
+    lx._write_case(tx, inc, lx._symptom_keywords(_payload()))
+    emitted = "\n".join(tx.queries)
+
+    assert 'has interpretation ""' in emitted
+    assert 'has outcome "diagnostic"' in emitted
+
+
+def test_observed_from_evidence_caps_two_summaries_and_400_chars() -> None:
+    refs = [
+        {"evidence_id": "E1", "summary": "a" * 240},
+        {"evidence_id": "E2", "summary": "b" * 240},
+        {"evidence_id": "E3", "summary": "c" * 240},
+    ]
+    observed = lx._observed_from_evidence({"evidence_ids": ["E1", "E2", "E3"]}, refs)
+    assert observed == ("a" * 240 + " / " + "b" * 240)[:400]
+    assert len(observed) == 400
+
+
+def test_observed_from_evidence_empty_without_resolvable_evidence() -> None:
+    refs = [{"evidence_id": "E1", "summary": "kept"}]
+    assert lx._observed_from_evidence({"evidence_ids": []}, refs) == ""
+    assert lx._observed_from_evidence({}, refs) == ""
+    assert lx._observed_from_evidence({"evidence_ids": ["missing"]}, refs) == ""
+
+
+def test_runbook_for_insert_binds_entities_only(monkeypatch: Any) -> None:
+    """Same static guard as test_probe_template_for_insert_binds_entities_only
+    (tests/test_troubleshooting_ontology.py): the relation insert's match must
+    NOT assert runbook_for itself, or the insert silently no-ops on a live
+    TypeDB even though the loader exits 0."""
+    monkeypatch.setattr(
+        ingest, "load_family_catalog",
+        lambda _: SimpleNamespace(families={"network_fabric_error"}),
+    )
+    inc = lx._to_incident(_payload(), "op", "t")
+
+    tx = _Tx()
+    lx._write_case(tx, inc, lx._symptom_keywords(_payload()))
+    inserts = [
+        q for q in tx.queries if "insert (runbook: $a, incident: $b) isa runbook_for" in q
+    ]
+    assert inserts, "loader must attempt the runbook_for insert"
+    for query in inserts:
+        match_clause = query.split("insert", 1)[0]
+        assert "runbook_for" not in match_clause
+
+
+def test_delete_playbook_deletes_runbook_for_before_runbook() -> None:
+    tx = _Tx()
+    lx._delete_playbook(tx, "ext:sc-gone000000")
+    emitted = "\n".join(tx.queries)
+    assert "isa runbook_for(runbook: $r); delete $x;" in emitted
+    assert emitted.index("isa runbook_for(runbook: $r); delete $x;") < emitted.index(
+        'match $x isa runbook, has name "ext:sc-gone000000:playbook"; delete $x;'
+    )
+
+
 def test_symptom_keywords_lowercase_dedup_and_error_signatures_only() -> None:
     kw = lx._symptom_keywords(_payload())
     assert kw == ["ibv_modify_qp failed with 19 no such device", "destination host unreachable"]

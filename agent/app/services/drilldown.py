@@ -108,7 +108,9 @@ _RESULT_CHARS = 1500  # per-query result excerpt fed back into the loop
 # cluster had reported it, which is how query strings once produced a
 # control-plane misdiagnosis on a run that observed nothing.
 _KNOWLEDGE_TOOL = "knowledge_lookup"
-_KNOWLEDGE_TOOLS = frozenset({"knowledge_lookup", "case_lookup", "xid_lookup", "component_checks"})
+_KNOWLEDGE_TOOLS = frozenset(
+    {"knowledge_lookup", "case_lookup", "xid_lookup", "component_checks", "steps_lookup"}
+)
 _KNOWLEDGE_MATCH_CAP = 5
 _RUNAI_PROJECT_ID_CACHE: dict[tuple[str, str], str] = {}
 _USER_PROMPT_CHARS = 6000
@@ -848,6 +850,7 @@ async def _run_query(
                         or args.get("text")
                         or args.get("xid")
                         or args.get("component")
+                        or args.get("family")
                         or ""
                     )[:200],
                     "summary": str(outcome.get("summary") or error or ""),
@@ -2638,6 +2641,102 @@ async def _tool_component_checks(settings: Settings, target: AnalysisTarget, arg
     return _component_checks_from_catalog(components, entry, canonical)
 
 
+_FN_STEPS_FOR_FAMILY = (
+    'match let $iid, $id, $q, $o, $it in steps_for_family("{family}"); '
+    "select $iid, $id, $q, $o, $it;"
+)
+_STEP_ORDER_RE = re.compile(r":d(\d+)$")
+
+
+def _step_order(diagnostic_id: str) -> int:
+    """The support-thread order encoded in a playbook step id's ``:dNN`` suffix
+    (ontology/load_external_cases.py) -- 0 for a malformed/foreign id, so a
+    stray row still sorts instead of crashing the tool."""
+    match = _STEP_ORDER_RE.search(diagnostic_id)
+    return int(match.group(1)) if match else 0
+
+
+def _steps_lookup_via_graph(client: Any, family: str, text: str) -> dict[str, Any]:
+    """Cross-case playbook steps for a root-cause family, read from
+    ``steps_for_family`` (ontology/functions.tql). `text`, when given, keyword-
+    filters on each step's own question+interpretation -- it never reaches
+    TypeQL, only the (already vocabulary-validated) `family` does."""
+    from app.knowledge import _keyword_hits
+    from app.ontology.typedb_client import escape_typeql
+
+    needle = [text.lower()] if text else []
+    with client.open_reader() as run:
+        rows = run(_FN_STEPS_FOR_FAMILY.format(family=escape_typeql(family)))
+    by_case: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        incident_id = str(row.get("iid") or "").strip()
+        diagnostic_id = str(row.get("id") or "").strip()
+        question = str(row.get("q") or "").strip()
+        if not incident_id or not diagnostic_id or not question:
+            continue
+        observed = str(row.get("it") or "").strip()
+        if needle and not _keyword_hits(f"{question} {observed}".lower(), needle)[0]:
+            continue
+        step: dict[str, Any] = {
+            "order": _step_order(diagnostic_id),
+            "question": question[:300],
+            "outcome": str(row.get("o") or "").strip(),
+        }
+        if observed:
+            step["observed"] = observed[:300]
+        by_case.setdefault(incident_id, []).append(step)
+    cases = [
+        {"case": incident_id, "steps": sorted(by_case[incident_id], key=lambda s: s["order"])[:6]}
+        for incident_id in sorted(by_case)[:5]
+    ]
+    step_count = sum(len(c["steps"]) for c in cases)
+    return {
+        "source": "ontology",
+        "summary": (
+            f"{len(cases)} case(s), {step_count} step(s) — historical reference, not evidence"
+        ),
+        "result": {"cases": cases},
+    }
+
+
+async def _tool_steps_lookup(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
+    """Cross-case support-team investigation patterns for a root-cause family:
+    the diagnostic/preventive steps other vendor-support cases in that family
+    walked through, in thread order. Graph-only -- these per-case mini-runbooks
+    (ontology/load_external_cases.py) are never mirrored to a YAML catalog, so
+    there is no fallback to degrade to."""
+    from ontology.families import ingestable_families
+
+    family = str(args.get("family") or "").strip()
+    if not family:
+        return {"error": "family is required"}
+    valid = ingestable_families()
+    if family not in valid:
+        return {"error": f"unknown family {family!r} — valid: {', '.join(sorted(valid)[:15])}"}
+    text = str(args.get("text") or "").strip()
+    if not _typedb_enabled(settings):
+        return {
+            "source": "unavailable",
+            "summary": "cross-case step patterns require the knowledge ontology (TypeDB)",
+            "result": {"cases": []},
+        }
+    from app.ontology.typedb_client import TypeDBClient
+
+    client = TypeDBClient(settings)
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_steps_lookup_via_graph, client, family, text),
+            timeout=settings.typedb_timeout_seconds + 1,
+        )
+    except Exception:  # noqa: BLE001 - ontology lookup is best-effort
+        _log.warning("steps_lookup ontology query failed", exc_info=True)
+        return {
+            "source": "unavailable",
+            "summary": "cross-case step patterns require the knowledge ontology (TypeDB)",
+            "result": {"cases": []},
+        }
+
+
 def _domain_tools(
     settings: Settings, loki_labels: dict[str, list[str]] | None = None
 ) -> dict[str, dict[str, dict[str, Any]]]:
@@ -2946,6 +3045,19 @@ def _domain_tools(
                 "(platform component name, e.g. runai-scheduler)"
             ),
             "call": _tool_component_checks,
+        }
+        agent_tools["steps_lookup"] = {
+            "description": (
+                "Look up cross-case support-team investigation patterns for a root-cause "
+                "family: the diagnostic/preventive steps other vendor-support cases in that "
+                "family walked through, in thread order. Reads the live TypeDB knowledge "
+                "ontology only — these per-case step sequences are never mirrored to a YAML "
+                "catalog, so there is no fallback when TypeDB is off. Known-knowledge guidance "
+                "to TEST with your own domain tools — never evidence for THIS incident. args: "
+                "family (one of the closed root-cause family names), text? (free text to "
+                "keyword-filter the returned steps)"
+            ),
+            "call": _tool_steps_lookup,
         }
     return registry
 

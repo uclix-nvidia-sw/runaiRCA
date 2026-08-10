@@ -82,6 +82,17 @@ SCHEMA_MIGRATIONS = [
     "undefine entity namespace;",
     "undefine entity project;",
     "undefine entity queue;",
+    # 2026-08-10 external-case step graph: diagnostic_step gains a step-class
+    # attribute and playbook runbooks gain a case link. Both are pure
+    # additions (no annotation change, nothing removed), so `define` below
+    # would normally cover them alone -- these are belt-and-suspenders entries
+    # so an upgraded deployment gets them even if the single big `define`
+    # transaction at the end ever fails partway through. The relation must be
+    # defined before either entity can play a role in it.
+    "define diagnostic_step owns outcome @card(0..1);",
+    "define relation runbook_for, relates runbook, relates incident;",
+    "define runbook plays runbook_for:runbook;",
+    "define incident plays runbook_for:incident;",
 ]
 
 # Instance deletions that must precede the schema undefines above: a type with

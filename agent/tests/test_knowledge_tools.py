@@ -1,5 +1,6 @@
-"""The three catalog drill-down tools (case_lookup, xid_lookup, component_checks):
-reachable by every agent, mirror knowledge_lookup's contract, never evidence."""
+"""The four catalog/graph drill-down tools (case_lookup, xid_lookup,
+component_checks, steps_lookup): reachable by every agent, mirror
+knowledge_lookup's contract, never evidence."""
 
 from __future__ import annotations
 
@@ -78,11 +79,17 @@ def _typedb_client_factory(run):
 # --- registry -----------------------------------------------------------
 
 
-def test_every_domain_agent_can_reach_all_four_knowledge_tools() -> None:
+def test_every_domain_agent_can_reach_all_five_knowledge_tools() -> None:
     registry = drilldown._domain_tools(make_settings())
     assert registry, "expected at least one domain registry"
     for agent, tools in registry.items():
-        for name in ("knowledge_lookup", "case_lookup", "xid_lookup", "component_checks"):
+        for name in (
+            "knowledge_lookup",
+            "case_lookup",
+            "xid_lookup",
+            "component_checks",
+            "steps_lookup",
+        ):
             assert name in tools, f"{agent} cannot consult {name}"
 
 
@@ -493,6 +500,137 @@ def test_case_lookup_error_text_alias_and_typedb_off_by_default() -> None:
     assert out["result"] == {"cases": [], "investigation_leads": []}
 
 
+# --- steps_lookup -----------------------------------------------------------
+
+
+def test_steps_lookup_requires_family() -> None:
+    out = asyncio.run(drilldown._tool_steps_lookup(make_settings(), _target(), {}))
+    assert out == {"error": "family is required"}
+
+
+def test_steps_lookup_unknown_family_lists_valid_names() -> None:
+    out = asyncio.run(
+        drilldown._tool_steps_lookup(
+            make_settings(), _target(), {"family": "not_a_real_family"}
+        )
+    )
+    assert "error" in out
+    assert "not_a_real_family" in out["error"]
+    assert "gpu_hardware_error" in out["error"]
+
+
+def test_steps_lookup_typedb_off_is_graceful() -> None:
+    # TypeDB off (make_settings default): no catalog fallback exists for this
+    # data, so the tool must degrade to an explicit "unavailable" answer.
+    out = asyncio.run(
+        drilldown._tool_steps_lookup(
+            make_settings(), _target(), {"family": "gpu_hardware_error"}
+        )
+    )
+    assert out == {
+        "source": "unavailable",
+        "summary": "cross-case step patterns require the knowledge ontology (TypeDB)",
+        "result": {"cases": []},
+    }
+
+
+def test_steps_lookup_graph_mode_groups_orders_and_caps(monkeypatch) -> None:
+    captured: list[str] = []
+
+    def fake_run(query: str) -> list[dict]:
+        captured.append(query)
+        return [
+            {"iid": "ext:sc-1", "id": "ext:sc-1:d10", "q": "Check XID history",
+             "o": "diagnostic", "it": "Xid 79 seen twice"},
+            {"iid": "ext:sc-1", "id": "ext:sc-1:d02", "q": "Collect nvidia-smi -q",
+             "o": "diagnostic", "it": ""},
+            {"iid": "ext:sc-2", "id": "ext:sc-2:d01", "q": "Reseat the GPU",
+             "o": "preventive", "it": "Card reseated cleanly"},
+        ]
+
+    monkeypatch.setattr(typedb_client_module, "TypeDBClient", _typedb_client_factory(fake_run))
+    out = asyncio.run(
+        drilldown._tool_steps_lookup(
+            _typedb_settings(), _target(), {"family": "gpu_hardware_error"}
+        )
+    )
+    assert captured and 'steps_for_family("gpu_hardware_error")' in captured[0]
+    assert out["source"] == "ontology"
+    cases = out["result"]["cases"]
+    assert [c["case"] for c in cases] == ["ext:sc-1", "ext:sc-2"]
+    # d02 must sort before d10 -- numeric order on the :dNN suffix, not
+    # lexicographic (which would put d10 first).
+    steps = cases[0]["steps"]
+    assert [s["order"] for s in steps] == [2, 10]
+    assert steps[0]["question"] == "Collect nvidia-smi -q"
+    assert "observed" not in steps[0]  # empty interpretation is omitted
+    assert steps[1]["observed"] == "Xid 79 seen twice"
+    assert cases[1]["steps"][0]["outcome"] == "preventive"
+    assert "2 case(s), 3 step(s)" in out["summary"]
+    assert "historical reference, not evidence" in out["summary"]
+
+
+def test_steps_lookup_caps_cases_and_steps(monkeypatch) -> None:
+    rows = [
+        {"iid": f"ext:sc-{i}", "id": f"ext:sc-{i}:d01", "q": "q", "o": "diagnostic", "it": ""}
+        for i in range(7)  # 7 distinct cases -> capped to 5
+    ] + [
+        {"iid": "ext:sc-0", "id": f"ext:sc-0:d{n:02d}", "q": f"q{n}", "o": "diagnostic", "it": ""}
+        for n in range(2, 9)  # 7 more steps on case 0 (8 total) -> capped to 6
+    ]
+    monkeypatch.setattr(
+        typedb_client_module, "TypeDBClient", _typedb_client_factory(lambda query: rows)
+    )
+    out = asyncio.run(
+        drilldown._tool_steps_lookup(
+            _typedb_settings(), _target(), {"family": "gpu_hardware_error"}
+        )
+    )
+    cases = out["result"]["cases"]
+    assert len(cases) == 5
+    case0 = next(c for c in cases if c["case"] == "ext:sc-0")
+    assert len(case0["steps"]) == 6
+
+
+def test_steps_lookup_text_filters_steps(monkeypatch) -> None:
+    def fake_run(query: str) -> list[dict]:
+        return [
+            {"iid": "ext:sc-1", "id": "ext:sc-1:d01", "q": "Collect nvidia-smi -q",
+             "o": "diagnostic", "it": "GPU fell off the bus"},
+            {"iid": "ext:sc-1", "id": "ext:sc-1:d02", "q": "Check NCCL logs",
+             "o": "diagnostic", "it": "no relevant lines"},
+        ]
+
+    monkeypatch.setattr(typedb_client_module, "TypeDBClient", _typedb_client_factory(fake_run))
+    out = asyncio.run(
+        drilldown._tool_steps_lookup(
+            _typedb_settings(), _target(), {"family": "gpu_hardware_error", "text": "nccl"}
+        )
+    )
+    steps = out["result"]["cases"][0]["steps"]
+    assert len(steps) == 1
+    assert steps[0]["question"] == "Check NCCL logs"
+
+
+def test_steps_lookup_graph_failure_degrades_gracefully(monkeypatch, caplog) -> None:
+    def boom(query: str) -> list[dict]:
+        raise RuntimeError("connection refused")
+
+    monkeypatch.setattr(typedb_client_module, "TypeDBClient", _typedb_client_factory(boom))
+    with caplog.at_level("WARNING"):
+        out = asyncio.run(
+            drilldown._tool_steps_lookup(
+                _typedb_settings(), _target(), {"family": "gpu_hardware_error"}
+            )
+        )
+    assert out == {
+        "source": "unavailable",
+        "summary": "cross-case step patterns require the knowledge ontology (TypeDB)",
+        "result": {"cases": []},
+    }
+    assert "steps_lookup ontology query failed" in caplog.text
+
+
 # --- artifact suppression (the #1 invariant of this file) ------------------
 
 
@@ -546,3 +684,16 @@ def test_case_lookup_answer_never_becomes_evidence() -> None:
     lookups = result.details.get("knowledge_lookups")
     assert lookups and lookups[0]["tool"] == "case_lookup"
     assert lookups[0]["query"] == "Xid 48 ECC error"
+
+
+def test_steps_lookup_answer_never_becomes_evidence() -> None:
+    # TypeDB off by default (make_settings()) -- exercises the real
+    # "unavailable" degrade path, no monkeypatch needed to prove suppression.
+    result, history = _drive_run_query(
+        "steps_lookup", drilldown._tool_steps_lookup, {"family": "gpu_hardware_error"}
+    )
+    assert result.artifacts == [], "steps_lookup answers must not be stored as artifacts"
+    assert len(history) == 1
+    lookups = result.details.get("knowledge_lookups")
+    assert lookups and lookups[0]["tool"] == "steps_lookup"
+    assert lookups[0]["query"] == "gpu_hardware_error"
