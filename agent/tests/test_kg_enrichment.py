@@ -26,6 +26,7 @@ from app.services.kg_enrichment import (
 from app.services.pipeline import (
     ReportKnowledge,
     _causal_chain_line,
+    _kb_remediation_lines,
     _knowledge_base_lines,
     _playbook_lines,
     _xid_diagnostic_guidance_lines,
@@ -1029,6 +1030,89 @@ def test_kb_says_no_match_when_no_symptom_keyword_matches() -> None:
     text = "\n".join(_knowledge_base_lines(kg, candidates, "some unrelated evidence text"))
     assert "No closely-matching prior knowledge" in text
     assert "Cordon or drain the node" not in text
+
+
+def test_kb_insufficient_evidence_hedges_cross_family_match_with_actions() -> None:
+    # candidates[0] == insufficient_evidence means _top_family_settled is False,
+    # so this cross-family graph match is the same unacted-on keyword hit the
+    # playbook hedges (_insufficient_evidence_playbook_lines) -- it must render
+    # tagged as unconfirmed, not with the confident "known fixes" wording, and
+    # the masker must still run over the rendered actions.
+    kg = KGContext(
+        enabled=True,
+        available=True,
+        knowledge={
+            "node_kubelet_pressure": [
+                {
+                    "symptom": "Node Disk Pressure",
+                    "keywords": ["diskpressure"],
+                    "actions": [
+                        "Cordon the node api_key=kg-hedge-secret-12345 before draining"
+                    ],
+                }
+            ]
+        },
+    ).as_dict()
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+
+    lines = _kb_remediation_lines(kg, candidates, "node condition DiskPressure=True")
+    text = "\n".join(lines)
+
+    assert "(knowledge match — unconfirmed)" in text
+    assert "not confirmed by this run's evidence; reference only:" in text
+    assert "known fixes from the knowledge base" not in text
+    assert "Cordon the node" in text
+    assert "kg-hedge-secret-12345" not in text
+    assert MASK_TOKEN in text
+
+
+def test_kb_settled_family_match_output_is_byte_identical() -> None:
+    # Regression guard: a settled top family must keep the exact pre-hedge
+    # wording -- none of the insufficient_evidence-only tag/suffix literals.
+    kg = KGContext(enabled=True, available=True, knowledge=_KNOWLEDGE).as_dict()
+    candidates = [RankedCause(family="node_kubelet_pressure", confidence="high", score=7.0)]
+    lines = _kb_remediation_lines(
+        kg, candidates, "node condition DiskPressure=True; pods evicted"
+    )
+    assert lines == [
+        "Matched symptom **Node Disk Pressure** (node kubelet pressure); "
+        "known fixes from the knowledge base:",
+        "  - Cordon or drain the node",
+        "  - Inspect kubelet disk usage",
+    ]
+
+
+def test_kb_insufficient_evidence_no_match_keeps_existing_line() -> None:
+    kg = KGContext(enabled=True, available=True, knowledge=_KNOWLEDGE).as_dict()
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+    lines = _kb_remediation_lines(kg, candidates, "some unrelated evidence text")
+    assert lines == ["- No closely-matching prior knowledge for this evidence yet."]
+
+
+def test_kb_insufficient_evidence_learned_family_keeps_prefix_with_tag() -> None:
+    # A matcher-only ("novel_*") family is exactly the learned/open-world case
+    # is_matcher_only_family exists for -- the learned framing and the new
+    # unconfirmed tag must coexist on the same header line.
+    kg = KGContext(
+        enabled=True,
+        available=True,
+        knowledge={
+            "novel_gpu_thermal_event": [
+                {
+                    "symptom": "Repeated Thermal Throttle On Node",
+                    "keywords": ["thermal throttle"],
+                    "actions": ["Check node airflow and fan health."],
+                }
+            ]
+        },
+    ).as_dict()
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+
+    lines = _kb_remediation_lines(kg, candidates, "repeated thermal throttle on the node")
+    text = "\n".join(lines)
+
+    assert "(not a catalog family): (knowledge match — unconfirmed)" in text
+    assert "Check node airflow and fan health." in text
 
 
 def test_case_cards_include_analog_and_different_family_counterexample() -> None:

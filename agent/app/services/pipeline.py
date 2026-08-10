@@ -7771,6 +7771,12 @@ def _kb_remediation_lines(
     # such as gpu_hardware_error). The ranker only orders the matches.
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
+    # insufficient_evidence never settles (_top_family_settled), so a cross-family
+    # graph match here is the same unacted-on keyword hit the playbook hedges
+    # (_insufficient_evidence_playbook_lines) -- tag it the same way instead of
+    # asserting it as this run's confirmed diagnosis. One vocabulary, same tag.
+    unsettled = top_family == "insufficient_evidence"
+    tag = "(knowledge match — unconfirmed)"
     active_masker = masker or build_masker(())
     for family, symptom in match_failure_mode_symptoms(
         knowledge, observed_text, top_family, fuzzy_query=fuzzy_query
@@ -7781,14 +7787,35 @@ def _kb_remediation_lines(
         if actions:
             symptom_name = _safe_line(symptom.get("symptom"), limit=160, masker=active_masker)
             learned = is_matcher_only_family(family)
-            header = ("- Learned from a previous incident (not a catalog family): " if learned else "") + (
-                f"Matched symptom **{symptom_name}** ({_family_label(family)}); known fixes from the knowledge base:"
-            )
+            if unsettled:
+                learned_prefix = (
+                    "Learned from a previous incident (not a catalog family): "
+                    if learned
+                    else ""
+                )
+                header = (
+                    f"- {learned_prefix}{tag} **{symptom_name}** ({_family_label(family)}) "
+                    "— not confirmed by this run's evidence; reference only:"
+                )
+            else:
+                header = (
+                    "- Learned from a previous incident (not a catalog family): "
+                    if learned
+                    else ""
+                ) + (
+                    f"Matched symptom **{symptom_name}** ({_family_label(family)}); "
+                    "known fixes from the knowledge base:"
+                )
             return [
                 header,
                 *[f"  - {_safe_line(a, limit=360, masker=active_masker)}" for a in actions[:5]],
             ]
         symptom_name = _safe_line(symptom.get("symptom"), limit=160, masker=active_masker)
+        if unsettled:
+            return [
+                f"{tag} Matched symptom **{symptom_name}** ({_family_label(family)}); "
+                "family prior from the knowledge base (no verified action recorded)."
+            ]
         return [
             f"Matched symptom **{symptom_name}** ({_family_label(family)}); "
             "family prior from the knowledge base (no verified action recorded)."
