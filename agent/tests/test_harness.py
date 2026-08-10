@@ -201,8 +201,11 @@ def test_explicit_unrelated_support_link_is_rejected() -> None:
     assert verdict.gates["invalid_evidence_links"] is True
 
 
-def test_non_catalog_family_requires_signature_grounded_support() -> None:
-    result = _result("system", "generic evidence without the promoted signature")
+def _known_issue_verdict(evidence_text: str):
+    """Harness verdict for a non-catalog family whose only support is one
+    system artifact. Two tests differ solely in that artifact's text and in
+    what they then expect, so the scaffolding between lives here."""
+    result = _result("system", evidence_text)
     result.artifacts[0].result = {"observation": _scoped_observation()}
     assign_evidence_ids([result])
     cause = RankedCause(
@@ -226,36 +229,18 @@ def test_non_catalog_family_requires_signature_grounded_support() -> None:
             }
         ],
     )
+    return verdict
+
+
+def test_non_catalog_family_requires_signature_grounded_support() -> None:
+    verdict = _known_issue_verdict("generic evidence without the promoted signature")
 
     assert verdict.claims[0]["supporting_evidence"] == []
     assert verdict.gates["invalid_evidence_links"] is True
 
 
 def test_non_catalog_family_with_matching_artifact_passes() -> None:
-    result = _result("system", "master-restart-policy is configured")
-    result.artifacts[0].result = {"observation": _scoped_observation()}
-    assign_evidence_ids([result])
-    cause = RankedCause(
-        "expected_known_behavior",
-        "medium",
-        5,
-        rationale=[
-            "matched known-issue signature: Distributed Training Backoff And Restart Policy Semantics"
-        ],
-        support_evidence_ids=["E01"],
-    )
-
-    verdict = evaluate(
-        _response("## Root Cause\n\nKnown behavior [E01]."),
-        [result],
-        [cause],
-        known_issues=[
-            {
-                "issue": "Distributed Training Backoff And Restart Policy Semantics",
-                "keywords": ["master-restart-policy", "--backoff-limit"],
-            }
-        ],
-    )
+    verdict = _known_issue_verdict("master-restart-policy is configured")
 
     assert verdict.claims[0]["supporting_evidence"] == ["E01"]
     assert verdict.gates["invalid_evidence_links"] is False

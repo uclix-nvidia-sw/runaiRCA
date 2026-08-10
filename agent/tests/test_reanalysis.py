@@ -656,15 +656,11 @@ def test_fresh_scoped_support_can_rehabilitate_a_refuted_family() -> None:
         )
     ]
 
-    assert pipeline._fresh_results_support_family(
-        "k8s_scheduling_error",
-        fresh,
-        {"E23": EvidenceEligibility(True, True, True)},
+    assert "k8s_scheduling_error" in pipeline._fresh_eligible_support_families(
+        fresh, {"E23": EvidenceEligibility(True, True, True)}
     )
-    assert not pipeline._fresh_results_support_family(
-        "k8s_scheduling_error",
-        fresh,
-        {"E23": EvidenceEligibility(False, False, True, "wrong entity")},
+    assert "k8s_scheduling_error" not in pipeline._fresh_eligible_support_families(
+        fresh, {"E23": EvidenceEligibility(False, False, True, "wrong entity")}
     )
 
 

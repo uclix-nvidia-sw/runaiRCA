@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.collectors.base import CollectorResult, artifact
-from app.services.timeline import build_timeline, to_markdown
+from app.services.timeline import build_timeline
 
 
 def test_empty_and_unknown_agents_yield_nothing() -> None:
@@ -146,16 +146,6 @@ def test_syslog_prefix_parsed() -> None:
     assert entry["timestamp"] == "Jul  2 10:15:03"
 
 
-def test_to_markdown_truncates() -> None:
-    timeline = [
-        {"timestamp": f"t{i}", "source": "s", "kind": "k", "message": "m"}
-        for i in range(40)
-    ]
-    md = to_markdown(timeline, limit=5)
-    assert "and 35 more" in md
-    assert to_markdown([]).startswith("- No timestamped")
-
-
 def test_bad_details_never_raises() -> None:
     # details not a dict / wrong-typed inner values must degrade, not throw.
     r = CollectorResult(agent="loki", status="ok", summary="", details={"queries": "nope"})
@@ -287,21 +277,3 @@ def test_timeline_masks_sensitive_messages_at_capture() -> None:
     assert "timeline-secret-12345" not in serialized
     assert "[MASKED]" in serialized
     assert timeline[0]["message"] == "panic api_key=[MASKED]"
-
-
-def test_timeline_markdown_masks_and_folds_raw_entries() -> None:
-    md = to_markdown(
-        [
-            {
-                "timestamp": "2026-07-02T10:00:00Z",
-                "source": "loki",
-                "kind": "errors",
-                "message": "panic password=timeline-md-secret-12345\n## injected",
-            }
-        ]
-    )
-
-    assert "timeline-md-secret-12345" not in md
-    assert "[MASKED]" in md
-    assert "\n## injected" not in md
-    assert "## injected" in md

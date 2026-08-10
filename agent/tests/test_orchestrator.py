@@ -1320,47 +1320,6 @@ async def test_chat_similar_incident_memory_is_folded_and_masked() -> None:
     assert memory_line.endswith("…")
 
 
-def test_pod_describe_line_carries_limits_restarts_oomkilled() -> None:
-    # "phase Running" alone tells the operator nothing on a memory-limit alert:
-    # the describe-grade line must carry the limit, restarts, and last OOMKilled.
-    from app.services.pipeline import _pod_describe_line
-
-    pod = {
-        "name": "workloads-manager-x",
-        "phase": "Running",
-        "resources": {
-            "workloads-manager": {
-                "limits": {"memory": "10Gi", "cpu": "2"},
-                "requests": {"memory": "8Gi"},
-            }
-        },
-        "containerStatuses": [
-            {
-                "name": "workloads-manager",
-                "restartCount": 3,
-                "state": {"running": {"startedAt": "2026-07-03T00:00:00Z"}},
-                "lastState": {
-                    "terminated": {
-                        "reason": "OOMKilled",
-                        "exitCode": 137,
-                        "finishedAt": "2026-07-02T23:59:00Z",
-                    }
-                },
-            }
-        ],
-    }
-    line = _pod_describe_line(pod)
-    assert "mem limit 10Gi (request 8Gi)" in line
-    assert "3 restart(s)" in line
-    assert "last OOMKilled (exit 137)" in line
-    # and the OOMKilled token feeds signature matching downstream
-    assert "oomkilled" in line.lower()
-    # a bare healthy pod stays a simple phase line
-    assert _pod_describe_line({"name": "p", "phase": "Running"}) == (
-        "- Kubernetes pod p is in phase Running."
-    )
-
-
 @pytest.mark.asyncio
 async def test_loki_correlates_control_plane_logs_to_dying_workload(monkeypatch) -> None:
     # When a workload alert implicates the control plane, Loki must also query the

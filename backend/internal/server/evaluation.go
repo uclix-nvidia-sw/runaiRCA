@@ -259,6 +259,8 @@ func (s *Store) UpsertEvaluationReview(runID string, req EvaluationReviewRequest
 	if err != nil {
 		return EvaluationReview{}, false, err
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
@@ -333,14 +335,32 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 			if s.persistKnowledgeCandidateValidationRefreshLocked(&refreshed, event) {
 				*existing = refreshed
 				s.knowledgeEvents[event.EventID] = event
+				s.supersedeStaleCaseCandidatesLocked(snapshot.CaseID, candidate.CandidateID, now)
 			}
 			continue
 		}
+		// Superseded is relative: a newer generation replaced this one, so a
+		// recompute can revoke that premise. Rejected is an operator decision and
+		// remains terminal.
 		if existing != nil &&
-			existing.Status == knowledgeCandidateValidationFailed &&
-			existing.ValidationError == knowledgeReviewInvalidationError &&
+			(existing.Status == knowledgeCandidateSuperseded ||
+				(existing.Status == knowledgeCandidateValidationFailed && existing.ValidationError == knowledgeReviewInvalidationError)) &&
 			candidate.Status == knowledgeCandidateReady {
 			if !s.knowledgeCandidateSupportsValidSnapshotsLocked(existing) {
+				continue
+			}
+			liveCandidate := false
+			for _, other := range s.knowledgeCandidates {
+				if other == nil || other.CandidateID == existing.CandidateID ||
+					(other.CaseID != snapshot.CaseID && !containsString(other.SupportingCaseIDs, snapshot.CaseID)) {
+					continue
+				}
+				switch other.Status {
+				case knowledgeCandidateGenerated, knowledgeCandidateReady, knowledgeCandidateShadow, knowledgeCandidateActive:
+					liveCandidate = true
+				}
+			}
+			if liveCandidate {
 				continue
 			}
 			now := time.Now().UTC()
@@ -368,6 +388,7 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 			}
 			*existing = revalidated
 			s.knowledgeEvents[event.EventID] = event
+			s.supersedeStaleCaseCandidatesLocked(snapshot.CaseID, candidate.CandidateID, now)
 			continue
 		}
 		link := candidate
@@ -397,6 +418,7 @@ func (s *Store) generateKnowledgeCandidateForReviewedRunLocked(runID, analysisHa
 			s.knowledgeCandidates[candidate.CandidateID] = candidate
 		}
 		s.knowledgeEvents[event.EventID] = event
+		s.supersedeStaleCaseCandidatesLocked(snapshot.CaseID, candidate.CandidateID, time.Now().UTC())
 	}
 }
 

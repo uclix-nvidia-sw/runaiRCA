@@ -14,8 +14,11 @@ from app.collectors.base import (
     parse_incident_time,
 )
 from app.collectors.grafana_mcp import (
+    call_grafana_mcp_json,
+    grafana_datasource_uid,
+    grafana_mcp_result_json,
     mark_grafana_datasource_failure,
-    resolve_grafana_datasource_uid,
+    raise_on_datasource_error,
     validate_grafana_datasource_uid,
 )
 from app.collectors.http_json import compact, get_json
@@ -24,12 +27,9 @@ from app.config import Settings
 from app.mcp_client import (
     MCP_FALLBACK_WARNING,
     mcp_budget,
-    mcp_call,
     mcp_call_many,
-    mcp_error,
     mcp_fallback_warning,
     mcp_tls_verify,
-    mcp_tool_json,
 )
 from app.services.query_memory import domain_query_key
 
@@ -593,7 +593,7 @@ async def _collect_prometheus_mcp(
 ) -> list[dict[str, object]]:
     try:
         async with mcp_budget(settings.prometheus_timeout_seconds):
-            datasource_uid = await _grafana_datasource_uid(
+            datasource_uid = await grafana_datasource_uid(
                 settings.prometheus_mcp_url,
                 "prometheus",
                 settings.prometheus_datasource_uid,
@@ -616,16 +616,7 @@ async def _collect_prometheus_mcp(
                 )
                 for (name, query), result in zip(queries, results, strict=True)
             ]
-            datasource_error = next(
-                (
-                    str(item.get("error") or "")
-                    for item in items
-                    if _grafana_datasource_error(str(item.get("error") or ""))
-                ),
-                "",
-            )
-            if datasource_error:
-                raise RuntimeError(datasource_error)
+            raise_on_datasource_error(items)
             return items
     except Exception as exc:
         mark_grafana_datasource_failure(
@@ -646,7 +637,7 @@ async def prom_mcp_query(
 ) -> dict[str, object]:
     try:
         async with mcp_budget(settings.prometheus_timeout_seconds):
-            datasource_uid = await _grafana_datasource_uid(
+            datasource_uid = await grafana_datasource_uid(
                 settings.prometheus_mcp_url,
                 "prometheus",
                 settings.prometheus_datasource_uid,
@@ -687,7 +678,7 @@ async def _mcp_query_prometheus(
     # instead of the incident.
     args = _prometheus_mcp_args(promql, datasource_uid, time_range)
     try:
-        data = await _call_mcp_json(url, "query_prometheus", [args])
+        data = await call_grafana_mcp_json(url, "query_prometheus", [args])
     except Exception as exc:
         mark_grafana_datasource_failure(url, "prometheus", datasource_uid, exc)
         raise
@@ -756,7 +747,7 @@ def _prometheus_mcp_tool_item(
     time_range: dict[str, str] | None,
 ) -> dict[str, object]:
     try:
-        data = _mcp_result_json(result, "query_prometheus")
+        data = grafana_mcp_result_json(result, "query_prometheus")
     except RuntimeError as exc:
         query_window = time_range or {"start": "now-15m", "end": "now"}
         return {
@@ -774,9 +765,6 @@ def _prometheus_mcp_tool_item(
     return _prometheus_mcp_item(name, promql, url, data, time_range)
 
 
-def _grafana_datasource_error(error: str) -> bool:
-    lowered = error.casefold()
-    return "get datasource by uid" in lowered or "id is invalid" in lowered
 
 
 def _prometheus_value_summary(result_data: list[object]) -> dict[str, object]:
@@ -996,18 +984,19 @@ def _has_prometheus_samples(
     return target_scope_verified is True
 
 
-def _prometheus_query_observation(
+def _prometheus_polarity(
     item: dict[str, object],
+    summary: dict[str, object],
     *,
+    name: str,
     time_range: dict[str, str] | None,
-    target: AnalysisTarget | None = None,
-    control_plane_namespaces: tuple[str, ...] = (),
-) -> dict[str, object]:
-    """Classify output without treating a non-empty all-zero vector as a failure."""
-    name = str(item.get("name") or "metric")
-    value_summary = item.get("value_summary")
-    summary = value_summary if isinstance(value_summary, dict) else {}
-    sample_window_verified = _prometheus_samples_in_window(summary, time_range)
+    sample_window_verified: bool | None,
+) -> tuple[str, str]:
+    """Per-metric semantics: what this reply proves about the incident window.
+
+    Every branch is a rule about what a Prometheus answer can and cannot
+    establish — an unbounded lookup, a counter without a delta, or a live
+    sample returned for a range request all stay context-only."""
     if item.get("error"):
         polarity, coverage = "unavailable", "unknown"
     else:
@@ -1110,6 +1099,28 @@ def _prometheus_query_observation(
             polarity, coverage = "absent", "scoped"
         else:
             polarity, coverage = "present", "scoped"
+    return polarity, coverage
+
+
+def _prometheus_query_observation(
+    item: dict[str, object],
+    *,
+    time_range: dict[str, str] | None,
+    target: AnalysisTarget | None = None,
+    control_plane_namespaces: tuple[str, ...] = (),
+) -> dict[str, object]:
+    """Classify output without treating a non-empty all-zero vector as a failure."""
+    name = str(item.get("name") or "metric")
+    value_summary = item.get("value_summary")
+    summary = value_summary if isinstance(value_summary, dict) else {}
+    sample_window_verified = _prometheus_samples_in_window(summary, time_range)
+    polarity, coverage = _prometheus_polarity(
+        item,
+        summary,
+        name=name,
+        time_range=time_range,
+        sample_window_verified=sample_window_verified,
+    )
     observed_entity: dict[str, str] | None = None
     target_scope_verified: bool | None = None
     if target is not None and polarity in {"present", "absent"}:
@@ -1431,59 +1442,10 @@ def _prometheus_samples(item: dict[str, object]) -> list[tuple[str, float | None
     return samples
 
 
-async def _grafana_datasource_uid(
-    url: str,
-    datasource_type: str,
-    configured_uid: str = "",
-) -> str:
-    return await resolve_grafana_datasource_uid(
-        url,
-        datasource_type,
-        configured_uid,
-        call_json=_call_mcp_json,
-    )
 
 
-async def _call_mcp_json(
-    url: str, tool: str, args_list: list[dict[str, object]]
-) -> object:
-    last_error = ""
-    for args in args_list:
-        try:
-            result = await mcp_call(url, tool, args)
-        except Exception as exc:  # noqa: BLE001 - try the next schema candidate.
-            last_error = f"{exc.__class__.__name__}: {exc}"
-            continue
-        try:
-            return _mcp_result_json(result, tool)
-        except RuntimeError as exc:
-            last_error = str(exc)
-            continue
-    raise RuntimeError(last_error or f"{tool} failed")
 
 
-def _mcp_result_json(result: object, tool: str) -> object:
-    error = mcp_error(result)
-    if error:
-        raise RuntimeError(error)
-    data = mcp_tool_json(result)
-    if isinstance(data, dict) and "raw" in data:
-        raise RuntimeError(f"{tool} result was not JSON")
-    return data
-
-
-def _first_result_list(data: object) -> list[object]:
-    if isinstance(data, list):
-        return data
-    if not isinstance(data, dict):
-        return []
-    for value in data.values():
-        if isinstance(value, list):
-            return value
-        found = _first_result_list(value)
-        if found:
-            return found
-    return []
 
 
 def _prometheus_mcp_result(data: object) -> list[object]:

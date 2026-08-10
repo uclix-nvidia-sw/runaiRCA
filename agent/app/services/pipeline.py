@@ -17,11 +17,9 @@ from typing import Any, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from app.collectors.base import (
-    NO_EVIDENCE,
     AnalysisTarget,
     CollectorResult,
     causal_evidence_time_range,
-    condition_observations,
     parse_incident_time,
     resolve_target,
 )
@@ -64,7 +62,7 @@ from app.progress import ProgressReporter
 from app.prompts import load_agent_souls
 from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse, SimilarIncidentContext
 from app.services.decision_tree import resolve_tree, walk_tree
-from app.services.evidence_projection import EXECUTION_METADATA_KEYS, observed_payload
+from app.services.evidence_projection import EXECUTION_METADATA_KEYS
 from app.services.general_guidance import general_guidance_lines
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
@@ -2636,17 +2634,19 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         request,
         state.results,
         state.missing,
-        state.failure_modes,
-        playbook_fallback,
         state.agent_souls,
         state.root_cause_candidates,
         state.kg_context.as_dict(),
         plan,
         state.graph_fixes,
-        language=getattr(settings, "language", "en"),
-        known_issues=state.known_issues,
-        components=load_architecture(settings.architecture_file),
-        masker=state.masker,
+        knowledge=ReportKnowledge(
+            failure_modes=state.failure_modes,
+            known_issues=state.known_issues,
+            components=load_architecture(settings.architecture_file),
+            cases=playbook_fallback,
+            language=getattr(settings, "language", "en"),
+            masker=state.masker,
+        ),
         eligible_support_ids=eligible_support_ids,
         self_check_next=state.self_check_next,
         runtime_knowledge_hints=state.runtime_knowledge_hints,
@@ -3449,30 +3449,6 @@ def _json_fingerprint(value: object) -> str:
         return repr(value)
 
 
-def _fresh_results_support_family(
-    family: str,
-    fresh_results: list[CollectorResult],
-    evidence_eligibility: Mapping[str, object],
-) -> bool:
-    """Whether this pass added eligible semantic support for a refuted family.
-
-    A prior self-check is a reason to seek an alternative, not a permanent ban.
-    Direct, target/window-scoped evidence found by the follow-up pass may
-    rehabilitate the family; compatibility summaries and ineligible cards may
-    not.
-    """
-    for result in fresh_results:
-        for artifact in result.artifacts:
-            evidence_id = str(getattr(artifact, "evidence_id", "") or "")
-            eligibility = evidence_eligibility.get(evidence_id)
-            permits = getattr(eligibility, "permits", None)
-            if not callable(permits) or not permits("support"):
-                continue
-            if artifact_supports_family(family, artifact):
-                return True
-    return False
-
-
 async def _reanalyze_once(
     state: PipelineState,
     *,
@@ -3991,201 +3967,7 @@ _COMMAND_ONLY_ACTION = re.compile(
 )
 
 
-def _synthesis_collector_findings(
-    results: list[CollectorResult],
-    *,
-    evidence_eligibility: Mapping[str, object] | None = None,
-) -> list[dict[str, object]]:
-    """Project artifacts into evidence roles before giving them to synthesis.
-
-    This is intentionally stricter than a transport-success check. The LLM may
-    see useful context, but it receives a machine-readable boundary that only
-    a scoped observation can support or contradict the RCA.
-    """
-    findings: list[dict[str, object]] = []
-    for result in results:
-        grouped: dict[str, list[dict[str, object]]] = {
-            "supporting_artifacts": [],
-            "contradicting_artifacts": [],
-            "context_artifacts": [],
-        }
-        for artifact in result.artifacts:
-            if not _artifact_is_evidence(artifact):
-                continue
-            payload = _synthesis_artifact_payload(
-                artifact, evidence_eligibility=evidence_eligibility
-            )
-            role = str(payload["evidence_role"])
-            key = {
-                "support": "supporting_artifacts",
-                "contradict": "contradicting_artifacts",
-            }.get(role, "context_artifacts")
-            grouped[key].append(payload)
-        findings.append(
-            {
-                "agent": result.agent,
-                "status": result.status,
-                "confidence": result.confidence,
-                # A collector headline is operational context, never a direct
-                # observation. Retain it without inviting the model to cite it.
-                "collection_summary": (
-                    result.summary if _collector_is_evidence(result) else NO_EVIDENCE
-                ),
-                **{
-                    key: [
-                        artifact for _index, artifact in sorted(
-                            ([(len(artifacts) - 1, artifacts[-1])] if artifacts else []) + sorted(
-                                enumerate(artifacts[:-1]),
-                                key=lambda item: (
-                                    bool(item[1].get("highlights")),
-                                    item[1].get("status") == "ok",
-                                    item[0],
-                                ),
-                                reverse=True,
-                            )[:5]
-                        )
-                    ]
-                    for key, artifacts in grouped.items()
-                },
-            }
-        )
-    return findings
-
-
-def _synthesis_artifact_payload(
-    artifact: object, *, evidence_eligibility: Mapping[str, object] | None = None
-) -> dict[str, object]:
-    result = getattr(artifact, "result", None)
-    observation = result.get("observation") if isinstance(result, dict) else None
-    polarity = "unknown"
-    coverage = "partial"
-    if isinstance(observation, dict):
-        candidate_polarity = str(observation.get("polarity") or "").strip().lower()
-        candidate_coverage = str(observation.get("coverage") or "").strip().lower()
-        if candidate_polarity in {"present", "absent", "unknown", "unavailable"}:
-            polarity = candidate_polarity
-        if candidate_coverage in {"scoped", "partial", "unknown"}:
-            coverage = candidate_coverage
-    if evidence_eligibility is not None:
-        # The blackboard has already checked run, target entity, topology and
-        # incident-window compatibility.  A raw artifact can claim to be a
-        # scoped observation while still belonging to another workload or a
-        # different time window, so never let the synthesis model re-promote
-        # it from its local polarity alone.
-        evidence_id = str(getattr(artifact, "evidence_id", "") or "")
-        eligibility = evidence_eligibility.get(evidence_id)
-        permits = getattr(eligibility, "permits", None)
-        if callable(permits) and permits("support"):
-            role = "support"
-        elif callable(permits) and permits("contradict"):
-            role = "contradict"
-        else:
-            role = "context"
-    elif polarity == "present" and coverage == "scoped":
-        role = "support"
-    elif polarity == "absent" and coverage == "scoped":
-        role = "contradict"
-    else:
-        role = "context"
-    agent = str(getattr(artifact, "agent", "") or "")
-    prompt_result = _sanitize_synthesis_result(result, agent=agent, role=role)
-    return {
-        "type": str(getattr(artifact, "type", "")),
-        "title": str(getattr(artifact, "title", "")),
-        "status": str(getattr(artifact, "status", "")),
-        "summary": str(getattr(artifact, "summary", "")),
-        "highlights": list(getattr(artifact, "highlights", []) or []),
-        "evidence_role": role,
-        "observation": {"polarity": polarity, "coverage": coverage},
-        "condition_checks": condition_observations(result),
-        "result": _compact_synthesis_value(
-            prompt_result, limit=_SYNTHESIS_ARTIFACT_RESULT_CHARS
-        ),
-    }
-
-
 _SYNTHESIS_OMIT = object()
-
-
-def _sanitize_synthesis_result(value: object, *, agent: str, role: str) -> object:
-    """Remove retrieval intent and diagnostic suggestions from LLM evidence.
-
-    Query text remains in the operator-facing artifact, but it is never an
-    observed value. Grafana MCP can also echo ``debug.hints.possibleCauses``;
-    those are transport suggestions, not incident evidence.
-    """
-
-    projected = observed_payload(value)
-    if agent == "kubernetes" and role == "context":
-        return _sanitize_kubernetes_context_result(projected)
-    return projected
-
-
-def _sanitize_kubernetes_context_result(value: object) -> object:
-    """Project live Kubernetes context without failure-looking configuration.
-
-    The response artifact still retains the full YAML/JSON for the operator.
-    This copy is only for the synthesis prompt, where raw ``spec`` fields such
-    as ``preemptionPolicy=PreemptLowerPriority`` and healthy condition reason
-    strings repeatedly became fabricated observations.
-    """
-
-    def walk(node: object, key: str = "") -> object:
-        if key.casefold() in _K8S_SYNTHESIS_CONTEXT_DROP_KEYS:
-            return _SYNTHESIS_OMIT
-        if isinstance(node, dict):
-            condition_type = str(node.get("type") or "").strip()
-            if condition_type.casefold() in _K8S_CONDITION_TYPES and "status" in node:
-                checks = condition_observations(
-                    {"type": condition_type, "status": node.get("status")}, limit=1
-                )
-                if not checks:
-                    return {"active": "unknown", "status": str(node.get("status") or "")}
-                check = checks[0]
-                # Inactive conditions are already represented, with their
-                # exact names, in the sibling condition_checks projection. Do
-                # not repeat failure vocabulary inside raw result text.
-                if not check.get("active"):
-                    return {"active": False, "status": str(node.get("status") or "")}
-                projected: dict[str, object] = {
-                    "condition": condition_type,
-                    "active": True,
-                    "status": str(node.get("status") or ""),
-                }
-                for field in ("reason", "message", "lastTransitionTime"):
-                    if node.get(field) not in (None, ""):
-                        projected[field] = node[field]
-                return projected
-            projected_dict: dict[str, object] = {}
-            for child_key, child in node.items():
-                projected = walk(child, str(child_key))
-                if projected is not _SYNTHESIS_OMIT:
-                    projected_dict[str(child_key)] = projected
-            return projected_dict
-        if isinstance(node, (list, tuple)):
-            projected_list = []
-            for child in node:
-                projected = walk(child, key)
-                if projected is not _SYNTHESIS_OMIT:
-                    projected_list.append(projected)
-            return projected_list
-        return node
-
-    projected = walk(value)
-    return {} if projected is _SYNTHESIS_OMIT else projected
-
-
-def _compact_synthesis_value(value: object, *, limit: int) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        text = value
-    else:
-        try:
-            text = json.dumps(value, ensure_ascii=False, default=str)
-        except (TypeError, ValueError):
-            text = str(value)
-    return " ".join(text.split())[:limit]
 
 
 
@@ -4443,30 +4225,45 @@ _HEADINGS = {
 }
 
 
+@dataclass(frozen=True)
+class ReportKnowledge:
+    """The curated catalogs a deterministic report is rendered against.
+
+    These six travelled together as separate parameters through every rendering
+    layer — the report body, the numbered actions, the playbook — so adding one
+    more knowledge source meant widening four signatures. They travel as one
+    value instead, and every field defaults: most callers care about one catalog
+    at a time.
+    """
+
+    failure_modes: dict[str, list[dict]] = field(default_factory=dict)
+    known_issues: list[dict] = field(default_factory=list)
+    components: dict[str, dict] = field(default_factory=dict)
+    cases: str = ""
+    language: str = "en"
+    masker: Masker | None = None
+
+
 def _detail_from(
     request: AlertAnalysisRequest,
     results: list[CollectorResult],
     missing: list[str],
-    failure_modes: dict[str, list[dict]] | None = None,
-    troubleshooting_cases: str = "",
     agent_souls: str = "",
     root_cause_candidates: list[RankedCause] | None = None,
     kg_context: dict | None = None,
     plan: InvestigationPlan | None = None,
     graph_fixes: GraphRemediation | None = None,
-    language: str = "en",
-    known_issues: list[dict] | None = None,
-    components: dict[str, dict] | None = None,
-    masker: Masker | None = None,
     eligible_support_ids: set[str] | None = None,
     self_check_next: str = "",
     runtime_knowledge_hints: list[tuple[str, dict[str, Any]]] | None = None,
     xid_codes: list[int] | None = None,
+    *,
+    knowledge: ReportKnowledge,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
     appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
     actually reads; the harness-owned Evidence Trace carries citable evidence."""
-    h = _HEADINGS.get(language, _HEADINGS["en"])
+    h = _HEADINGS.get(knowledge.language, _HEADINGS["en"])
     labels = request.alert.labels
     annotations = request.alert.annotations
     alert_name = labels.get("alertname") or request.alert.labels.get("alert_name") or "alert"
@@ -4485,13 +4282,13 @@ def _detail_from(
 
     # --- 1. Problem -----------------------------------------------------------
     lines.extend([h["problem"], ""])
-    lines.append(f"- {h['what']}: {_root_cause_statement(request, language=language)}")
+    lines.append(f"- {h['what']}: {_root_cause_statement(request, language=knowledge.language)}")
     if where:
         lines.append(f"- {h['where']}: {where}")
     if request.occurrence_count > 1:
         impact = (
             f"같은 워크로드에서 {request.occurrence_count}회 반복 발생"
-            if language == "ko"
+            if knowledge.language == "ko"
             else f"recurred {request.occurrence_count} times on the same workload"
         )
         lines.append(f"- {h['impact']}: {impact}")
@@ -4506,8 +4303,8 @@ def _detail_from(
             root_cause_candidates or [],
             request,
             observed_text,
-            failure_modes or {},
-            language,
+            knowledge.failure_modes or {},
+            knowledge.language,
             results=results,
             eligible_evidence_ids=eligible_support_ids,
         )
@@ -4515,12 +4312,12 @@ def _detail_from(
     # Multi-axis facets (Locus / Nature / Trigger) for the top cause — names the
     # subsystem, the KIND of cause, and (when known) what set it off.
     if root_cause_candidates:
-        facets = _facets_line(root_cause_candidates[0], language)
+        facets = _facets_line(root_cause_candidates[0], knowledge.language)
         if facets:
             lines.append(facets)
     # What the failing entity was configured with — the limit that was exceeded,
     # the request no node could satisfy, the capacity a node ran out of.
-    lines.extend(_observed_configuration_lines(results, eligible_support_ids, language))
+    lines.extend(_observed_configuration_lines(results, eligible_support_ids, knowledge.language))
     # Ground the coarse family in the most specific signature match when one exists:
     # a recognised known issue (with its affected/fixed version) is far more precise.
     lines.extend(
@@ -4529,7 +4326,7 @@ def _detail_from(
         # match_runai_known_issues ignores fuzzy_query today, but this call site
         # should not depend on that staying true to remain safe.
         _known_issue_cause_lines(
-            known_issues, observed_text, language, _alert_signature_text(request)
+            knowledge.known_issues, observed_text, knowledge.language, _alert_signature_text(request)
         )
     )
     supporting = _supporting_evidence(results, eligible_support_ids=eligible_support_ids)
@@ -4554,14 +4351,14 @@ def _detail_from(
     # tell a confirmed upstream cause from a catalog-only candidate.
     observed_xid_codes = set(xid_codes) if xid_codes is not None else None
     causal = (
-        _causal_chain_line(graph_fixes, language, observed_xid_codes)
+        _causal_chain_line(graph_fixes, knowledge.language, observed_xid_codes)
         if allow_cause_specific_actions
         else ""
     )
     if causal:
         lines.extend(["", causal])
     if allow_cause_specific_actions:
-        lines.extend(_xid_diagnostic_guidance_lines(graph_fixes, language))
+        lines.extend(_xid_diagnostic_guidance_lines(graph_fixes, knowledge.language))
 
     # --- 3. Recommended Actions ------------------------------------------------
     lines.extend(["", h["actions"], ""])
@@ -4570,13 +4367,10 @@ def _detail_from(
         graph_fixes,
         root_cause_candidates,
         observed_text,
-        failure_modes or {},
         missing,
         request,
-        known_issues or [],
-        components=components,
+        knowledge=knowledge,
         allow_cause_specific_actions=allow_cause_specific_actions,
-        language=language,
         self_check_next=self_check_next,
         facts=_remediation_facts(results, eligible_support_ids, target),
         observed_codes=observed_xid_codes,
@@ -4588,7 +4382,7 @@ def _detail_from(
         lines.append(
             "증거가 부족하여 구체적인 조치를 제시하기 어렵습니다. "
             "아래 확인 요청을 먼저 진행해 주세요."
-            if language == "ko"
+            if knowledge.language == "ko"
             else "Not enough evidence for concrete actions yet — please address the "
             "questions below first."
         )
@@ -4605,18 +4399,18 @@ def _detail_from(
             root_cause_candidates,
             observed_text,
             _alert_signature_text(request),
-            masker,
+            knowledge.masker,
             allow_remediation=allow_cause_specific_actions,
         )
     )
-    lines.extend(_runtime_knowledge_hint_lines(runtime_knowledge_hints or [], masker))
+    lines.extend(_runtime_knowledge_hint_lines(runtime_knowledge_hints or [], knowledge.masker))
     operator_prompt = annotations.get("operator_prompt")
     if operator_prompt:
-        active_masker = masker or build_masker(())
+        active_masker = knowledge.masker or build_masker(())
         lines.extend(
             [
                 "",
-                "### Operator Guidance" if language != "ko" else "### 운영자 요청",
+                "### Operator Guidance" if knowledge.language != "ko" else "### 운영자 요청",
                 "",
                 _short_sentence(active_masker.mask_text(str(operator_prompt)), limit=500),
             ]
@@ -4629,7 +4423,7 @@ def _detail_from(
             lines.extend(
                 [
                     "",
-                    "이미 시도한 조치 (효과 없음)" if language == "ko" else "Already attempted (did not resolve it)",
+                    "이미 시도한 조치 (효과 없음)" if knowledge.language == "ko" else "Already attempted (did not resolve it)",
                     "",
                 ]
             )
@@ -4641,7 +4435,7 @@ def _detail_from(
     # THIS incident. (Kept in prompts.py for the NAT workflow's system prompt.)
     if not agent_souls:
         lines.append("- Agent role contract file was not loaded; fallback guidance was used.")
-    lines.extend(_affected_pods_lines(request, language))
+    lines.extend(_affected_pods_lines(request, knowledge.language))
     lines.extend(["", "### Troubleshooting Playbook", ""])
     lines.extend(
         # Same reasoning as _knowledge_base_lines above: a fuzzy hit here can
@@ -4650,15 +4444,10 @@ def _detail_from(
         _playbook_lines(
             root_cause_candidates,
             observed_text,
-            failure_modes or {},
-            troubleshooting_cases,
-            known_issues or [],
             _alert_signature_text(request),
-            components,
-            masker,
+            knowledge=knowledge,
             component=getattr(plan, "component", "") if plan is not None else "",
             allow_remediation=allow_cause_specific_actions,
-            language=language,
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -4677,17 +4466,17 @@ def _detail_from(
         lines.extend(
             [
                 "",
-                _general_guidance_heading(language),
+                _general_guidance_heading(knowledge.language),
                 "",
                 *general_guidance_lines(
                     _alert_text(request),
-                    failure_modes or {},
-                    known_issues or [],
-                    language=language,
-                    masker=masker,
+                    knowledge.failure_modes or {},
+                    knowledge.known_issues or [],
+                    language=knowledge.language,
+                    masker=knowledge.masker,
                     component=getattr(plan, "component", "") if plan else "",
                     component_source=getattr(plan, "component_source", "") if plan else "",
-                    components=components,
+                    components=knowledge.components,
                     matched_alert=getattr(plan, "matched_alert", None) if plan else None,
                     families=_plan_families(plan),
                     case_cards=list((kg_context or {}).get("case_cards") or []),
@@ -5295,6 +5084,7 @@ def _promote_signature_cause(
                         "kind": "known_issue",
                         "label": rationale,
                         "score_floor": 8.0,
+                        "evidence_ids": list(dict.fromkeys(support_ids)),
                     }
                 ],
             )
@@ -5363,6 +5153,7 @@ def _promote_signature_cause(
                         "kind": "curated_symptom",
                         "label": rationale,
                         "score_floor": 7.0,
+                        "evidence_ids": list(dict.fromkeys(support_ids)),
                         "matched_keywords": matched_keywords,
                     }
                 ],
@@ -5374,6 +5165,89 @@ def _promote_signature_cause(
             continue
         return [lead] + [c for c in candidates if c.family != family]
     return candidates
+
+
+def _typed_cause(family: str, reason: str, evidence_id: str) -> tuple[str, str, list[str]]:
+    return (
+        family,
+        f"typed container state {reason} on the alert Pod "
+        "(machine-reported, not keyword-matched)",
+        [evidence_id],
+    )
+
+
+def _lifecycle_typed_cause(payload: dict, evidence_id: str) -> tuple[str, str, list[str]] | None:
+    """A waiting/terminated container state whose reason is a known signature."""
+    containers = payload.get("containers")
+    for container in containers if isinstance(containers, list) else []:
+        if not isinstance(container, dict):
+            continue
+        for state_key in ("state", "lastTerminated"):
+            state = container.get(state_key)
+            if not isinstance(state, dict):
+                continue
+            reason = str(state.get("reason") or "")
+            if state_key == "state" and state.get("phase") not in {"waiting", "terminated"}:
+                continue
+            exit_code = state.get("exitCode")
+            if state_key == "lastTerminated" and not (reason or exit_code is not None):
+                continue
+            if family := _typed_reason_family(reason):
+                return _typed_cause(family, reason, evidence_id)
+    return None
+
+
+def _warning_event_typed_cause(
+    payload: dict, evidence_id: str
+) -> tuple[str, str, list[str]] | None:
+    """A repeated (>=3), target-verified Warning Event with a known reason."""
+    events = payload.get("events")
+    for event in events if isinstance(events, list) else []:
+        if not isinstance(event, dict):
+            continue
+        if (
+            str(event.get("type") or "") != "Warning"
+            or event.get("target_identity_verified") is not True
+        ):
+            continue
+        try:
+            count = int(event.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count < 3:
+            continue
+        reason = str(event.get("reason") or "")
+        if family := _typed_reason_family(reason):
+            return _typed_cause(family, reason, evidence_id)
+    return None
+
+
+def _scheduling_typed_cause(
+    payload: dict, observation: dict, evidence_id: str
+) -> tuple[str, str, list[str]] | None:
+    """A PodScheduled reason, attributed to the scheduler that owns it."""
+    reason = _canonical_scheduling_reason(payload)
+    family = _typed_reason_family(reason) if reason else ""
+    if not family:
+        return None
+    # The dispositive table decides WHETHER this reason is a signature; the
+    # owning scheduler decides WHOSE. Same choke point as the ranker, or the
+    # floor-scored signature and the support gate would name different families
+    # for one Pod.
+    scheduled_by = observation.get("scheduler") if isinstance(observation, dict) else ""
+    family = scheduling_reason_family(reason, scheduled_by) or family
+    return _typed_cause(family, reason, evidence_id)
+
+
+_TYPED_STATE_CAUSES = {
+    "kubernetes_container_lifecycle": lambda payload, observation, evidence_id: (
+        _lifecycle_typed_cause(payload, evidence_id)
+    ),
+    "kubernetes_warning_events": lambda payload, observation, evidence_id: (
+        _warning_event_typed_cause(payload, evidence_id)
+    ),
+    "kubernetes_pod_scheduling": _scheduling_typed_cause,
+}
 
 
 def _dispositive_typed_state(
@@ -5404,81 +5278,9 @@ def _dispositive_typed_state(
                 and observation.get("target_identity_verified") is True
             ):
                 continue
-            if getattr(item, "type", "") == "kubernetes_container_lifecycle":
-                containers = payload.get("containers")
-                if not isinstance(containers, list):
-                    continue
-                for container in containers:
-                    if not isinstance(container, dict):
-                        continue
-                    for state_key in ("state", "lastTerminated"):
-                        state = container.get(state_key)
-                        if not isinstance(state, dict):
-                            continue
-                        reason = str(state.get("reason") or "")
-                        if state_key == "state" and state.get("phase") not in {
-                            "waiting",
-                            "terminated",
-                        }:
-                            continue
-                        exit_code = state.get("exitCode")
-                        if state_key == "lastTerminated" and not (
-                            reason or exit_code is not None
-                        ):
-                            continue
-                        family = _typed_reason_family(reason)
-                        if family:
-                            return (
-                                family,
-                                f"typed container state {reason} on the alert Pod "
-                                "(machine-reported, not keyword-matched)",
-                                [evidence_id],
-                            )
-            if getattr(item, "type", "") == "kubernetes_warning_events":
-                events = payload.get("events")
-                if not isinstance(events, list):
-                    continue
-                for event in events:
-                    if not isinstance(event, dict):
-                        continue
-                    if (
-                        str(event.get("type") or "") != "Warning"
-                        or event.get("target_identity_verified") is not True
-                    ):
-                        continue
-                    try:
-                        count = int(event.get("count") or 0)
-                    except (TypeError, ValueError):
-                        count = 0
-                    if count < 3:
-                        continue
-                    reason = str(event.get("reason") or "")
-                    family = _typed_reason_family(reason)
-                    if family:
-                        return (
-                            family,
-                            f"typed container state {reason} on the alert Pod "
-                            "(machine-reported, not keyword-matched)",
-                            [evidence_id],
-                        )
-            if getattr(item, "type", "") == "kubernetes_pod_scheduling":
-                reason = _canonical_scheduling_reason(payload)
-                family = _typed_reason_family(reason) if reason else ""
-                if family:
-                    # The dispositive table decides WHETHER this reason is a
-                    # signature; the owning scheduler decides WHOSE. Same choke
-                    # point as the ranker, or the floor-scored signature and the
-                    # support gate would name different families for one Pod.
-                    scheduled_by = (
-                        observation.get("scheduler") if isinstance(observation, dict) else ""
-                    )
-                    family = scheduling_reason_family(reason, scheduled_by) or family
-                    return (
-                        family,
-                        f"typed container state {reason} on the alert Pod "
-                        "(machine-reported, not keyword-matched)",
-                        [evidence_id],
-                    )
+            find = _TYPED_STATE_CAUSES.get(str(getattr(item, "type", "")))
+            if find and (cause := find(payload, observation, evidence_id)):
+                return cause
     return "", "", []
 
 
@@ -5532,6 +5334,7 @@ def _promote_typed_state_cause(
                     "kind": "typed_container_state",
                     "label": rationale,
                     "score_floor": 9.0,
+                    "evidence_ids": list(dict.fromkeys(support_ids)),
                     "force_high": True,
                 },
             ],
@@ -5559,6 +5362,7 @@ def _promote_typed_state_cause(
                     "kind": "typed_container_state",
                     "label": rationale,
                     "score_floor": 9.0,
+                    "evidence_ids": list(dict.fromkeys(support_ids)),
                     "force_high": True,
                 }
             ],
@@ -5646,6 +5450,7 @@ def _with_signature_support(
                 "label": rationale,
                 "score_floor": score_floor,
                 "delta": score - candidate.score,
+                "evidence_ids": list(dict.fromkeys(support_evidence_ids or [])),
                 **({"matched_keywords": signature_keywords} if signature_keywords else {}),
             },
         ],
@@ -5682,6 +5487,7 @@ def _promote_xid_cause(candidates: list[RankedCause], xid_codes: list[int]) -> l
                     "label": rationale,
                     "score_floor": 10.0,
                     "delta": 10.0 - existing.score,
+                    "evidence_ids": list(existing.support_evidence_ids),
                     "force_high": True,
                 },
             ],
@@ -5707,6 +5513,7 @@ def _promote_xid_cause(candidates: list[RankedCause], xid_codes: list[int]) -> l
                     "kind": "nvidia_xid",
                     "label": rationale,
                     "score_floor": 10.0,
+                    "evidence_ids": [],
                     "force_high": True,
                 }
             ],
@@ -5904,15 +5711,12 @@ def _numbered_actions(
     graph_fixes: GraphRemediation | None,
     candidates: list[RankedCause] | None,
     observed_text: str,
-    failure_modes: dict[str, list[dict]],
     missing: list[str],
     request: AlertAnalysisRequest,
-    known_issues: list[dict] | None = None,
-    components: dict[str, dict] | None = None,
     *,
+    knowledge: ReportKnowledge,
     allow_graph_remediation: bool = True,
     allow_cause_specific_actions: bool | None = None,
-    language: str = "en",
     self_check_next: str = "",
     facts: dict[str, str] | None = None,
     observed_codes: set[int] | None = None,
@@ -5935,7 +5739,7 @@ def _numbered_actions(
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
     symptom_matches = _actionable_failure_mode_matches(
-        failure_modes, observed_text, candidates, fuzzy_query=fuzzy
+        knowledge.failure_modes, observed_text, candidates, fuzzy_query=fuzzy
     )
     # Self-check is the final evidence-aware critic. Its concrete next probe is
     # more incident-specific than catalog/component/graph guidance and must not
@@ -5951,8 +5755,8 @@ def _numbered_actions(
         ordered.extend(
             line
             for line in (
-                memory_sizing_action(observed, language),
-                image_typo_hint(observed, language),
+                memory_sizing_action(observed, knowledge.language),
+                image_typo_hint(observed, knowledge.language),
             )
             if line
         )
@@ -5963,7 +5767,7 @@ def _numbered_actions(
     ):
         actions = [
             *ordered,
-            *_localized_failure_mode_actions(symptom_matches[0][1], language),
+            *_localized_failure_mode_actions(symptom_matches[0][1], knowledge.language),
         ]
         masker = build_masker(())
         rendered = list(
@@ -5983,7 +5787,7 @@ def _numbered_actions(
     # they must not crowd the observed mechanism out of the report cap.
     if allow_cause_specific_actions and top_family != "insufficient_evidence":
         for _family, symptom in symptom_matches[:1]:
-            actions = _localized_failure_mode_actions(symptom, language)
+            actions = _localized_failure_mode_actions(symptom, knowledge.language)
             specific_actions += len(actions)
             ordered.extend(actions)
     if allow_cause_specific_actions and plan is not None and plan.matched_alert:
@@ -5994,14 +5798,14 @@ def _numbered_actions(
     # own checks + dependency chain (e.g. runai-container-toolkit → the NVIDIA
     # GPU Operator stack) come before any keyword-matched guidance.
     if allow_cause_specific_actions and plan is not None and getattr(plan, "component", ""):
-        component_actions = component_action_lines(components or {}, plan.component)
+        component_actions = component_action_lines(knowledge.components or {}, plan.component)
         specific_actions += len(component_actions)
         ordered.extend(component_actions)
     # Known operator cases recognised by their signature keywords in the evidence
     # (ranking-independent): version-regression / observability / expected-behavior
     # fixes surface even when the coarse family ranking points elsewhere.
     if allow_cause_specific_actions and top_family != "insufficient_evidence":
-        for issue in match_runai_known_issues(known_issues or [], observed_text, fuzzy_query=fuzzy):
+        for issue in match_runai_known_issues(knowledge.known_issues or [], observed_text, fuzzy_query=fuzzy):
             if filter_to_top and str(issue.get("family") or "") != top_family:
                 continue
             actions = [str(a) for a in issue.get("actions", [])]
@@ -6077,7 +5881,7 @@ def _numbered_actions(
         # labelling it stops the report from reading as "do the thing you said
         # you already did".
         if _matches_attempted_action(action, attempted):
-            action = f"{action} {_already_attempted_note(language)}"
+            action = f"{action} {_already_attempted_note(knowledge.language)}"
         numbered.append(f"{len(numbered) + 1}. {action}")
         if len(numbered) >= 8:
             break
@@ -7372,107 +7176,132 @@ _PROBE_LABELS = {
 }
 
 
+def _container_lifecycle_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    for container in payload.get("containers", []):
+        if not isinstance(container, dict):
+            continue
+        pairs = _resource_pairs(container.get("resources"), _CONTAINER_RESOURCE_KEYS, unset)
+        if image := str(container.get("image") or ""):
+            pairs.append(f"image {image}")
+        if pairs:
+            name = str(container.get("name") or "")
+            subject = f"{labels['container']} ({name})" if name else labels["container"]
+            return f"- {subject}: " + " · ".join(pairs)
+    return ""
+
+
+def _pod_scheduling_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    resources = payload.get("resources")
+    parts: list[str] = []
+    for name, spec in (resources or {}).items() if isinstance(resources, dict) else ():
+        requested = spec.get("requests") if isinstance(spec, dict) else None
+        if pairs := _flat_resource_pairs(requested, _CONTAINER_RESOURCE_KEYS):
+            parts.append(f"{name}: " + ", ".join(pairs))
+    selector = payload.get("node_selector")
+    if isinstance(selector, dict) and selector:
+        rendered = ", ".join(f"{key}={value}" for key, value in sorted(selector.items()))
+        parts.append(f"{labels['selector']} {rendered}")
+    if scheduler := str(payload.get("scheduler") or ""):
+        parts.append(f"{labels['scheduler']} {scheduler}")
+    parts.extend(_runai_allocation_parts(payload.get("runai_allocation"), labels))
+    return f"- {labels['requested']}: " + " · ".join(parts) if parts else ""
+
+
+def _queue_quota_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    parts = []
+    quota = str(payload.get("gpu_quota") or "")
+    requested = str(payload.get("gpu_requested") or "")
+    if quota or requested:
+        # requested/quota is the borrow question: above quota, the project is
+        # only served from idle capacity, and only if its weight allows it.
+        parts.append(
+            f"{labels['quota_gpu']} {requested or '?'}/{quota or labels['unlimited']}"
+        )
+    if allocated := str(payload.get("gpu_allocated") or ""):
+        parts.append(f"{labels['quota_allocated']} {allocated}")
+    if limit := str(payload.get("gpu_limit") or ""):
+        parts.append(f"{labels['quota_limit']} {limit}")
+    if weight := str(payload.get("gpu_over_quota_weight") or ""):
+        parts.append(f"{labels['quota_weight']} {weight}")
+    if pool := str(payload.get("node_pool") or ""):
+        parts.append(f"{labels['quota_pool']} {pool}")
+    if not parts:
+        return ""
+    queue = str(payload.get("queue") or "")
+    subject = f"{labels['quota']} ({queue})" if queue else labels["quota"]
+    return f"- {subject}: " + " · ".join(parts)
+
+
+def _storage_claim_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    claim = str(payload.get("claim") or "")
+    parts = []
+    if requested := payload.get("requested_storage"):
+        actual = payload.get("actual_storage")
+        # A bound PV can be larger than the request; both numbers matter.
+        parts.append(
+            f"{labels['requested_size']} {requested}"
+            + (f" ({labels['bound_size']} {actual})" if actual and actual != requested else "")
+        )
+    for key, label in (("storage_class", "storageClass"), ("volume_mode", "volumeMode")):
+        if value := payload.get(key):
+            parts.append(f"{label} {value}")
+    if modes := payload.get("access_modes"):
+        parts.append(", ".join(str(mode) for mode in modes))
+    if phase := payload.get("phase"):
+        parts.append(f"phase {phase}")
+    if volume := payload.get("volume_name"):
+        parts.append(f"PV {volume}")
+    if not parts:
+        return ""
+    subject = f"{labels['storage']} ({claim})" if claim else labels["storage"]
+    return f"- {subject}: " + " · ".join(parts)
+
+
+def _node_gpu_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    # The comparison a pending GPU workload turns on: what the node can give
+    # against what the Pods already on it hold.
+    node = str(payload.get("node") or "")
+    free, allocatable = payload.get("gpu_estimated_free"), payload.get("gpu_allocatable")
+    if free is None or allocatable is None:
+        return ""
+    parts = [
+        f"{labels['gpu_free']} {free}/{allocatable}",
+        f"{labels['gpu_held']} {payload.get('gpu_requested')}",
+    ]
+    if capacity := payload.get("gpu_capacity"):
+        parts.append(f"capacity {capacity}")
+    if pods := payload.get("scheduled_non_terminal_pods"):
+        parts.append(f"{labels['gpu_pods']} {pods}")
+    subject = f"{labels['gpu']} ({node})" if node else labels["gpu"]
+    return f"- {subject}: " + " · ".join(parts)
+
+
+def _node_condition_config(payload: dict[str, Any], labels: dict[str, str], unset: str) -> str:
+    pairs = _flat_resource_pairs(payload.get("allocatable"), _NODE_RESOURCE_KEYS)
+    node = str(payload.get("node") or "")
+    if not pairs:
+        return ""
+    subject = f"{labels['node']} ({node})" if node else labels["node"]
+    return f"- {subject}: " + ", ".join(pairs)
+
+
+# Each observation kind renders the settings an operator would have to change,
+# never the observed values themselves.
+_CONFIGURATION_LINES: dict[str, Callable[[dict[str, Any], dict[str, str], str], str]] = {
+    "kubernetes_container_lifecycle": _container_lifecycle_config,
+    "kubernetes_pod_scheduling": _pod_scheduling_config,
+    "runai_queue_quota": _queue_quota_config,
+    "kubernetes_storage_claim": _storage_claim_config,
+    "kubernetes_node_gpu_resources": _node_gpu_config,
+    "kubernetes_node_condition": _node_condition_config,
+}
+
+
 def _configuration_line(
     kind: str, payload: dict[str, Any], labels: dict[str, str], unset: str
 ) -> str:
-    if kind == "kubernetes_container_lifecycle":
-        for container in payload.get("containers", []):
-            if not isinstance(container, dict):
-                continue
-            pairs = _resource_pairs(container.get("resources"), _CONTAINER_RESOURCE_KEYS, unset)
-            if image := str(container.get("image") or ""):
-                pairs.append(f"image {image}")
-            if pairs:
-                name = str(container.get("name") or "")
-                subject = f"{labels['container']} ({name})" if name else labels["container"]
-                return f"- {subject}: " + " · ".join(pairs)
-        return ""
-    if kind == "kubernetes_pod_scheduling":
-        resources = payload.get("resources")
-        parts: list[str] = []
-        for name, spec in (resources or {}).items() if isinstance(resources, dict) else ():
-            requested = spec.get("requests") if isinstance(spec, dict) else None
-            if pairs := _flat_resource_pairs(requested, _CONTAINER_RESOURCE_KEYS):
-                parts.append(f"{name}: " + ", ".join(pairs))
-        selector = payload.get("node_selector")
-        if isinstance(selector, dict) and selector:
-            rendered = ", ".join(f"{key}={value}" for key, value in sorted(selector.items()))
-            parts.append(f"{labels['selector']} {rendered}")
-        if scheduler := str(payload.get("scheduler") or ""):
-            parts.append(f"{labels['scheduler']} {scheduler}")
-        parts.extend(_runai_allocation_parts(payload.get("runai_allocation"), labels))
-        return f"- {labels['requested']}: " + " · ".join(parts) if parts else ""
-    if kind == "runai_queue_quota":
-        parts = []
-        quota = str(payload.get("gpu_quota") or "")
-        requested = str(payload.get("gpu_requested") or "")
-        if quota or requested:
-            # requested/quota is the borrow question: above quota, the project is
-            # only served from idle capacity, and only if its weight allows it.
-            parts.append(
-                f"{labels['quota_gpu']} {requested or '?'}/{quota or labels['unlimited']}"
-            )
-        if allocated := str(payload.get("gpu_allocated") or ""):
-            parts.append(f"{labels['quota_allocated']} {allocated}")
-        if limit := str(payload.get("gpu_limit") or ""):
-            parts.append(f"{labels['quota_limit']} {limit}")
-        if weight := str(payload.get("gpu_over_quota_weight") or ""):
-            parts.append(f"{labels['quota_weight']} {weight}")
-        if pool := str(payload.get("node_pool") or ""):
-            parts.append(f"{labels['quota_pool']} {pool}")
-        if not parts:
-            return ""
-        queue = str(payload.get("queue") or "")
-        subject = f"{labels['quota']} ({queue})" if queue else labels["quota"]
-        return f"- {subject}: " + " · ".join(parts)
-    if kind == "kubernetes_storage_claim":
-        claim = str(payload.get("claim") or "")
-        parts = []
-        if requested := payload.get("requested_storage"):
-            actual = payload.get("actual_storage")
-            # A bound PV can be larger than the request; both numbers matter.
-            parts.append(
-                f"{labels['requested_size']} {requested}"
-                + (f" ({labels['bound_size']} {actual})" if actual and actual != requested else "")
-            )
-        for key, label in (("storage_class", "storageClass"), ("volume_mode", "volumeMode")):
-            if value := payload.get(key):
-                parts.append(f"{label} {value}")
-        if modes := payload.get("access_modes"):
-            parts.append(", ".join(str(mode) for mode in modes))
-        if phase := payload.get("phase"):
-            parts.append(f"phase {phase}")
-        if volume := payload.get("volume_name"):
-            parts.append(f"PV {volume}")
-        if not parts:
-            return ""
-        subject = f"{labels['storage']} ({claim})" if claim else labels["storage"]
-        return f"- {subject}: " + " · ".join(parts)
-    if kind == "kubernetes_node_gpu_resources":
-        # The comparison a pending GPU workload turns on: what the node can give
-        # against what the Pods already on it hold.
-        node = str(payload.get("node") or "")
-        free, allocatable = payload.get("gpu_estimated_free"), payload.get("gpu_allocatable")
-        if free is None or allocatable is None:
-            return ""
-        parts = [
-            f"{labels['gpu_free']} {free}/{allocatable}",
-            f"{labels['gpu_held']} {payload.get('gpu_requested')}",
-        ]
-        if capacity := payload.get("gpu_capacity"):
-            parts.append(f"capacity {capacity}")
-        if pods := payload.get("scheduled_non_terminal_pods"):
-            parts.append(f"{labels['gpu_pods']} {pods}")
-        subject = f"{labels['gpu']} ({node})" if node else labels["gpu"]
-        return f"- {subject}: " + " · ".join(parts)
-    if kind == "kubernetes_node_condition":
-        pairs = _flat_resource_pairs(payload.get("allocatable"), _NODE_RESOURCE_KEYS)
-        node = str(payload.get("node") or "")
-        if not pairs:
-            return ""
-        subject = f"{labels['node']} ({node})" if node else labels["node"]
-        return f"- {subject}: " + ", ".join(pairs)
-    return ""
+    render = _CONFIGURATION_LINES.get(kind)
+    return render(payload, labels, unset) if render else ""
 
 
 def _as_sentence(text: str) -> str:
@@ -7971,16 +7800,11 @@ def _kb_remediation_lines(
 def _playbook_lines(
     candidates: list[RankedCause] | None,
     observed_text: str,
-    failure_modes: dict[str, list[dict]],
-    fallback_cases: str,
-    known_issues: list[dict] | None = None,
     fuzzy_query: str = "",
-    components: dict[str, dict] | None = None,
-    masker: Masker | None = None,
     component: str = "",
     *,
+    knowledge: ReportKnowledge,
     allow_remediation: bool = True,
-    language: str = "en",
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
@@ -7996,16 +7820,16 @@ def _playbook_lines(
             "target/window-scoped observation is available."
         ]
     lines: list[str] = []
-    active_masker = masker or build_masker(())
+    active_masker = knowledge.masker or build_masker(())
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
     if component:
-        comp_lines = component_check_lines(components or {}, component)
+        comp_lines = component_check_lines(knowledge.components or {}, component)
         if comp_lines:
             lines.append(f"- **{component}** (the alert target itself)")
             lines.extend(comp_lines)
     for issue in match_runai_known_issues(
-        known_issues or [], observed_text, fuzzy_query=fuzzy_query
+        knowledge.known_issues or [], observed_text, fuzzy_query=fuzzy_query
     )[:2]:
         if filter_to_top and str(issue.get("family") or "") != top_family:
             continue
@@ -8019,36 +7843,34 @@ def _playbook_lines(
             for action in issue.get("actions", [])[:4]
         )
     symptom_matches = _actionable_failure_mode_matches(
-        failure_modes, observed_text, candidates, fuzzy_query=fuzzy_query
+        knowledge.failure_modes, observed_text, candidates, fuzzy_query=fuzzy_query
     )
     if symptom_matches[0:1] and symptom_matches[0][1].get("exclusive_actions"):
         lines = []
     for family, symptom in symptom_matches[:1]:
         symptom_name = _safe_line(
-            _localized_failure_mode_name(symptom, language),
+            _localized_failure_mode_name(symptom, knowledge.language),
             limit=180,
             masker=active_masker,
         )
         learned = is_matcher_only_family(family)
-        lines.append(("- 이전 인시던트에서 학습된 지식(카탈로그 계열 아님): " if learned and language == "ko" else "- Learned from a previous incident (not a catalog family): " if learned else "- ") + f"**{symptom_name}** ({_family_label(family)})")
+        lines.append(("- 이전 인시던트에서 학습된 지식(카탈로그 계열 아님): " if learned and knowledge.language == "ko" else "- Learned from a previous incident (not a catalog family): " if learned else "- ") + f"**{symptom_name}** ({_family_label(family)})")
         lines.extend(
             f"  - {_safe_line(action, limit=360, masker=active_masker)}"
-            for action in _localized_failure_mode_actions(symptom, language)[:5]
+            for action in _localized_failure_mode_actions(symptom, knowledge.language)[:5]
         )
         # Architecture layer: the implicated platform component's failure effect,
         # dependency check order, and ready-to-run checks (runai_architecture.yaml).
         if symptom.get("component"):
-            lines.extend(component_check_lines(components or {}, str(symptom["component"])))
+            lines.extend(component_check_lines(knowledge.components or {}, str(symptom["component"])))
     if lines:
         # Preserve sibling symptom discriminators as explicitly unconfirmed
         # appendix context. The family has no independent executable remedy.
         if symptom_matches and not symptom_matches[0][1].get("exclusive_actions"):
             lines.extend(
                 _family_supplemental_playbook_lines(
-                    failure_modes,
                     top_family,
-                    language,
-                    active_masker,
+                    knowledge=replace(knowledge, masker=active_masker),
                     exclude_symptom=str(symptom_matches[0][1].get("symptom") or ""),
                 )
             )
@@ -8056,47 +7878,45 @@ def _playbook_lines(
     if top_family == "insufficient_evidence":
         return [
             "- 현재 증거와 정확히 일치하는 트러블슈팅 playbook이 없습니다."
-            if language == "ko"
+            if knowledge.language == "ko"
             else "- No troubleshooting playbook matched the available evidence yet."
         ]
     if top_family:
         family_context = [
             "- 원인 family는 추정됐지만 세부 증상은 확인되지 않았습니다. "
             "아래 항목은 확정 조치가 아니라 추가 증거 수집용 보조 점검입니다."
-            if language == "ko"
+            if knowledge.language == "ko"
             else "- The cause family is ranked, but no specific symptom is confirmed; "
             "the items below are supplemental checks for collecting evidence, not confirmed fixes."
         ]
         family_context.extend(
             _family_supplemental_playbook_lines(
-                failure_modes, top_family, language, active_masker
+                top_family, knowledge=replace(knowledge, masker=active_masker)
             )
         )
         return family_context
-    if fallback_cases:
-        return [fallback_cases]
+    if knowledge.cases:
+        return [knowledge.cases]
     return ["- No troubleshooting guidance is available for this cause yet."]
 
 
 def _family_supplemental_playbook_lines(
-    failure_modes: dict[str, list[dict]],
     family: str,
-    language: str,
-    masker: Masker,
     *,
+    knowledge: ReportKnowledge,
     exclude_symptom: str = "",
 ) -> list[str]:
     """Render sibling symptoms as discriminators, never as executable fixes."""
-    symptoms = failure_modes.get(family) or []
+    symptoms = knowledge.failure_modes.get(family) or []
     rendered: list[str] = []
     for symptom in symptoms:
         if str(symptom.get("symptom") or "") == exclude_symptom:
             continue
         name = _safe_line(
-            _localized_failure_mode_name(symptom, language), limit=160, masker=masker
+            _localized_failure_mode_name(symptom, knowledge.language), limit=160, masker=knowledge.masker
         )
         signals = [
-            _safe_line(keyword, limit=100, masker=masker)
+            _safe_line(keyword, limit=100, masker=knowledge.masker)
             for keyword in symptom.get("keywords", [])[:4]
         ]
         signals = [signal for signal in signals if signal]
@@ -8105,7 +7925,7 @@ def _family_supplemental_playbook_lines(
         signal_text = ", ".join(f"`{signal}`" for signal in signals)
         discriminator = (
             f"구분 신호: {signal_text}"
-            if language == "ko"
+            if knowledge.language == "ko"
             else f"Distinguishing signals: {signal_text}"
         )
         rendered.append(f"  - **{name}** — {discriminator}")
@@ -8115,7 +7935,7 @@ def _family_supplemental_playbook_lines(
         return []
     heading = (
         "- **같은 family의 대안 symptom (현재 증거로 확인되지 않음)**"
-        if language == "ko"
+        if knowledge.language == "ko"
         else "- **Alternative symptoms in the same family (not confirmed by current evidence)**"
     )
     return [heading, *rendered]
@@ -8252,126 +8072,6 @@ def _artifact_observation(art: object) -> dict[str, object] | None:
 
 def _collector_is_evidence(result: object) -> bool:
     return getattr(result, "status", "ok") in ("ok", "partial")
-
-
-def _kubernetes_highlights(details: dict[str, object]) -> list[str]:
-    lines: list[str] = []
-    # Run:ai CRD findings first — a not-Ready project/workload is the most direct
-    # answer for a control-plane alert that carried no workload label.
-    crd_findings = details.get("runai_crd_findings")
-    if isinstance(crd_findings, list):
-        for finding in crd_findings[:3]:
-            if not isinstance(finding, dict) or not finding.get("name"):
-                continue
-            kind = finding.get("kind") or "resource"
-            reason = finding.get("reason") or "NotReady"
-            message = str(finding.get("message") or "")
-            line = f"- Run:ai {kind} {finding.get('name')} is not Ready ({reason})"
-            if message:
-                line += f": {_short_sentence(message, limit=200)}"
-            lines.append(line)
-    warning_events = details.get("warning_events")
-    if isinstance(warning_events, list):
-        for event in warning_events[:3]:
-            if not isinstance(event, dict):
-                continue
-            reason = event.get("reason") or "Warning"
-            message = event.get("message") or ""
-            if message:
-                lines.append(
-                    f"- Kubernetes event {reason}: {_short_sentence(str(message), limit=220)}"
-                )
-    pod_statuses = details.get("pod_statuses")
-    if isinstance(pod_statuses, list):
-        for pod in pod_statuses[:2]:
-            if not isinstance(pod, dict):
-                continue
-            if pod.get("phase") and pod.get("name"):
-                lines.append(_pod_describe_line(pod))
-    return lines
-
-
-def _pod_describe_line(pod: dict[str, object]) -> str:
-    """`kubectl describe`-grade one-liner: phase + per-container limits, restarts,
-    and last termination. "phase Running" alone told the operator nothing on a
-    memory-limit alert — the limit and any OOMKilled restarts are the evidence."""
-    base = f"- Kubernetes pod {pod.get('name')} is in phase {pod.get('phase')}"
-    resources = pod.get("resources") if isinstance(pod.get("resources"), dict) else {}
-    statuses = pod.get("containerStatuses")
-    parts: list[str] = []
-    for st in (statuses if isinstance(statuses, list) else [])[:2]:
-        if not isinstance(st, dict) or not st.get("name"):
-            continue
-        cname = str(st["name"])
-        facts: list[str] = []
-        res = resources.get(cname) if isinstance(resources.get(cname), dict) else {}
-        limits = res.get("limits") if isinstance(res.get("limits"), dict) else {}
-        requests = res.get("requests") if isinstance(res.get("requests"), dict) else {}
-        if limits.get("memory"):
-            mem = f"mem limit {limits['memory']}"
-            if requests.get("memory"):
-                mem += f" (request {requests['memory']})"
-            facts.append(mem)
-        if limits.get("cpu"):
-            facts.append(f"cpu limit {limits['cpu']}")
-        restarts = st.get("restartCount")
-        if isinstance(restarts, int) and restarts > 0:
-            facts.append(f"{restarts} restart(s)")
-        state = st.get("state") if isinstance(st.get("state"), dict) else {}
-        waiting = state.get("waiting") if isinstance(state.get("waiting"), dict) else {}
-        if waiting.get("reason"):
-            facts.append(f"waiting: {waiting['reason']}")
-        last_state = st.get("lastState") if isinstance(st.get("lastState"), dict) else {}
-        term = last_state.get("terminated")
-        term = term if isinstance(term, dict) else {}
-        if term.get("reason") or term.get("exitCode") is not None:
-            last = f"last {term.get('reason') or 'terminated'}"
-            if term.get("exitCode") is not None:
-                last += f" (exit {term['exitCode']})"
-            if term.get("finishedAt"):
-                last += f" at {term['finishedAt']}"
-            facts.append(last)
-        if facts:
-            parts.append(f"{cname}: " + ", ".join(facts))
-    if parts:
-        base += " — " + "; ".join(parts)
-    return base + "."
-
-
-def _loki_highlights(details: dict[str, object]) -> list[str]:
-    lines: list[str] = []
-    queries = details.get("queries")
-    if not isinstance(queries, list):
-        return lines
-    for query in queries:
-        if not isinstance(query, dict):
-            continue
-        line_count = query.get("line_count")
-        name = query.get("name") or "query"
-        if isinstance(line_count, int) and line_count > 0:
-            lines.append(f"- Loki {name} returned {line_count} matching log line(s).")
-    return lines
-
-
-def _runai_highlights(details: dict[str, object]) -> list[str]:
-    lines: list[str] = []
-    project = details.get("project")
-    workload = details.get("workload_name") or details.get("runai_workload_id")
-    if project or workload:
-        lines.append(
-            "- Run:ai target context: "
-            f"project={project or 'unknown'}, workload={workload or 'unknown'}."
-        )
-    queries = details.get("queries")
-    if isinstance(queries, list):
-        for query in queries[:3]:
-            if not isinstance(query, dict):
-                continue
-            if query.get("error"):
-                lines.append(
-                    f"- Run:ai {query.get('name', 'query')} failed with {query.get('error')}."
-                )
-    return lines
 
 
 # Backend blended scale: identity contributes at most labelWeight, so scores no
@@ -8727,37 +8427,6 @@ def _stringify_result(
     if details and not structured:
         parts.append(_evidence_leaf_text(details))
     return " ".join(parts)
-
-
-def _graph_remediation_lines(graph_fixes: GraphRemediation | None) -> list[str]:
-    if graph_fixes is None or graph_fixes.is_empty():
-        return []
-    if not (graph_fixes.xid_fixes or graph_fixes.xid_triggers or graph_fixes.model_xids):
-        return []
-    masker = build_masker(())
-    lines = ["- Knowledge-graph derived remediation:"]
-    # Never render flat family/historical actions here. Curated and promoted
-    # remedies must arrive through a symptom->action relation; this renderer is
-    # reserved for signature-specific graph facts such as XID codes.
-    for code, fixes in graph_fixes.xid_fixes.items():
-        identity = _xid_identity_clause(graph_fixes, code, masker)
-        suffix = f" — {identity}" if identity else ""
-        lines.append(f"  - NVIDIA Xid {code}{suffix}:")
-        lines.extend(
-            f"    - {_safe_line(statement, limit=360, masker=masker)}" for statement in fixes[:5]
-        )
-    for code, trigger in graph_fixes.xid_triggers.items():
-        identity = _xid_identity_clause(graph_fixes, code, masker)
-        suffix = f" — {identity}" if identity else ""
-        lines.append(
-            f"  - Diagnostic guidance (XID {code}{suffix}): "
-            f"{_safe_line(trigger, limit=360, masker=masker)}"
-        )
-    for model, xids in graph_fixes.model_xids.items():
-        rendered = ", ".join(str(x) for x in xids)
-        safe_model = _safe_line(model, limit=120, masker=masker)
-        lines.append(f"  - Known Xid codes for {safe_model}: {rendered}.")
-    return lines
 
 
 def _affected_pods_lines(request: AlertAnalysisRequest, language: str = "en") -> list[str]:

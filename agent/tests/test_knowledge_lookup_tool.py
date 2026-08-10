@@ -43,8 +43,11 @@ def test_lookup_returns_curated_knowledge_with_its_source():
 
 def test_lookup_reaches_approved_novel_knowledge():
     """Matcher-only knowledge is exactly what the plan-time catalog cannot carry."""
-    from app.knowledge import _validate_approved_snapshot, set_runtime_knowledge_registry
-    from app.knowledge import KnowledgeRegistry
+    from app.knowledge import (
+        KnowledgeRegistry,
+        _validate_approved_snapshot,
+        set_runtime_knowledge_registry,
+    )
 
     registry = KnowledgeRegistry(mode="assist")
     registry._snapshot = _validate_approved_snapshot(

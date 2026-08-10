@@ -56,6 +56,9 @@ import { FeedbackPanel } from './workspace/FeedbackPanel';
 import { ConfidenceBreakdownPanel } from './workspace/ConfidenceBreakdownPanel';
 import { EvaluationPanel } from './workspace/EvaluationPanel';
 import { FloatingChat } from './workspace/FloatingChat';
+import { RcaCorrectionPanel } from './workspace/RcaCorrectionPanel';
+import { useRcaCorrection } from './workspace/rcaCorrection';
+import { useWorkspaceDialog } from './workspace/workspaceDialog';
 import { SimilarIncidentsPanel } from './workspace/SimilarIncidentsPanel';
 import { useRcaChat } from './workspace/chatSession';
 import { exportIncidentDocx } from '../exportDocx';
@@ -108,179 +111,15 @@ import { hashForDetail, hashForView, routeFromHash } from '../utils/routing';
 import { evidenceMetadata, type EvidenceMetadata, type EvidenceWindow } from '../utils/evidenceMetadata';
 import { analysisRunForDetail, selectedAnalysisRunID as selectedAnalysisRunIDForDetail } from '../utils/analysisRunSelection';
 import { parseCorrectionActions } from '../utils/operatorCorrection';
-
-// The report's "## 3. 권장 조치 (Recommended Actions)" numbered items, one per
-// line, for seeding the correction form. First line of each item only — the
-// operator is editing, not archiving.
-function reportActionLines(markdown: string): string {
-  const start = markdown.search(/^## 3\./m);
-  if (start < 0) return '';
-  const section = markdown.slice(start);
-  const next = section.slice(6).search(/^## /m);
-  const body = next < 0 ? section : section.slice(0, next + 6);
-  return body
-    .split('\n')
-    .map((line) => /^\s*\d+\.\s+(.*)$/.exec(line)?.[1] ?? '')
-    .filter(Boolean)
-    .join('\n');
-}
-
-function errorMessage(err: unknown, fallback: string) {
-  return err instanceof Error ? err.message : fallback;
-}
-
-function formatArtifactValue(value: unknown) {
-  return typeof value === 'string' ? value : safeJSONStringify(value, 2);
-}
-
-function safeJSONStringify(value: unknown, space?: number) {
-  const seen = new WeakSet<object>();
-  try {
-    const serialized = JSON.stringify(
-      value,
-      (_key, item) => {
-        if (typeof item !== 'object' || item === null) {
-          return item;
-        }
-        if (seen.has(item)) {
-          return '[Circular]';
-        }
-        seen.add(item);
-        return item;
-      },
-      space,
-    );
-    return serialized ?? String(value);
-  } catch (err) {
-    return `[Unserializable: ${errorMessage(err, 'unknown value')}]`;
-  }
-}
-
-function compactArtifactValue(value: unknown, depth = 3): unknown {
-  if (depth <= 0) {
-    if (Array.isArray(value)) return `[${value.length} item(s)]`;
-    if (isPlainObject(value)) return '{...}';
-    return value;
-  }
-  if (Array.isArray(value)) {
-    const trimmed = value.slice(0, 4).map((item) => compactArtifactValue(item, depth - 1));
-    if (value.length > 4) {
-      trimmed.push({ truncated: value.length - 4 });
-    }
-    return trimmed;
-  }
-  if (!isPlainObject(value)) return value;
-
-  const priorityKeys = [
-    'name',
-    'namespace',
-    'path',
-    'query',
-    'status',
-    'status_code',
-    'error',
-    'reason',
-    'message',
-    'phase',
-    'nodeName',
-    'ready',
-    'restartCount',
-    'line_count',
-    'stream_count',
-    'items',
-    'conditions',
-    'containerStatuses',
-    'data',
-    'sample',
-  ];
-  const keys = Object.keys(value);
-  const selected = [
-    ...priorityKeys.filter((key) => key in value),
-    ...keys.filter((key) => !priorityKeys.includes(key)),
-  ].slice(0, 9);
-
-  const compacted: Record<string, unknown> = {};
-  for (const key of selected) {
-    compacted[key] = compactArtifactValue(value[key], depth - 1);
-  }
-  if (keys.length > selected.length) {
-    compacted.truncated_keys = keys.length - selected.length;
-  }
-  return compacted;
-}
-
-function queryDisplayItems(result: unknown): QueryDisplayItem[] {
-  if (!isPlainObject(result) || !Array.isArray(result.queries)) return [];
-  return result.queries
-    .filter(isPlainObject)
-    .map((query, index) => {
-      const name = stringValue(query.name) || `query_${index + 1}`;
-      const statusCode = numberValue(query.status_code);
-      const error = stringValue(query.error);
-      const rawStatus = stringValue(query.status);
-      // Collectors that pre-extract the salient content (e.g. Loki's flat
-      // sample_lines: the actual log text) win over the nested sample/data,
-      // which compactArtifactValue would otherwise crush to "[N item(s)]".
-      const sampleLines = Array.isArray(query.sample_lines) ? (query.sample_lines as unknown[]) : undefined;
-      const previewSource = query.sample !== undefined ? query.sample : query.data;
-      // A query failed if the transport 4xx/5xx'd OR the response BODY reports an
-      // error. MCP builders stamp a fixed status_code:200/error:None and hide the
-      // real failure in the body — runai as a numeric {status:404,…}, Prometheus/
-      // Loki as a "error" status. Any of these must render red, not a green pill.
-      const bodyStatus = isPlainObject(previewSource) ? numberValue(previewSource.status) : undefined;
-      const failed =
-        Boolean(error) ||
-        (statusCode !== undefined && statusCode >= 400) ||
-        (bodyStatus !== undefined && bodyStatus >= 400) ||
-        rawStatus === 'error';
-      const status = failed ? 'failed' : rawStatus || (statusCode ? String(statusCode) : 'ok');
-      const queryText = stringValue(query.query) || stringValue(query.path) || stringValue(query.url) || '';
-      const facts = [
-        statusCode ? `HTTP ${statusCode}` : '',
-        numberValue(query.stream_count) !== undefined ? `${numberValue(query.stream_count)} stream(s)` : '',
-        numberValue(query.line_count) !== undefined ? `${numberValue(query.line_count)} line(s)` : '',
-        error ? error : '',
-      ].filter(Boolean);
-      return {
-        id: `${name}-${index}`,
-        name: humanizeKey(name),
-        queryText,
-        queryLabel: query.query ? 'Query' : query.path ? 'Path' : 'URL',
-        status,
-        statusCode,
-        error,
-        facts,
-        preview: sampleLines ?? (previewSource === undefined ? undefined : compactArtifactValue(previewSource)),
-      };
-    });
-}
-
-function stringValue(value: unknown) {
-  return typeof value === 'string' ? value : '';
-}
-
-function numberValue(value: unknown) {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
-}
-
-// Empty results ([], {}, "") are noise — collectors that ran and found nothing
-// still show their status/facts, just not a barren "Relevant result: []".
-function isEmptyResult(value: unknown): boolean {
-  if (value === undefined || value === null) return true;
-  if (Array.isArray(value)) return value.length === 0;
-  if (isPlainObject(value)) return Object.keys(value).length === 0;
-  if (typeof value === 'string') return value.trim() === '';
-  return false;
-}
-
-function humanizeKey(value: string) {
-  return value.replace(/[_:]/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
+import {
+  compactArtifactValue,
+  errorMessage,
+  queryDisplayItems,
+  reportActionLines,
+  safeJSONStringify,
+} from '../utils/artifactValues';
+import { ProgressTimeline } from './workspace/ProgressTimeline';
+import { AffectedPods, AgentTrail, DiagnosticsPanel } from './workspace/EvidenceTrail';
 function realtimeEventMatchesDetail(detail: DetailState, payload: RealtimeEventPayload | undefined) {
   if (!detail || !payload?.data) return false;
   const data = payload.data;
@@ -911,23 +750,6 @@ function UnifiedWorkspace({
   onResolve: (id: string) => Promise<void>;
 }) {
   const [busyAction, setBusyAction] = useState('');
-  const [closing, setClosing] = useState(false);
-  const [justApproved, setJustApproved] = useState(false);
-  const [correctionOpen, setCorrectionOpen] = useState(false);
-  const [correctionFamily, setCorrectionFamily] = useState('');
-  const [correctionNewCause, setCorrectionNewCause] = useState('');
-  const [correctionSuggestions, setCorrectionSuggestions] = useState<{ catalog: string[]; novel: Array<{ family: string; mechanism: string }>; slug: string }>();
-  const [correctionSummary, setCorrectionSummary] = useState('');
-  const [correctionActions, setCorrectionActions] = useState('');
-  const [correctionCatalogStatus, setCorrectionCatalogStatus] = useState<'loading' | 'ready' | 'failed'>('ready');
-  const [correctionFamilies, setCorrectionFamilies] = useState<string[]>([]);
-  const [correctionError, setCorrectionError] = useState('');
-  const [operatorActionError, setOperatorActionError] = useState('');
-  const [operatorPinnedOverride, setOperatorPinnedOverride] = useState<boolean>();
-  const closeTimerRef = useRef<number | null>(null);
-  const approveTimerRef = useRef<number | null>(null);
-  const correctionTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const correctionFamilyRef = useRef<HTMLSelectElement | null>(null);
   const runWorkspaceAction = useCallback(async (action: string, work: () => Promise<void>) => {
     if (busyAction) return;
     setBusyAction(action);
@@ -943,121 +765,27 @@ function UnifiedWorkspace({
       ? detail.data.incident_id
       : detail.data.alert_id
     : null;
+  const { closing, justApproved, handleClose, flashApproved, sectionRef } =
+    useWorkspaceDialog(detailKey, onClose);
+
+  // Every hook must run before the `if (!detail)` bail-out below: React matches
+  // hooks by call order, so one behind a conditional return crashes the panel
+  // the moment detail goes null.
+  const incident = detail?.kind === 'incident' ? detail.data : null;
+  const correction = useRcaCorrection({
+    incident,
+    analysisRun,
+    report: (analysisRun ?? detail?.data ?? {}) as { analysis_summary?: string; analysis_detail?: string },
+    busyAction,
+    setBusyAction,
+    onRefresh,
+    onReverify,
+  });
 
   // Opening a different target (or reopening) cancels any in-flight close, so the
   // new detail shows immediately instead of finishing the previous exit animation.
-  useEffect(() => {
-    setClosing(false);
-    if (closeTimerRef.current !== null) {
-      window.clearTimeout(closeTimerRef.current);
-      closeTimerRef.current = null;
-    }
-  }, [detailKey]);
-
-  useEffect(() => () => {
-    if (closeTimerRef.current !== null) window.clearTimeout(closeTimerRef.current);
-    if (approveTimerRef.current !== null) window.clearTimeout(approveTimerRef.current);
-  }, []);
-
-  useEffect(() => {
-    if (!correctionOpen) return undefined;
-    let cancelled = false;
-    setCorrectionCatalogStatus('loading');
-    setCorrectionError('');
-    void fetchRootCauseFamilies().then((families) => {
-      if (cancelled) return;
-      setCorrectionFamilies(families);
-      setCorrectionCatalogStatus('ready');
-      // "수정" edits the RCA the operator is looking at: seed the form from
-      // the current analysis. Pristine fields only, so reopening the panel
-      // never clobbers an in-progress edit.
-      if (!correctionFamily && !correctionNewCause && !correctionSummary && !correctionActions) {
-        const currentFamily = String(incident?.root_cause_family ?? '');
-        if (currentFamily && families.includes(currentFamily)) {
-          setCorrectionFamily(currentFamily);
-        }
-        const report = (analysisRun ?? detail?.data ?? {}) as {
-          analysis_summary?: string;
-          analysis_detail?: string;
-        };
-        setCorrectionSummary(report.analysis_summary ?? '');
-        setCorrectionActions(reportActionLines(report.analysis_detail ?? ''));
-      }
-    }).catch((err: unknown) => {
-      if (cancelled) return;
-      setCorrectionCatalogStatus('failed');
-      setCorrectionError(`Root-cause family catalog unavailable: ${errorMessage(err, 'Failed to load catalog.')}`);
-    });
-    return () => { cancelled = true; };
-  }, [correctionOpen]);
-
-  useEffect(() => {
-    if (!correctionNewCause.trim()) { setCorrectionSuggestions(undefined); return undefined; }
-    let cancelled = false;
-    const handle = window.setTimeout(() => { void fetchFamilySuggestions(correctionNewCause).then((value) => { if (!cancelled) setCorrectionSuggestions(value); }).catch(() => { if (!cancelled) setCorrectionSuggestions(undefined); }); }, 300);
-    return () => { cancelled = true; window.clearTimeout(handle); };
-  }, [correctionNewCause]);
-
-  useEffect(() => {
-    if (!correctionOpen) return undefined;
-    correctionFamilyRef.current?.focus();
-
-    const handleCorrectionKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      event.stopPropagation();
-      setCorrectionOpen(false);
-      correctionTriggerRef.current?.focus();
-    };
-
-    document.addEventListener('keydown', handleCorrectionKeyDown, true);
-    return () => document.removeEventListener('keydown', handleCorrectionKeyDown, true);
-  }, [correctionOpen]);
-
-  useEffect(() => {
-    setOperatorPinnedOverride(undefined);
-  }, [analysisRun?.run_id]);
-
-  // Play the exit animation, then let the parent unmount. Timer-based (not
-  // animationend) so it still closes under prefers-reduced-motion.
-  const handleClose = useCallback(() => {
-    if (closeTimerRef.current !== null) return;
-    setClosing(true);
-    closeTimerRef.current = window.setTimeout(() => {
-      closeTimerRef.current = null;
-      onClose();
-    }, 220);
-  }, [onClose]);
-
-  const flashApproved = useCallback(() => {
-    setJustApproved(true);
-    if (approveTimerRef.current !== null) window.clearTimeout(approveTimerRef.current);
-    approveTimerRef.current = window.setTimeout(() => {
-      approveTimerRef.current = null;
-      setJustApproved(false);
-    }, 1400);
-  }, []);
-
-  const sectionRef = useRef<HTMLElement | null>(null);
-  const openerRef = useRef<HTMLElement | null>(null);
-
-  // Dialog focus management: remember what opened the workspace (the table row
-  // activated by Enter/click), move focus into the dialog so Tab starts on its
-  // actions instead of the covered list, and hand focus back on close.
-  // useLayoutEffect, not useEffect: the same commit that mounts the dialog also
-  // hides `.main` (visibility), and the browser blurs the row during the style
-  // recalc that follows — a passive effect would only ever see <body> focused.
-  useLayoutEffect(() => {
-    if (!detailKey) return undefined;
-    openerRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    sectionRef.current?.focus();
-    return () => {
-      openerRef.current?.focus();
-    };
-  }, [detailKey]);
 
   if (!detail) return null;
-  const incident = detail.kind === 'incident' ? detail.data : null;
   const alert = detail.kind === 'alert' ? detail.data : null;
   const title = incident?.title ?? alert?.alarm_title ?? '';
   const id = incident?.incident_id ?? alert?.alert_id ?? '';
@@ -1078,9 +806,6 @@ function UnifiedWorkspace({
     incident?.missing_data,
     incident?.artifacts?.length ?? 0,
   );
-  const isOperatorCorrection = analysisRun?.source === 'operator';
-  const operatorCorrectionPinned = isOperatorCorrection &&
-    (operatorPinnedOverride ?? analysisRun?.metadata?.pinned === true);
   const evidencePresentation = collectorEvidencePresentation({
     isAnalyzing,
     runStatus: analysisRun?.status,
@@ -1095,54 +820,6 @@ function UnifiedWorkspace({
   const commentCount = feedback?.comments?.length ?? 0;
   const scrollToFeedback = () => {
     document.getElementById('operator-feedback')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  };
-  const saveCorrection = async () => {
-    if (!incident || busyAction || correctionCatalogStatus !== 'ready' || (!correctionFamily && !correctionNewCause.trim()) || !correctionSummary.trim()) return;
-    setBusyAction('rca-correction');
-    setCorrectionError('');
-    try {
-      await rcaCorrection(incident.incident_id, {
-        ...(correctionNewCause.trim() ? { new_cause: correctionNewCause.trim() } : { root_cause_family: correctionFamily }),
-        summary: correctionSummary.trim(),
-        actions: parseCorrectionActions(correctionActions),
-      });
-      await onRefresh();
-      setCorrectionOpen(false);
-      setCorrectionFamily('');
-      setCorrectionNewCause('');
-      setCorrectionSummary('');
-      setCorrectionActions('');
-    } catch (err) {
-      setCorrectionError(errorMessage(err, 'Failed to save RCA correction.'));
-    } finally {
-      setBusyAction('');
-    }
-  };
-  const updateOperatorPin = async () => {
-    if (!incident || !isOperatorCorrection || busyAction) return;
-    setBusyAction('rca-pin');
-    setOperatorActionError('');
-    try {
-      const run = await rcaPin(incident.incident_id, !operatorCorrectionPinned);
-      setOperatorPinnedOverride(run.metadata?.pinned === true);
-      await onRefresh();
-    } catch (err) {
-      setOperatorActionError(errorMessage(err, 'Failed to update RCA correction pin.'));
-    } finally {
-      setBusyAction('');
-    }
-  };
-  const reverifyCorrection = async () => {
-    if (!incident || !operatorCorrectionPinned || busyAction) return;
-    setBusyAction('reverify');
-    setOperatorActionError('');
-    try {
-      await onReverify(incident.incident_id);
-    } catch (err) {
-      setOperatorActionError(errorMessage(err, 'Failed to start re-verification.'));
-    } finally {
-      setBusyAction('');
-    }
   };
 
   return (
@@ -1223,27 +900,27 @@ function UnifiedWorkspace({
               <button
                 className="ghost-button"
                 disabled={Boolean(busyAction) || isAnalyzing}
-                onClick={() => setCorrectionOpen((open) => !open)}
-                ref={correctionTriggerRef}
+                onClick={() => correction.setOpen((open) => !open)}
+                ref={correction.triggerRef}
                 type="button"
               >
                 <FileText size={16} /> RCA 수정
               </button>
-              {isOperatorCorrection && (
+              {correction.isOperatorRun && (
                 <button
                   className={`ghost-button compact-button ${busyAction === 'rca-pin' ? 'is-busy' : ''}`}
                   disabled={Boolean(busyAction)}
-                  onClick={() => void updateOperatorPin()}
+                  onClick={() => void correction.togglePin()}
                   type="button"
                 >
-                  {busyAction === 'rca-pin' ? 'Updating...' : operatorCorrectionPinned ? '고정 해제' : '고정'}
+                  {busyAction === 'rca-pin' ? 'Updating...' : correction.pinned ? '고정 해제' : '고정'}
                 </button>
               )}
-              {operatorCorrectionPinned && (
+              {correction.pinned && (
                 <button
                   className={`ghost-button compact-button ${busyAction === 'reverify' ? 'is-busy' : ''}`}
                   disabled={Boolean(busyAction)}
-                  onClick={() => void reverifyCorrection()}
+                  onClick={() => void correction.reverify()}
                   type="button"
                 >
                   <RefreshCw size={14} /> {busyAction === 'reverify' ? 'Analyzing...' : '수정 결론으로 재검증'}
@@ -1310,79 +987,8 @@ function UnifiedWorkspace({
       )}
 
       <div className="workspace-body">
-        {incident && correctionOpen && (
-          <section className="rca-correction-panel evaluation-panel" aria-label="RCA correction">
-            <div className="section-title"><FileText size={18} /> RCA 수정</div>
-            {correctionError && <p className="feedback-error">{correctionError}</p>}
-            <form className="evaluation-form" onSubmit={(event) => { event.preventDefault(); void saveCorrection(); }}>
-              <label className="evaluation-field">
-                <span>Root-cause family</span>
-                <select
-                  ref={correctionFamilyRef}
-                  value={correctionFamily}
-                  onChange={(event) => setCorrectionFamily(event.target.value)}
-                  disabled={correctionCatalogStatus !== 'ready' || Boolean(busyAction)}
-                  required
-                >
-                  <option value="">
-                    {correctionCatalogStatus === 'loading'
-                      ? 'Loading families…'
-                      : correctionCatalogStatus === 'failed'
-                        ? 'Family catalog unavailable'
-                        : 'Select family'}
-                  </option>
-                  {correctionFamilies.map((family) => (
-                    <option key={family} value={family}>{family.split('_').join(' ')}</option>
-                  ))}
-                </select>
-              </label>
-              <label className="evaluation-field">
-                <span>New cause <small>Optional; leave blank to use the catalog family</small></span>
-                <input value={correctionNewCause} onChange={(event) => { setCorrectionNewCause(event.target.value); setCorrectionFamily(''); }} disabled={Boolean(busyAction)} maxLength={200} />
-                {correctionSuggestions && (
-                  <small>
-                    {correctionSuggestions.catalog.map((family) => <button key={family} type="button" className="link-button" onClick={() => { setCorrectionFamily(family); setCorrectionNewCause(''); }}>{family}</button>)}
-                    {correctionSuggestions.novel.map((item) => <button key={item.family} type="button" className="link-button" onClick={() => { setCorrectionFamily(item.family); setCorrectionNewCause(''); }}>{item.mechanism || item.family}</button>)}
-                    {correctionNewCause.trim() && <> New slug: <code>{correctionSuggestions.slug}</code></>}
-                  </small>
-                )}
-              </label>
-              <label className="evaluation-field">
-                <span>RCA summary</span>
-                <textarea
-                  value={correctionSummary}
-                  onChange={(event) => setCorrectionSummary(event.target.value)}
-                  disabled={Boolean(busyAction)}
-                  required
-                />
-              </label>
-              <label className="evaluation-field">
-                <span>Actions <small>One action per line</small></span>
-                <textarea
-                  value={correctionActions}
-                  onChange={(event) => setCorrectionActions(event.target.value)}
-                  disabled={Boolean(busyAction)}
-                />
-              </label>
-              <div className="evaluation-actions">
-                <button
-                  className="ghost-button"
-                  disabled={Boolean(busyAction)}
-                  onClick={() => setCorrectionOpen(false)}
-                  type="button"
-                >
-                  Cancel
-                </button>
-                <button
-                  className={`primary-button evaluation-save ${busyAction === 'rca-correction' ? 'is-busy' : ''}`}
-                  disabled={Boolean(busyAction) || correctionCatalogStatus !== 'ready' || (!correctionFamily && !correctionNewCause.trim()) || !correctionSummary.trim()}
-                  type="submit"
-                >
-                  {busyAction === 'rca-correction' ? 'Saving...' : 'Save'}
-                </button>
-              </div>
-            </form>
-          </section>
+        {incident && correction.open && (
+          <RcaCorrectionPanel correction={correction} busyAction={busyAction} />
         )}
         <section className="rca-summary">
           <div className="rca-summary-heading">
@@ -1403,10 +1009,10 @@ function UnifiedWorkspace({
                 증거 일부 누락
               </span>
             )}
-            {isOperatorCorrection && (
+            {correction.isOperatorRun && (
               <div className="rca-operator-meta">
                 <span className="quality quality-operator">운영자 수정</span>
-                <span className="rca-operator-pin">{operatorCorrectionPinned ? '고정됨' : '고정 해제됨'}</span>
+                <span className="rca-operator-pin">{correction.pinned ? '고정됨' : '고정 해제됨'}</span>
               </div>
             )}
           </div>
@@ -1419,7 +1025,7 @@ function UnifiedWorkspace({
               <MessageSquare size={14} /> Feedback
             </button>
           </div>
-          {operatorActionError && <p className="feedback-error">{operatorActionError}</p>}
+          {correction.actionError && <p className="feedback-error">{correction.actionError}</p>}
         </section>
 
         {(isAnalyzing || progressEvents.length > 0) && (
@@ -1538,584 +1144,6 @@ function UnifiedWorkspace({
         />
       </div>
     </section>
-  );
-}
-
-function ProgressTimeline({
-  events,
-  live,
-  run,
-}: {
-  events: AnalysisProgressEntry[];
-  live: boolean;
-  run?: AnalysisRun;
-}) {
-  const [open, setOpen] = useState(live);
-  const historyRef = useRef<HTMLOListElement>(null);
-  const followsLatestRef = useRef(true);
-  const initializedScrollRef = useRef(false);
-  const runID = run?.run_id ?? '';
-
-  useEffect(() => {
-    if (live) setOpen(true);
-  }, [live]);
-
-  useEffect(() => {
-    initializedScrollRef.current = false;
-    followsLatestRef.current = true;
-  }, [runID]);
-
-  useEffect(() => {
-    const history = historyRef.current;
-    if (!open || !history) return;
-    if (!initializedScrollRef.current || (live && followsLatestRef.current)) {
-      const frame = window.requestAnimationFrame(() => {
-        history.scrollTop = history.scrollHeight;
-        initializedScrollRef.current = true;
-      });
-      return () => window.cancelAnimationFrame(frame);
-    }
-  }, [events.length, live, open, runID]);
-
-  const handleHistoryScroll = () => {
-    const history = historyRef.current;
-    if (!history) return;
-    const distanceFromLatest = history.scrollHeight - history.scrollTop - history.clientHeight;
-    followsLatestRef.current = distanceFromLatest < 48;
-  };
-
-  const ledger = latestProgressLedger(events);
-  return (
-    <section className={`progress-timeline ${live ? 'is-live' : ''}`}>
-      <button className="progress-timeline-head" onClick={() => setOpen((value) => !value)} type="button">
-        <span>
-          <ListChecks size={18} /> Thought Process
-        </span>
-        <span className="progress-timeline-meta">
-          {live ? 'live' : run?.updated_at ? formatTime(run.updated_at) : 'complete'} · {events.length}
-          <ChevronDown size={15} />
-        </span>
-      </button>
-      {open && (
-        <div className="progress-timeline-body">
-          {ledger.length > 0 && (
-            <div className="hypothesis-strip">
-              {ledger.slice(0, 4).map((item) => {
-                // 0.5 with status "open" is the investigator's untouched seed, not a
-                // computed probability — showing "50%" on every chip misled operators.
-                const seeded = String(item.status || 'open') === 'open' && item.confidence === 0.5;
-                return (
-                  <span key={String(item.id)} className={`hypothesis-chip status-${String(item.status || 'open')}`}>
-                    <strong>{String(item.family || item.id || 'hypothesis').replace(/_/g, ' ')}</strong>
-                    {typeof item.confidence === 'number' && !seeded && <em>{Math.round(item.confidence * 100)}%</em>}
-                  </span>
-                );
-              })}
-            </div>
-          )}
-          {events.length === 0 ? (
-            <p className="empty">Analysis has started. Waiting for the first reasoning update.</p>
-          ) : (
-            <>
-              <div className="progress-history-hint">
-                <span>{events.length} updates</span>
-                <span>Scroll up for earlier history</span>
-              </div>
-              <ol
-                aria-label="Thought Process history"
-                className="progress-events progress-events-scroll"
-                onScroll={handleHistoryScroll}
-                ref={historyRef}
-              >
-                {events.map((event, index) => (
-                  <li key={`${event.seq ?? index}-${event.phase ?? 'phase'}`}>
-                    <span className="progress-dot" />
-                    <div className="progress-event-copy">
-                      <div className="progress-event-head">
-                        <strong>{progressEventTitle(event)}</strong>
-                        <time>{formatProgressTimestamp(event.timestamp)}</time>
-                      </div>
-                      {event.message && <p>{String(event.message)}</p>}
-                      <ProgressEventDetails event={event} />
-                    </div>
-                  </li>
-                ))}
-              </ol>
-            </>
-          )}
-        </div>
-      )}
-    </section>
-  );
-}
-
-const PROGRESS_BASE_FIELDS = new Set(['seq', 'phase', 'message', 'timestamp']);
-const PROGRESS_REQUEST_FIELDS = new Set([
-  'target',
-  'plan',
-  'hypotheses',
-  'scope',
-  'query',
-  'queries',
-  'probes',
-]);
-const PROGRESS_RESPONSE_FIELDS = new Set([
-  'collector',
-  'collectors',
-  'status',
-  'summary',
-  'top_root_cause',
-  'root_cause_candidates',
-  'refuted',
-  'caveat',
-  'next_check',
-]);
-const PROGRESS_DECISION_FIELDS = new Set([
-  'step',
-  'action',
-  'selected_hypothesis',
-  'hypothesis_ledger',
-  'hypothesis_updates',
-]);
-
-type ProgressDetailGroup = {
-  label: string;
-  entries: Array<[string, unknown]>;
-};
-
-function ProgressEventDetails({ event }: { event: AnalysisProgressEntry }) {
-  const groups = progressDetailGroups(event);
-  const fieldCount = groups.reduce((total, group) => total + group.entries.length, 0);
-  if (fieldCount === 0) return null;
-  return (
-    <details className="progress-event-details">
-      <summary>
-        <span>Exchange details</span>
-        <span>{fieldCount} field{fieldCount === 1 ? '' : 's'}</span>
-      </summary>
-      <div className="progress-detail-groups">
-        {groups.map((group) => (
-          <section key={group.label} className="progress-detail-group">
-            <h4>{group.label}</h4>
-            {group.entries.map(([key, value]) => (
-              <div className="progress-detail-field" key={key}>
-                <span>{progressFieldLabel(key)}</span>
-                {isProgressScalar(value) ? (
-                  <span className="progress-detail-plain">{formatProgressValue(value)}</span>
-                ) : (
-                  <pre tabIndex={0}>{formatProgressValue(value)}</pre>
-                )}
-              </div>
-            ))}
-          </section>
-        ))}
-      </div>
-    </details>
-  );
-}
-
-function progressDetailGroups(event: AnalysisProgressEntry): ProgressDetailGroup[] {
-  const grouped: Record<string, Array<[string, unknown]>> = {
-    'Sent context': [],
-    'Agent decision': [],
-    'Received observation': [],
-    'Additional context': [],
-  };
-  for (const [key, value] of Object.entries(event)) {
-    if (PROGRESS_BASE_FIELDS.has(key) || value === undefined || value === null || value === '') {
-      continue;
-    }
-    const label = PROGRESS_REQUEST_FIELDS.has(key)
-      ? 'Sent context'
-      : PROGRESS_DECISION_FIELDS.has(key)
-        ? 'Agent decision'
-        : PROGRESS_RESPONSE_FIELDS.has(key)
-          ? 'Received observation'
-          : 'Additional context';
-    grouped[label].push([key, value]);
-  }
-  return Object.entries(grouped)
-    .filter(([, entries]) => entries.length > 0)
-    .map(([label, entries]) => ({ label, entries }));
-}
-
-function progressFieldLabel(key: string) {
-  return key.replace(/_/g, ' ').replace(/\b\w/g, (character) => character.toUpperCase());
-}
-
-function formatProgressValue(value: unknown) {
-  return typeof value === 'string' ? value : safeJSONStringify(value, 2);
-}
-
-function isProgressScalar(value: unknown) {
-  return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean';
-}
-
-function latestProgressLedger(events: AnalysisProgressEntry[]) {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const ledger = events[index].hypothesis_ledger;
-    if (Array.isArray(ledger)) return ledger as Array<Record<string, unknown>>;
-  }
-  return [];
-}
-
-const PHASE_LABELS: Record<string, string> = {
-  enrich: 'Enrichment',
-  plan: 'Planning',
-  planning: 'Planning',
-  evidence: 'Evidence',
-  collection: 'Evidence',
-  rank: 'Ranking',
-  ranking: 'Ranking',
-  investigation: 'Investigation',
-  self_check: 'Self-check',
-  synthesize: 'Synthesis',
-  harness: 'Validation',
-  reflection: 'Synthesis',
-};
-
-function progressEventTitle(event: AnalysisProgressEntry) {
-  const rawPhase = String(event.phase || 'progress');
-  const phase = PHASE_LABELS[rawPhase] || rawPhase.replace(/_/g, ' ');
-  if (event.collector) return `${phase} · ${agentLabel(String(event.collector))}`;
-  if (event.selected_hypothesis) return `${phase} · ${String(event.selected_hypothesis)}`;
-  return phase;
-}
-
-function formatProgressTimestamp(value: unknown) {
-  if (typeof value !== 'string' || !value) return '';
-  return formatTime(value);
-}
-
-function AffectedPods({ pods }: { pods: string[] }) {
-  if (!pods.length) return null;
-  const shown = pods.slice(0, 12);
-  const remaining = pods.length - shown.length;
-  return (
-    <div className="affected-pods">
-      <span className="affected-pods-label">Affected pods · {pods.length}</span>
-      <div className="affected-pods-list">
-        {shown.map((pod) => (
-          <code key={pod} className="pod-chip" title={pod}>{pod}</code>
-        ))}
-        {remaining > 0 && <span className="pod-chip pod-chip-more">+{remaining} more</span>}
-      </div>
-    </div>
-  );
-}
-
-
-function DiagnosticsPanel({ missingData, warnings, tokenUsage, analysisDuration }: { missingData: string[]; warnings: string[]; tokenUsage?: Record<string, unknown>; analysisDuration?: string }) {
-  return (
-    <section className="diagnostics">
-      {analysisDuration && <div className="token-usage">Analysis time: {analysisDuration}</div>}
-      {tokenUsage && <div className="token-usage">LLM tokens: {formatTokenUsage(tokenUsage)}</div>}
-      {missingData.length > 0 && <DiagnosticGroup title="Missing Data" items={missingData} tone="missing" />}
-      {warnings.length > 0 && <DiagnosticGroup title="Warnings" items={warnings} tone="warning" />}
-    </section>
-  );
-}
-
-function DiagnosticGroup({
-  title,
-  items,
-  tone,
-}: {
-  title: string;
-  items: string[];
-  tone: 'missing' | 'warning';
-}) {
-  const [open, setOpen] = useState(false);
-  const visibleItems = open ? items : items.slice(0, 3);
-  const hiddenCount = Math.max(0, items.length - visibleItems.length);
-
-  return (
-    <div className={`diagnostic-group diagnostic-${tone}`}>
-      <button className="diagnostic-toggle" onClick={() => setOpen((value) => !value)} type="button">
-        <span>{title}</span>
-        <strong>{items.length}</strong>
-        <ChevronDown size={16} />
-      </button>
-      <ul>
-        {visibleItems.map((item, index) => (
-          <li key={`${title}-${index}-${item}`}>{item}</li>
-        ))}
-      </ul>
-      {hiddenCount > 0 && (
-        <button className="ghost-button compact-button diagnostic-more" onClick={() => setOpen(true)} type="button">
-          <ChevronDown size={14} /> Show {hiddenCount} more
-        </button>
-      )}
-    </div>
-  );
-}
-
-// Surface WHY a collector is unavailable: match the aggregate missing-data keys and
-// warnings back to this agent (keys are prefixed by source, e.g. "system_agent.url",
-// "loki.auth", "runai.queue") so an Unavailable card explains itself.
-function agentReasons(agent: string, missingData: string[], warnings: string[]): string[] {
-  const needles = agent === 'system' ? ['system_agent', 'system'] : [agent];
-  const hit = (s: string) => needles.some((n) => s.toLowerCase().includes(n));
-  const friendly: Record<string, string> = {
-    'system_agent.url': 'System agent is not configured (no URL) — node/kernel evidence was skipped.',
-    'system_agent.node': 'No node is associated with this alert — node/kernel evidence was skipped.',
-    'loki.auth': 'Loki authentication failed.',
-  };
-  const fromMissing = missingData.filter(hit).map((k) => friendly[k] || `missing: ${k}`);
-  const fromWarnings = warnings.filter(hit);
-  return Array.from(new Set([...fromMissing, ...fromWarnings]));
-}
-
-// Evidence trail: a collector tab strip (icon + label + helpful count + capability
-// dot) over ONE full-width panel showing just the selected collector's artifacts.
-// One card open at a time keeps the section scannable even at 100+ artifacts.
-function AgentTrail({
-  artifacts,
-  capabilities,
-  missingData,
-  warnings,
-}: {
-  artifacts: Artifact[];
-  capabilities: Record<string, string>;
-  missingData: string[];
-  warnings: string[];
-}) {
-  const { tabs, defaultAgent } = agentTabs(artifacts, capabilities);
-  // Lazy selection: until the user picks, follow the data-driven default so
-  // artifacts arriving mid-analysis land on a useful tab.
-  const [picked, setPicked] = useState<string | null>(null);
-  const selected = picked !== null && tabs.some((tab) => tab.agent === picked) ? picked : defaultAgent;
-  return (
-    <>
-      <div className="agent-tabs">
-        {tabs.map((tab) => (
-          <button
-            key={tab.agent}
-            className={`agent-tab ${tab.agent === selected ? 'active' : ''}`}
-            onClick={() => setPicked(tab.agent)}
-            type="button"
-          >
-            {agentIcon(tab.agent)}
-            <strong>{agentLabel(tab.agent)}</strong>
-            {tab.helpful > 0 && <span className="agent-tab-count">{tab.helpful}</span>}
-            <span className={`agent-tab-dot capability-${tab.capability}`} aria-hidden />
-          </button>
-        ))}
-      </div>
-      <AgentEvidence
-        key={selected}
-        artifacts={artifacts.filter((artifact) => artifact.agent === selected)}
-        reasons={agentReasons(selected, missingData, warnings)}
-      />
-    </>
-  );
-}
-
-function AgentEvidence({ artifacts, reasons = [] }: { artifacts: Artifact[]; reasons?: string[] }) {
-  const [showAll, setShowAll] = useState(false);
-  const [expanded, setExpanded] = useState(false);
-  const emptyText = reasons.length > 0 ? reasons.join(' ') : 'No evidence yet.';
-  const helpful = artifacts.filter((artifact) => !isNoEvidenceArtifact(artifact));
-  const hidden = artifacts.length - helpful.length;
-  const pool = showAll ? artifacts : helpful;
-  const visible = expanded ? pool : pool.slice(0, 8);
-  const more = pool.length - visible.length;
-  return (
-    <article className="agent-evidence">
-      <div className="agent-content">
-        {visible.length === 0 ? (
-          <p className="empty">{emptyText}</p>
-        ) : (
-          visible.map((artifact, index) => (
-            <ArtifactResult artifact={artifact} key={`${artifact.agent}-${artifact.type}-${index}`} />
-          ))
-        )}
-        {more > 0 && (
-          <button className="ghost-button compact-button artifact-more" onClick={() => setExpanded(true)} type="button">
-            <ChevronDown size={14} /> Show {more} more
-          </button>
-        )}
-        {hidden > 0 && (
-          <button className="artifact-toggle compact-artifact-toggle" onClick={() => setShowAll((value) => !value)} type="button">
-            {showAll ? `Hide ${hidden} no-evidence item(s)` : `Show ${hidden} no-evidence item(s)`}
-          </button>
-        )}
-      </div>
-    </article>
-  );
-}
-
-function ArtifactResult({ artifact }: { artifact: Artifact }) {
-  const [open, setOpen] = useState(false);
-  const presented = artifactForPresentation(artifact);
-  const queryItems = queryDisplayItems(presented.result);
-  const resultText = presented.result !== undefined ? formatArtifactValue(compactArtifactValue(presented.result)) : '';
-  const evidence = evidenceMetadata(artifact.result);
-  // One-line summary so a collapsed row is scannable without expanding it.
-  const preview = String(artifact.summary || '').split('\n')[0].replace(/[*`_#]/g, '').trim();
-  return (
-    <div className="artifact">
-      <button className="artifact-toggle compact-artifact-toggle" onClick={() => setOpen((value) => !value)} type="button">
-        <div className="artifact-head">
-          <strong>{artifact.evidence_id ? `[${artifact.evidence_id}] ` : ''}{artifact.title || artifact.type}</strong>
-          {!open && preview && <span className="artifact-preview">{preview}</span>}
-          <span>{artifact.confidence}</span>
-        </div>
-        <ChevronDown size={16} />
-      </button>
-      {open && (
-        <div className="artifact-body">
-          {/* Emphasis (salient signals) is baked into the summary text as markdown
-              bold by the backend, so it also survives Word export / raw JSON — render
-              it as markdown instead of overlaying a frontend-only red highlight. */}
-          <div className="artifact-summary">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{presented.summary ?? ''}</ReactMarkdown>
-          </div>
-          <EvidenceInterpretation evidence={evidence} />
-          {queryItems.length > 0 ? (
-            <QueryResultList items={queryItems} highlights={artifact.highlights} />
-          ) : (
-            <>
-              {artifact.query && <CopyableBlock title="Query" value={artifact.query} kind="code" />}
-              {presented.result !== undefined && !isEmptyResult(presented.result) && (
-                <CopyableBlock
-                  title="Result summary"
-                  value={resultText}
-                  kind="pre"
-                  highlights={artifact.highlights}
-                />
-              )}
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function EvidenceInterpretation({
-  evidence,
-}: {
-  evidence: ReturnType<typeof evidenceMetadata>;
-}) {
-  if (evidence === null) {
-    return (
-      <p className="evidence-limitation">
-        이 아티팩트에는 형식화된 관측 메타데이터가 없습니다. 단독으로 인과관계를 확정하는 근거로 사용하지 마세요.
-      </p>
-    );
-  }
-  return (
-    <section className="evidence-interpretation" aria-label="Evidence interpretation">
-      <div className="evidence-interpretation-head">
-        <strong>증거 해석</strong>
-        <span className={evidence.typed ? 'evidence-typed' : 'evidence-untyped'}>
-          {evidence.typed ? '형식화된 관측' : '불완전한 메타데이터'}
-        </span>
-      </div>
-      <dl>
-        <div>
-          <dt>판정</dt>
-          <dd>{evidencePolarityLabel(evidence.polarity)}</dd>
-        </div>
-        <div>
-          <dt>범위</dt>
-          <dd>{evidenceCoverageLabel(evidence.coverage)}</dd>
-        </div>
-        {evidence.entity && (
-          <div className="evidence-interpretation-wide">
-            <dt>관측 대상</dt>
-            <dd>{evidence.entity}</dd>
-          </div>
-        )}
-        {evidence.evidenceWindow && (
-          <div className="evidence-interpretation-wide">
-            <dt>신호 발생 시점</dt>
-            <dd>{formatEvidenceWindow(evidence.evidenceWindow)}</dd>
-          </div>
-        )}
-        {evidence.observationWindow && (
-          <div className="evidence-interpretation-wide">
-            <dt>조회 범위</dt>
-            <dd>{formatEvidenceWindow(evidence.observationWindow)}</dd>
-          </div>
-        )}
-      </dl>
-      {!evidence.typed && (
-        <p className="evidence-limitation">
-          불완전한 관측 메타데이터는 진단 맥락일 뿐, 단독 인과 근거가 아닙니다.
-        </p>
-      )}
-    </section>
-  );
-}
-
-function formatEvidenceWindow(window: EvidenceWindow) {
-  const start = formatTime(window.start);
-  const end = formatTime(window.end);
-  return start === end ? start : `${start} – ${end}`;
-}
-
-function evidencePolarityLabel(value: EvidenceMetadata['polarity']) {
-  return {
-    present: '신호 확인됨',
-    absent: '신호 없음',
-    unavailable: '조회 불가',
-    unknown: '판정 불가',
-  }[value || 'unknown'];
-}
-
-function evidenceCoverageLabel(value: EvidenceMetadata['coverage']) {
-  return {
-    scoped: '대상·시간 범위 확인됨',
-    partial: '부분 범위',
-    unknown: '범위 미확인',
-  }[value || 'unknown'];
-}
-
-function QueryResultList({ items, highlights }: { items: QueryDisplayItem[]; highlights?: string[] }) {
-  // A query that came back empty ([]/{}/blank) is noise — drop the whole card, not
-  // just its result block, and don't flag it red. Its failure (if any) still shows
-  // in the Warnings panel.
-  const visible = items.filter((item) => !isEmptyResult(item.preview));
-  if (visible.length === 0) return null;
-  return (
-    <div className="query-result-list">
-      {visible.map((item) => (
-        <QueryResultCard item={item} key={item.id} highlights={highlights} />
-      ))}
-    </div>
-  );
-}
-
-function QueryResultCard({ item, highlights }: { item: QueryDisplayItem; highlights?: string[] }) {
-  const previewText = item.preview === undefined ? '' : formatArtifactValue(item.preview);
-  const [open, setOpen] = useState(false);
-  return (
-    <article className="query-result-card">
-      <button className="query-result-toggle" onClick={() => setOpen((value) => !value)} type="button">
-        <div className="query-result-head">
-          <strong>{item.name}</strong>
-          <span className={item.status === 'failed' ? 'query-status query-status-error' : 'query-status'}>{item.status}</span>
-        </div>
-        <ChevronDown size={16} />
-      </button>
-      {item.facts.length > 0 && (
-        <div className="query-facts compact-query-facts">
-          {item.facts.slice(0, open ? 4 : 2).map((fact) => (
-            <span key={`${item.id}-${fact}`}>{fact}</span>
-          ))}
-        </div>
-      )}
-      {open && (
-        <>
-          {item.queryText && <CopyableBlock title={item.queryLabel} value={item.queryText} kind="code" />}
-          {item.preview !== undefined && !isEmptyResult(item.preview) && (
-            <CopyableBlock title="Relevant result" value={previewText} kind="pre" highlights={highlights} />
-          )}
-        </>
-      )}
-    </article>
   );
 }
 

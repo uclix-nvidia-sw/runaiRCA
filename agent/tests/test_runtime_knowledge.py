@@ -12,6 +12,7 @@ from app.knowledge import (
 )
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
+from app.services.pipeline import ReportKnowledge
 from app.services.root_cause_ranking import RankedCause
 
 
@@ -193,20 +194,20 @@ async def test_registry_modes_apply_activation_ladder(monkeypatch) -> None:
     )[0][0] == "gpu_hardware_error"
 
     detail = pipeline._detail_from(
-        AlertAnalysisRequest(
+                 AlertAnalysisRequest(
             alert=Alert(
                 labels={"alertname": "RuntimeKnowledgeAlert"},
                 annotations={"summary": "runtime marker and shadow marker"},
             )
         ),
-        [],
-        [],
-        failure_modes=assist_catalog,
-        root_cause_candidates=[
+                 [],
+                 [],
+                 root_cause_candidates=[
             RankedCause(family="workload_runtime_error", confidence="medium", score=7.0)
         ],
-        runtime_knowledge_hints=assist_with_shadow.shadow_hints("shadow marker"),
-    )
+                 runtime_knowledge_hints=assist_with_shadow.shadow_hints("shadow marker"),
+                 knowledge=ReportKnowledge(failure_modes=assist_catalog),
+             )
     assert "package pkg-1; family workload_runtime_error; matched symptom Runtime symptom; status active" in detail
     assert "### Learned Knowledge (Pending Activation)" in detail
     assert "package pkg-shadow family gpu_hardware_error" in detail

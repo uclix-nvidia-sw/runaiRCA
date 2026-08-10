@@ -27,24 +27,6 @@ def load_agent_souls(path: str) -> str:
     return _FALLBACK_AGENT_SOULS.strip()
 
 
-def agent_role_coverage_lines() -> list[str]:
-    return [
-        "- **analysis**: KubeRCA-style RCA verdict, confidence, impact, missing-data, "
-        "recommended remediation actions, prevention, and dashboard summary.",
-        "- **runai**: Run:ai API workload, project, queue, quota, and scheduling "
-        "context; no CLI by default.",
-        "- **kubernetes**: workload pods/events, Run:ai control-plane pod health, "
-        "node conditions, and Kubernetes scheduling blockers.",
-        "- **prometheus**: queue/project GPU metrics, pending/restart/resource "
-        "signals, and absent metric series.",
-        "- **loki**: workload logs plus `runai` and `runai-backend` control-plane/backend logs.",
-        "- **postgres**: RCA store, pgvector, embeddings, feedback, comments, "
-        "and persistence health.",
-        "- **system**: node infrastructure below Kubernetes — syslog, journalctl, and "
-        "dmesg (kernel, GPU driver / NVIDIA XID, OOM, hardware) via the per-node agent.",
-    ]
-
-
 def _candidate_paths(path: str) -> list[Path]:
     configured = Path(path)
     if configured.is_absolute():

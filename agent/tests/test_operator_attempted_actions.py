@@ -1,8 +1,8 @@
 """What the operator says they already tried must change the answer."""
 
-from app.schemas import Alert, AlertAnalysisRequest
 from app.plan import InvestigationPlan
-from app.services.pipeline import _matches_attempted_action, _numbered_actions
+from app.schemas import Alert, AlertAnalysisRequest
+from app.services.pipeline import ReportKnowledge, _matches_attempted_action, _numbered_actions
 
 
 def test_matches_a_recommendation_that_restates_the_attempt():
@@ -29,16 +29,15 @@ def test_numbered_actions_mark_rather_than_drop_the_attempted_step():
     )
     plan = InvestigationPlan(attempted_actions=["Increased the container memory limit"])
     actions = _numbered_actions(
-        plan,
-        None,
-        None,
-        "",
-        {},
-        [],
-        request,
-        self_check_next="Raise the container memory limit above the observed working set",
-        language="en",
-    )
+                  plan,
+                  None,
+                  None,
+                  "",
+                  [],
+                  request,
+                  self_check_next="Raise the container memory limit above the observed working set",
+                  knowledge=ReportKnowledge(failure_modes={}, language="en"),
+              )
     assert actions, "the self-check action must still be listed"
     assert "already doing this" in actions[0]
     assert "Raise the container memory limit" in actions[0]

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.collectors import kubernetes, loki, postgres, prometheus
+from app.collectors import grafana_mcp, kubernetes, loki, postgres, prometheus
 from app.collectors.base import NO_EVIDENCE
 from app.collectors.grafana_mcp import (
     clear_grafana_datasource_cache,
@@ -92,7 +92,9 @@ def _patch_mcp_calls(monkeypatch, module, call) -> None:
     async def call_many(url, calls):
         return [await call(url, tool, arguments) for tool, arguments in calls]
 
-    monkeypatch.setattr(module, "mcp_call", call)
+    # Datasource discovery now goes through the shared Grafana MCP helper;
+    # the per-collector query calls still use the collector's own mcp_call_many.
+    monkeypatch.setattr(grafana_mcp, "mcp_call", call)
     monkeypatch.setattr(module, "mcp_call_many", call_many)
 
 
@@ -234,7 +236,7 @@ async def test_explicit_prometheus_uid_skips_discovery_and_batches_queries(
             for _ in calls
         ]
 
-    monkeypatch.setattr(prometheus, "mcp_call", discovery_must_not_run)
+    monkeypatch.setattr(grafana_mcp, "mcp_call", discovery_must_not_run)
     monkeypatch.setattr(prometheus, "mcp_call_many", fake_many)
     result = await prometheus.PrometheusCollector(
         replace(
@@ -503,7 +505,7 @@ async def test_explicit_loki_uid_batches_all_queries_in_one_mcp_call(monkeypatch
         batches.append(calls)
         return [_McpResult({"data": []}) for _ in calls]
 
-    monkeypatch.setattr(loki, "mcp_call", discovery_must_not_run)
+    monkeypatch.setattr(grafana_mcp, "mcp_call", discovery_must_not_run)
     monkeypatch.setattr(loki, "mcp_call_many", fake_many)
     result = await loki.LokiCollector(
         replace(
@@ -573,7 +575,7 @@ async def test_loki_mcp_parses_grafana_log_entries(monkeypatch) -> None:
             }
         )
 
-    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(grafana_mcp, "mcp_call", fake_mcp_call)
     result = await loki._mcp_query_loki(
         "http://grafana-mcp/mcp", "smoke", '{namespace="runai"}', 20, "loki"
     )
@@ -594,7 +596,7 @@ async def test_loki_mcp_malformed_success_body_is_not_an_empty_log_search(
     async def fake_mcp_call(url, tool, arguments):
         return _McpResult({"status": "success", "data": {}})
 
-    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(grafana_mcp, "mcp_call", fake_mcp_call)
     result = await loki._mcp_query_loki(
         "http://grafana-mcp/mcp", "smoke", '{namespace="runai"}', 20, "loki"
     )
@@ -608,7 +610,7 @@ async def test_loki_mcp_unrelated_list_is_not_an_empty_log_search(monkeypatch) -
     async def fake_mcp_call(url, tool, arguments):
         return _McpResult({"data": [{"uid": "prom", "type": "prometheus"}]})
 
-    monkeypatch.setattr(loki, "mcp_call", fake_mcp_call)
+    monkeypatch.setattr(grafana_mcp, "mcp_call", fake_mcp_call)
     result = await loki._mcp_query_loki(
         "http://grafana-mcp/mcp", "smoke", '{namespace="runai"}', 20, "loki"
     )
@@ -987,3 +989,70 @@ async def test_kubernetes_shared_deadline_escapes_partial_mcp_sweep_for_fallback
         )
 
     assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_datasource_cache_entries_expire_on_their_own_ttl(monkeypatch) -> None:
+    """The cache's two TTLs are the reason a discovery failure does not become
+    permanent, and nothing exercised their EXPIRY: every other test observes the
+    cache only inside one tick, so a broken clock comparison would look correct.
+
+    Both directions matter. A failure must stop being served after 30s or a
+    transient Grafana blip circuit-breaks the collector for the rest of the run;
+    a success must stop being served after 300s or a re-pointed datasource is
+    never picked up.
+    """
+    clock = 1000.0
+    # grafana_mcp._now, not time.monotonic: patching the stdlib object would also
+    # freeze the asyncio event loop's clock, and this test is async.
+    monkeypatch.setattr(grafana_mcp, "_now", lambda: clock)
+    clear_grafana_datasource_cache()
+
+    calls = 0
+
+    async def discovery(url, tool, args_list):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("grafana is down")
+        return [{"type": "prometheus", "uid": "prom-live"}]
+
+    monkeypatch.setattr(grafana_mcp, "call_grafana_mcp_json", discovery)
+
+    with pytest.raises(RuntimeError):
+        await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus")
+    assert calls == 1
+
+    # Literal seconds, not the constants: reading them would let a change to a
+    # constant move the assertion with it and prove nothing.
+    clock += 20  # inside the ~30s failure TTL: the cached error is replayed
+    with pytest.raises(RuntimeError):
+        await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus")
+    assert calls == 1, "a cached failure must not re-hit Grafana inside its TTL"
+
+    clock += 20  # 40s in: past it, so discovery is retried and succeeds
+    assert await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus") == "prom-live"
+    assert calls == 2, "a discovery failure must not be cached for 40s"
+
+    # The success is then cached for its own, much longer TTL.
+    clock += 240  # 4 minutes: well past the failure TTL, inside the success one
+    assert await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus") == "prom-live"
+    assert calls == 2, "a cached success must not re-hit Grafana inside its TTL"
+
+    clock += 120  # 6 minutes since the success
+    assert await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus") == "prom-live"
+    assert calls == 3, "a cached success must not outlive ~5 minutes"
+
+    # The OTHER writer into the failure cache: a UID Grafana rejected mid-query.
+    # It must expire on the failure TTL too, or one rejection blinds the
+    # collector for five minutes of a run instead of thirty seconds.
+    grafana_mcp.mark_grafana_datasource_failure(
+        "http://mcp", "prometheus", "", RuntimeError("id is invalid")
+    )
+    with pytest.raises(RuntimeError):
+        await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus")
+    assert calls == 3, "a circuit-broken UID must not re-hit Grafana inside its TTL"
+
+    clock += 40
+    assert await grafana_mcp.grafana_datasource_uid("http://mcp", "prometheus") == "prom-live"
+    assert calls == 4, "a rejected-UID circuit break must not be cached for 40s"

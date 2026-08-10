@@ -23,6 +23,9 @@ func RegisterPostgresDriver(state *PostgresState) string {
 
 type PostgresState struct {
 	mu                       sync.Mutex
+	execLatency              time.Duration
+	execLatencyFor           map[string]time.Duration
+	execTimings              []ExecTiming
 	failCreateVector         bool
 	failAnalysisRuns         bool
 	failAnalysisRunExecAfter int
@@ -64,6 +67,55 @@ func NewPostgresState(failCreateVector bool) *PostgresState {
 		emptyObjectJSON:  []byte(`{}`),
 		emptyArrayJSON:   []byte(`[]`),
 	}
+}
+
+// SetExecLatency makes every statement take as long as a real round-trip to a
+// Postgres in the same cluster, so a benchmark can see what a caller holding a
+// lock across several of them costs everyone else.
+func (s *PostgresState) SetExecLatency(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.execLatency = d
+}
+
+// SetExecLatencyFor gives one statement its own duration, so a test can tell
+// "these two ran concurrently" apart from "the caller did not wait for the
+// second one" — with a single latency both look the same from the outside.
+func (s *PostgresState) SetExecLatencyFor(substr string, d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.execLatencyFor == nil {
+		s.execLatencyFor = map[string]time.Duration{}
+	}
+	s.execLatencyFor[substr] = d
+}
+
+func (s *PostgresState) latencyFor(query string) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for substr, d := range s.execLatencyFor {
+		if strings.Contains(query, substr) {
+			return d
+		}
+	}
+	return s.execLatency
+}
+
+// ExecTiming is when one statement was issued and when it came back. Statement
+// ORDER cannot show that a second writer ran inside a first writer's window
+// when both issue the same slow statement — the later one simply finishes
+// later either way. Overlap is a property of the intervals, so the intervals
+// are recorded.
+type ExecTiming struct {
+	Query string
+	Start time.Time
+	End   time.Time
+}
+
+func (s *PostgresState) ExecTimings() []ExecTiming {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]ExecTiming(nil), s.execTimings...)
 }
 
 func (s *PostgresState) SetFailAnalysisRuns(value bool) {
@@ -222,6 +274,13 @@ func maxDollarPlaceholder(query string) int {
 }
 
 func (c *fakePostgresConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	started := time.Now()
+	if d := c.state.latencyFor(query); d > 0 {
+		time.Sleep(d)
+	}
+	c.state.mu.Lock()
+	c.state.execTimings = append(c.state.execTimings, ExecTiming{Query: query, Start: started, End: time.Now()})
+	c.state.mu.Unlock()
 	// Mimic Postgres bind semantics: it binds exactly the number of $N params the
 	// statement references. Passing extra args (a real bug that fails at runtime)
 	// used to silently "work" against this fake driver.

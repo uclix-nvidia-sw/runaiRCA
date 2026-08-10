@@ -493,62 +493,36 @@ class Blackboard(EvidenceBlackboard):
         ).fact_id
 
 
-def normalize_artifact(
-    artifact: AlertAnalysisArtifact | Mapping[str, Any],
-    *,
-    entity: str = "",
-    timestamp: str = "",
-    observed_window_start: str = "",
-    observed_window_end: str = "",
-    artifact_id: str = "",
-    predicate: str = "observation",
-    polarity: Polarity | None = None,
-    coverage: Coverage | None = None,
-    source_group: str = "",
-    run_id: str = "",
-    topology: object = (),
-    masker: Masker | None = None,
-    require_typed_observation: bool = False,
-) -> EvidenceFact:
-    """Turn a collector artifact into a stable fact without retaining its query.
+def _declared_metadata(sources: tuple[Mapping[str, Any], ...], *keys: str) -> tuple[bool, object]:
+    """Read declared scope without replacing malformed values with defaults."""
+    for container in sources:
+        for key in keys:
+            if key in container:
+                return True, container[key]
+    return False, None
 
-    Callers may explicitly set polarity/coverage when a tool has richer result
-    semantics. The inferred fallback only calls a clean successful no-evidence
-    response ``absent``; an unavailable source is never absence.  The shared
-    Blackboard enables ``require_typed_observation`` because its facts can
-    promote an open-world hypothesis: a legacy summary alone must remain
-    operational context, not causal proof.
+
+def _observation_window(
+    sources: tuple[Mapping[str, Any], ...], observed_window_start: str, observed_window_end: str
+) -> tuple[str, str, list[str], bool]:
+    """The window this observation covers, and whether its declaration was valid.
+
+    A collector-provided observation window is more precise than the broad
+    incident window supplied by the pipeline.  For a positive result, an
+    evidence-occurrence window is more precise still: a bounded query may
+    intentionally include a post-resolution epilogue, while a returned log line
+    or metric sample can prove exactly when the signal occurred.  Keep the query
+    window for coverage metadata, but use the occurrence window for
+    causal/timing eligibility so recovery-time observations cannot be promoted
+    merely because their query overlapped the alert.
     """
-    raw = _artifact_mapping(artifact)
-    result = raw.get("result")
-    result_metadata = result if isinstance(result, Mapping) else {}
-    observation = result_metadata.get("observation")
-    observation_metadata = observation if isinstance(observation, Mapping) else {}
-
-    def metadata(key: str) -> object:
-        return raw.get(key) or result_metadata.get(key) or observation_metadata.get(key)
-
-    def declared_metadata(*keys: str) -> tuple[bool, object]:
-        """Read declared scope without replacing malformed values with defaults."""
-        for container in (observation_metadata, result_metadata, raw):
-            for key in keys:
-                if key in container:
-                    return True, container[key]
-        return False, None
-
-    # A collector-provided observation window is more precise than the broad
-    # incident window supplied by the pipeline.  For a positive result, an
-    # evidence-occurrence window is more precise still: a bounded query may
-    # intentionally include a post-resolution epilogue, while a returned log
-    # line or metric sample can prove exactly when the signal occurred.  Keep
-    # the query window for coverage metadata, but use the occurrence window
-    # for causal/timing eligibility so recovery-time observations cannot be
-    # promoted merely because their query overlapped the alert.
     invalid_declared_scope = False
-    evidence_window_declared, evidence_window = declared_metadata("evidence_window")
-    window_declared, raw_window = declared_metadata("observation_window", "observed_window")
-    start_declared, declared_start = declared_metadata("observed_window_start")
-    end_declared, declared_end = declared_metadata("observed_window_end")
+    evidence_window_declared, evidence_window = _declared_metadata(sources, "evidence_window")
+    window_declared, raw_window = _declared_metadata(
+        sources, "observation_window", "observed_window"
+    )
+    start_declared, declared_start = _declared_metadata(sources, "observed_window_start")
+    end_declared, declared_end = _declared_metadata(sources, "observed_window_end")
     if evidence_window_declared:
         candidate = evidence_window
     elif window_declared:
@@ -587,6 +561,106 @@ def normalize_artifact(
     identity_window = [observed_window_start, observed_window_end]
     if candidate is None and not invalid_declared_scope:
         identity_window = [observed_window_start]
+    return observed_window_start, observed_window_end, identity_window, invalid_declared_scope
+
+
+def _resolved_entity(
+    sources: tuple[Mapping[str, Any], ...],
+    entity: str,
+    resolved_polarity: str,
+    resolved_coverage: str,
+    *,
+    require_typed_observation: bool,
+) -> tuple[str, tuple[str, ...], str, str, str]:
+    """Who this fact is about, and the demotion that follows when nobody is named.
+
+    A collector can name the resource it actually observed. Preserve that
+    identity instead of relabelling every artifact as the alert target during
+    blackboard seeding; otherwise an unrelated namespace observation can pass
+    the later entity-compatibility gate as target evidence.
+    """
+    entity_declared, raw_entity = _declared_metadata(sources, "observed_entity", "entity")
+    # Set only at the exact point the blackboard itself (not the collector)
+    # demotes a fact, so ``_demotion_reason`` never has to reverse-engineer
+    # which branch fired from the post-hoc polarity/coverage alone.
+    entity_demotion_reason = ""
+    if entity_declared:
+        resolved_entity = _observed_entity(raw_entity)
+        resolved_entity_scope = _observed_entity_scope(raw_entity)
+        if not resolved_entity:
+            # An explicit malformed entity is not a license to relabel this
+            # observation as the alert target.
+            if resolved_coverage == "scoped":
+                resolved_polarity, resolved_coverage = "unknown", "partial"
+                entity_demotion_reason = "malformed_entity"
+    elif (
+        require_typed_observation
+        and resolved_coverage == "scoped"
+        and resolved_polarity in {"present", "absent"}
+    ):
+        # ``entity`` is pipeline context, not a collector observation.  A
+        # broad query can return a scoped result for another Pod while still
+        # being seeded with this incident's target.  Preserve compatibility
+        # for legacy/context-only artifacts below, but a typed scoped verdict
+        # must name what it observed before it can support or refute RCA.
+        resolved_entity = ""
+        resolved_entity_scope = ()
+        resolved_polarity, resolved_coverage = "unknown", "partial"
+        entity_demotion_reason = "entity_not_named"
+    else:
+        resolved_entity = entity
+        resolved_entity_scope = ()
+    return (
+        resolved_entity,
+        resolved_entity_scope,
+        entity_demotion_reason,
+        resolved_polarity,
+        resolved_coverage,
+    )
+
+
+def normalize_artifact(
+    artifact: AlertAnalysisArtifact | Mapping[str, Any],
+    *,
+    entity: str = "",
+    timestamp: str = "",
+    observed_window_start: str = "",
+    observed_window_end: str = "",
+    artifact_id: str = "",
+    predicate: str = "observation",
+    polarity: Polarity | None = None,
+    coverage: Coverage | None = None,
+    source_group: str = "",
+    run_id: str = "",
+    topology: object = (),
+    masker: Masker | None = None,
+    require_typed_observation: bool = False,
+) -> EvidenceFact:
+    """Turn a collector artifact into a stable fact without retaining its query.
+
+    Callers may explicitly set polarity/coverage when a tool has richer result
+    semantics. The inferred fallback only calls a clean successful no-evidence
+    response ``absent``; an unavailable source is never absence.  The shared
+    Blackboard enables ``require_typed_observation`` because its facts can
+    promote an open-world hypothesis: a legacy summary alone must remain
+    operational context, not causal proof.
+    """
+    raw = _artifact_mapping(artifact)
+    result = raw.get("result")
+    result_metadata = result if isinstance(result, Mapping) else {}
+    observation = result_metadata.get("observation")
+    observation_metadata = observation if isinstance(observation, Mapping) else {}
+
+    def metadata(key: str) -> object:
+        return raw.get(key) or result_metadata.get(key) or observation_metadata.get(key)
+
+    sources = (observation_metadata, result_metadata, raw)
+    (
+        observed_window_start,
+        observed_window_end,
+        identity_window,
+        invalid_declared_scope,
+    ) = _observation_window(sources, observed_window_start, observed_window_end)
     source = _clean_text(raw.get("source")) or "unknown"
     status = _normalise_token(_clean_text(raw.get("status")))
     summary = _clean_text(raw.get("summary"))
@@ -649,45 +723,22 @@ def normalize_artifact(
     # Missing tool coverage must never masquerade as a verified negative.
     if resolved_polarity == "absent" and resolved_coverage != "scoped":
         resolved_polarity = "unknown"
-
     active_masker = masker or build_masker(())
     safe_summary = active_masker.mask_text(summary)
     safe_highlights = tuple(active_masker.mask_text(item) for item in highlights)
-    # A collector can name the resource it actually observed. Preserve that
-    # identity instead of relabelling every artifact as the alert target during
-    # blackboard seeding; otherwise an unrelated namespace observation can
-    # pass the later entity-compatibility gate as target evidence.
-    entity_declared, raw_entity = declared_metadata("observed_entity", "entity")
-    # Set only at the exact point the blackboard itself (not the collector)
-    # demotes a fact, so ``_demotion_reason`` never has to reverse-engineer
-    # which branch fired from the post-hoc polarity/coverage alone.
-    entity_demotion_reason = ""
-    if entity_declared:
-        resolved_entity = _observed_entity(raw_entity)
-        resolved_entity_scope = _observed_entity_scope(raw_entity)
-        if not resolved_entity:
-            # An explicit malformed entity is not a license to relabel this
-            # observation as the alert target.
-            if resolved_coverage == "scoped":
-                resolved_polarity, resolved_coverage = "unknown", "partial"
-                entity_demotion_reason = "malformed_entity"
-    elif (
-        require_typed_observation
-        and resolved_coverage == "scoped"
-        and resolved_polarity in {"present", "absent"}
-    ):
-        # ``entity`` is pipeline context, not a collector observation.  A
-        # broad query can return a scoped result for another Pod while still
-        # being seeded with this incident's target.  Preserve compatibility
-        # for legacy/context-only artifacts below, but a typed scoped verdict
-        # must name what it observed before it can support or refute RCA.
-        resolved_entity = ""
-        resolved_entity_scope = ()
-        resolved_polarity, resolved_coverage = "unknown", "partial"
-        entity_demotion_reason = "entity_not_named"
-    else:
-        resolved_entity = entity
-        resolved_entity_scope = ()
+    (
+        resolved_entity,
+        resolved_entity_scope,
+        entity_demotion_reason,
+        resolved_polarity,
+        resolved_coverage,
+    ) = _resolved_entity(
+        sources,
+        entity,
+        resolved_polarity,
+        resolved_coverage,
+        require_typed_observation=require_typed_observation,
+    )
     safe_entity = active_masker.mask_text(resolved_entity)
     safe_entity_scope = tuple(active_masker.mask_text(item) for item in resolved_entity_scope)
     safe_value = _finding_value(safe_summary, safe_highlights, resolved_polarity)

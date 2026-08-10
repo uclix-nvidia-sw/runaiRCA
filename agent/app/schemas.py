@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import BaseModel, Field
 
 
 class Alert(BaseModel):
@@ -13,27 +13,6 @@ class Alert(BaseModel):
     endsAt: str | None = None
     generatorURL: str | None = None
     fingerprint: str = ""
-
-
-class RuntimeKnowledgePackage(BaseModel):
-    """Read-only approved knowledge package supplied by the backend snapshot API.
-
-    This is deliberately a transport contract, not an authoring model.  A package
-    must have completed validation before it can reach an agent.
-    """
-
-    package_id: str
-    state: Literal["active", "shadow"] = Field(
-        validation_alias=AliasChoices("state", "status", "runtime_status")
-    )
-    compiled: dict[str, Any] = Field(
-        validation_alias=AliasChoices("compiled", "knowledge", "payload")
-    )
-
-
-class RuntimeKnowledgeSnapshot(BaseModel):
-    revision: str
-    packages: list[RuntimeKnowledgePackage] = Field(default_factory=list)
 
 
 class RuntimeKnowledgeValidationResponse(BaseModel):

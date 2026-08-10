@@ -15,6 +15,7 @@ from app.collectors.kubernetes import (
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services import pipeline
 from app.services.harness import assign_evidence_ids
+from app.services.pipeline import ReportKnowledge
 from app.services.remediation import (
     fill_placeholders,
     format_memory,
@@ -213,10 +214,10 @@ def _actions(container: dict[str, object], family: str, reason: str, observed: s
             None,
             candidates,
             observed,
-            pipeline.load_failure_modes("knowledge/failure_modes.yaml"),
             [],
             _request(),
             facts=pipeline._remediation_facts(results, {"E01"}, target),
+            knowledge=ReportKnowledge(failure_modes=pipeline.load_failure_modes("knowledge/failure_modes.yaml")),
         )
     )
 

@@ -7,6 +7,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/brilly-bohyun/runai-rca/backend/internal/server/testsupport"
 )
 
 func completeScores(value int) map[string]int {
@@ -300,6 +303,118 @@ func TestMatchingReviewDoesNotEraseAgentSemanticValidationFailure(t *testing.T) 
 	stored, _ := store.KnowledgeCandidate(candidate.CandidateID)
 	if stored.Status != knowledgeCandidateValidationFailed || stored.ValidationError != "probe binding no longer resolves" {
 		t.Fatalf("review resave erased independent semantic validation failure: %+v", stored)
+	}
+}
+
+func TestEvaluationSaveRevivesSupersededCandidate(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.ApprovalState = "active"
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	store.analysisRuns[snapshot.RunID] = &AnalysisRun{RunID: snapshot.RunID, Metadata: map[string]any{"analysis_hash": snapshot.AnalysisHash}}
+	candidate := knowledgeCandidateForSnapshotWithOutcome(snapshot, true, false)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("invalid ready candidate fixture: %+v", candidate)
+	}
+	candidate.Status = knowledgeCandidateSuperseded
+	candidate.ValidationError = "stale generation"
+	now := time.Now().UTC()
+	candidate.DecidedAt, candidate.DecidedBy, candidate.DecisionNote = &now, "system", "superseded by a newer candidate"
+	store.knowledgeCandidates[candidate.CandidateID] = candidate
+
+	req := EvaluationReviewRequest{Author: "operator-a", AnalysisHash: snapshot.AnalysisHash, CaseType: "known", ExpectedFamily: snapshot.RootCauseFamily, Scores: completeScores(5), ResolutionOutcome: "resolved"}
+	if _, ok, err := store.UpsertEvaluationReview(snapshot.RunID, req, []string{snapshot.RootCauseFamily}); err != nil || !ok {
+		t.Fatalf("evaluation save failed: ok=%t err=%v", ok, err)
+	}
+	stored, _ := store.KnowledgeCandidate(candidate.CandidateID)
+	if stored.Status != knowledgeCandidateReady || stored.ValidationError != "" {
+		t.Fatalf("evaluation save did not revive the superseded candidate: %+v", stored)
+	}
+	if stored.DecidedAt != nil || stored.DecidedBy != "" || stored.DecisionNote != "" {
+		t.Fatalf("revived candidate retained a supersession decision: %+v", stored)
+	}
+	for _, event := range store.knowledgeEvents {
+		if event.CandidateID == candidate.CandidateID && event.Type == "candidate_revalidated" {
+			return
+		}
+	}
+	t.Fatal("superseded candidate revival did not record candidate_revalidated")
+}
+
+func TestEvaluationSaveDoesNotReviveRejectedCandidate(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.ApprovalState = "active"
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	store.analysisRuns[snapshot.RunID] = &AnalysisRun{RunID: snapshot.RunID, Metadata: map[string]any{"analysis_hash": snapshot.AnalysisHash}}
+	candidate := knowledgeCandidateForSnapshotWithOutcome(snapshot, true, false)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("invalid ready candidate fixture: %+v", candidate)
+	}
+	candidate.Status, candidate.DecisionNote = knowledgeCandidateRejected, "operator rejected"
+	store.knowledgeCandidates[candidate.CandidateID] = candidate
+
+	req := EvaluationReviewRequest{Author: "operator-a", AnalysisHash: snapshot.AnalysisHash, CaseType: "known", ExpectedFamily: snapshot.RootCauseFamily, Scores: completeScores(5), ResolutionOutcome: "resolved"}
+	if _, ok, err := store.UpsertEvaluationReview(snapshot.RunID, req, []string{snapshot.RootCauseFamily}); err != nil || !ok {
+		t.Fatalf("evaluation save failed: ok=%t err=%v", ok, err)
+	}
+	stored, _ := store.KnowledgeCandidate(candidate.CandidateID)
+	if stored.Status != knowledgeCandidateRejected {
+		t.Fatalf("evaluation save revived rejected candidate: %+v", stored)
+	}
+}
+
+func TestEvaluationSaveDoesNotReviveSupersededCandidateAlongsideLiveSibling(t *testing.T) {
+	store := NewStore()
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.ApprovalState = "active"
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	store.analysisRuns[snapshot.RunID] = &AnalysisRun{RunID: snapshot.RunID, Metadata: map[string]any{"analysis_hash": snapshot.AnalysisHash}}
+	candidate := knowledgeCandidateForSnapshotWithOutcome(snapshot, true, false)
+	if candidate == nil || candidate.Status != knowledgeCandidateReady {
+		t.Fatalf("invalid ready candidate fixture: %+v", candidate)
+	}
+	candidate.Status = knowledgeCandidateSuperseded
+	store.knowledgeCandidates[candidate.CandidateID] = candidate
+	sibling := cloneKnowledgeCandidate(candidate)
+	sibling.CandidateID, sibling.Status = "KNC-live-sibling", knowledgeCandidateActive
+	store.knowledgeCandidates[sibling.CandidateID] = &sibling
+
+	req := EvaluationReviewRequest{Author: "operator-a", AnalysisHash: snapshot.AnalysisHash, CaseType: "known", ExpectedFamily: snapshot.RootCauseFamily, Scores: completeScores(5), ResolutionOutcome: "resolved"}
+	if _, ok, err := store.UpsertEvaluationReview(snapshot.RunID, req, []string{snapshot.RootCauseFamily}); err != nil || !ok {
+		t.Fatalf("evaluation save failed: ok=%t err=%v", ok, err)
+	}
+	stored, _ := store.KnowledgeCandidate(candidate.CandidateID)
+	if stored.Status != knowledgeCandidateSuperseded {
+		t.Fatalf("evaluation save revived a superseded candidate alongside a live sibling: %+v", stored)
+	}
+}
+
+func TestCandidatePersistFailureDoesNotSupersedeSibling(t *testing.T) {
+	state := testsupport.NewPostgresState(false)
+	store := NewStore()
+	store.connectDatabaseWithDriver(testsupport.RegisterPostgresDriver(state), "fake://runai_rca", time.Second)
+	if err := store.db.Close(); err != nil {
+		t.Fatalf("close fake postgres: %v", err)
+	}
+	snapshot := eligibleKnowledgeSnapshot()
+	snapshot.ApprovalState = "active"
+	store.caseSnapshots[snapshot.CaseID] = snapshot
+	store.analysisRuns[snapshot.RunID] = &AnalysisRun{RunID: snapshot.RunID, Metadata: map[string]any{"analysis_hash": snapshot.AnalysisHash}}
+	sibling := knowledgeCandidateForSnapshotWithOutcome(snapshot, true, false)
+	if sibling == nil || sibling.Status != knowledgeCandidateReady {
+		t.Fatalf("invalid sibling fixture: %+v", sibling)
+	}
+	sibling.CandidateID = "KNC-stale-candidate"
+	sibling.Status, sibling.ValidationError = knowledgeCandidateValidationFailed, "stale validation"
+	store.knowledgeCandidates[sibling.CandidateID] = sibling
+
+	req := EvaluationReviewRequest{Author: "operator-a", AnalysisHash: snapshot.AnalysisHash, CaseType: "known", ExpectedFamily: snapshot.RootCauseFamily, Scores: completeScores(5), ResolutionOutcome: "resolved"}
+	if _, ok, err := store.UpsertEvaluationReview(snapshot.RunID, req, []string{snapshot.RootCauseFamily}); err != nil || !ok {
+		t.Fatalf("evaluation save failed: ok=%t err=%v", ok, err)
+	}
+	if sibling.Status != knowledgeCandidateValidationFailed {
+		t.Fatalf("failed successor write superseded sibling: %+v", sibling)
 	}
 }
 

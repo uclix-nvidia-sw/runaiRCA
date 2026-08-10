@@ -482,6 +482,8 @@ func (s *Store) QueueSlackAnalysisDelivery(runID string, incidentID string) (Sla
 // so looking the run up again here can observe the next attempt's "analyzing"
 // state (or, worse, its later completed payload) and lose/mislabel this reply.
 func (s *Store) QueueSlackAnalysisDeliverySnapshot(snapshot AnalysisRun, incidentID string) (SlackAnalysisDelivery, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.queueSlackAnalysisDeliverySnapshotLocked(snapshot, incidentID, true)
@@ -582,6 +584,8 @@ func (s *Store) SlackAnalysisDeliveryPredatesThread(incidentID string, threadTS 
 }
 
 func (s *Store) updateSlackDelivery(runID string, deliveryID string, update func(map[string]any)) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
@@ -607,6 +611,8 @@ func (s *Store) updateSlackDelivery(runID string, deliveryID string, update func
 }
 
 func (s *Store) BeginSlackAnalysisDelivery(runID string, deliveryID string) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]
@@ -664,6 +670,8 @@ func (s *Store) BeginSlackAnalysisDelivery(runID string, deliveryID string) bool
 }
 
 func (s *Store) ResetIncidentSlackThread(incidentID string, expectedThreadTS string) bool {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	incident := s.incidents[incidentID]
@@ -706,6 +714,8 @@ func (s *Store) SkipSlackAnalysisDelivery(runID string, deliveryID string, reaso
 }
 
 func (s *Store) CompleteSlackAnalysisDelivery(runID string, deliveryID string, incidentID string, root bool, messageTS string) (int, bool) {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	run := s.analysisRuns[runID]

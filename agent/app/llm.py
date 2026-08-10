@@ -14,7 +14,7 @@ import logging
 import random
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar, Token
 from typing import Any
 
@@ -613,6 +613,47 @@ def _usage_bucket(current: dict[str, Any], model: str) -> dict[str, int]:
     return bucket
 
 
+def _balanced_json_objects(text: str) -> Iterator[Any]:
+    """Every balanced, parseable JSON value in an LLM reply, in order.
+
+    Brace matching is string-aware, so a brace inside a quoted value (or an
+    escaped quote) cannot end the object early, and an unparseable balanced
+    block does not stop the scan — the next candidate starts after it.
+    """
+    if not text:
+        return
+    start = text.find("{")
+    while start != -1:
+        next_start = start + 1
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            ch = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    next_start = index + 1
+                    try:
+                        parsed = json.loads(text[start : index + 1])
+                    except (ValueError, TypeError):
+                        break  # invalid here — try after this balanced block
+                    yield parsed
+                    break
+        start = text.find("{", next_start)
+
+
 def parse_json_object(text: str) -> dict[str, Any] | None:
     """The first JSON OBJECT inside an LLM reply, or None.
 
@@ -620,77 +661,16 @@ def parse_json_object(text: str) -> dict[str, Any] | None:
     fences, leading prose ("물론입니다! {...}"), trailing commentary. String-aware
     brace matching finds the object wherever it sits, so one bad token of
     preamble no longer throws away an otherwise-valid synthesis/decision."""
-    if not text:
-        return None
-    start = text.find("{")
-    while start != -1:
-        next_start = start + 1
-        depth = 0
-        in_string = False
-        escaped = False
-        for index in range(start, len(text)):
-            ch = text[index]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-            elif ch == '"':
-                in_string = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        parsed = json.loads(text[start : index + 1])
-                    except (ValueError, TypeError):
-                        next_start = index + 1
-                        break  # invalid here — try after this balanced block
-                    return parsed if isinstance(parsed, dict) else None
-        start = text.find("{", next_start)
-    return None
+    parsed = next(_balanced_json_objects(text), None)
+    return parsed if isinstance(parsed, dict) else None
 
 
 def parse_last_json_object(text: str) -> dict[str, Any] | None:
     """Return the last balanced JSON object in an LLM reply."""
-    if not text:
-        return None
     candidate: dict[str, Any] | None = None
-    start = text.find("{")
-    while start != -1:
-        next_start = start + 1
-        depth = 0
-        in_string = False
-        escaped = False
-        for index in range(start, len(text)):
-            ch = text[index]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-            elif ch == '"':
-                in_string = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        parsed = json.loads(text[start : index + 1])
-                    except (ValueError, TypeError):
-                        next_start = index + 1
-                        break
-                    if isinstance(parsed, dict):
-                        candidate = parsed
-                    next_start = index + 1
-                    break
-        start = text.find("{", next_start)
+    for parsed in _balanced_json_objects(text):
+        if isinstance(parsed, dict):
+            candidate = parsed
     return candidate
 
 

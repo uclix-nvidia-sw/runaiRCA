@@ -26,10 +26,10 @@ from app.schemas import Alert, AlertAnalysisRequest
 from app.services.kg_enrichment import GraphRemediation, graph_remediation
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import (
+    ReportKnowledge,
     _apply_line_translations,
     _detail_from,
     _gpu_model_from,
-    _graph_remediation_lines,
     _summary_from,
     _translatable_report_lines,
     _translate_report_lines_ko,
@@ -138,23 +138,16 @@ def test_gpu_model_derived_from_details() -> None:
     assert _gpu_model_from(_target(), results) == "H100"
 
 
-def test_graph_remediation_lines_render() -> None:
+def test_graph_derived_xid_text_is_masked_and_cannot_inject_headings() -> None:
     fixes = GraphRemediation(
-        family_fixes=["Reset the GPU / contact support api_key=graph-secret-12345.\n## bad"],
-        xid_fixes={79: ["Reset the GPU / contact support password=graph-xid-secret-12345."]},
-        model_xids={"H100\n## bad-model": [79]},
+        xid_triggers={79: "Reset the GPU / contact support password=graph-secret-12345.\n## bad"},
     )
-    text = "\n".join(_graph_remediation_lines(fixes))
-    assert "Knowledge-graph derived remediation" in text
-    assert "NVIDIA Xid 79" in text
-    assert "Known Xid codes for H100" in text
-    assert "79" in text
+    text = "\n".join(_xid_diagnostic_guidance_lines(fixes, "en"))
     assert "graph-secret-12345" not in text
-    assert "graph-xid-secret-12345" not in text
     assert "\n## bad" not in text
     assert "[MASKED]" in text
-    assert _graph_remediation_lines(None) == []
-    assert _graph_remediation_lines(GraphRemediation()) == []
+    assert _xid_diagnostic_guidance_lines(None, "en") == []
+    assert _xid_diagnostic_guidance_lines(GraphRemediation(), "en") == []
 
 
 def test_graph_remediation_lines_name_the_xid() -> None:
@@ -169,10 +162,6 @@ def test_graph_remediation_lines_name_the_xid() -> None:
         xid_descriptions={79: "GPU has fallen off the bus"},
         xid_severities={79: "fatal"},
     )
-    text = "\n".join(_graph_remediation_lines(fixes))
-    assert "GPU has fallen off the bus" in text
-    assert "fatal" in text
-
     en_lines = _xid_diagnostic_guidance_lines(fixes, "en")
     assert en_lines and "GPU has fallen off the bus" in en_lines[0]
     assert "fatal" in en_lines[0]
@@ -187,18 +176,10 @@ def test_graph_remediation_lines_no_mnemonic_stays_clean() -> None:
         xid_fixes={999999: ["Run the app under compute-sanitizer."]},
         xid_triggers={999999: "GPU memory page fault."},
     )
-    text = "\n".join(_graph_remediation_lines(fixes))
-    assert text == (
-        "- Knowledge-graph derived remediation:\n"
-        "  - NVIDIA Xid 999999:\n"
-        "    - Run the app under compute-sanitizer.\n"
-        "  - Diagnostic guidance (XID 999999): GPU memory page fault."
-    )
-    assert " — " not in text
-    assert "()" not in text
-
     en_lines = _xid_diagnostic_guidance_lines(fixes, "en")
     assert en_lines == ["- Diagnostic guidance (XID 999999): GPU memory page fault."]
+    assert " — " not in en_lines[0]
+    assert "()" not in en_lines[0]
 
 
 def test_xid_identity_falls_back_to_local_catalog_without_typedb() -> None:
@@ -211,12 +192,9 @@ def test_xid_identity_falls_back_to_local_catalog_without_typedb() -> None:
         xid_triggers={79: "Check for PCIe link errors before reset."},
         # xid_mnemonics/xid_descriptions/xid_severities intentionally empty.
     )
-    text = "\n".join(_graph_remediation_lines(fixes))
-    assert "GPU has fallen off the bus" in text
-    assert "fatal" in text
-
     en_lines = _xid_diagnostic_guidance_lines(fixes, "en")
     assert en_lines and "GPU has fallen off the bus" in en_lines[0]
+    assert "fatal" in en_lines[0]
 
 
 # --- synthesis waits for ALL collectors + Korean LLM synthesis ----------------
@@ -510,13 +488,12 @@ def test_jwks_discovery_failure_overrides_generic_crashloop_playbook_in_korean()
         request, results, candidates, failure_modes, language="ko"
     )
     detail = _detail_from(
-        request,
-        results,
-        [],
-        failure_modes=failure_modes,
-        root_cause_candidates=candidates,
-        language="ko",
-    )
+                 request,
+                 results,
+                 [],
+                 root_cause_candidates=candidates,
+                 knowledge=ReportKnowledge(failure_modes=failure_modes, language="ko"),
+             )
 
     assert "OIDC JSON 문서 대신 HTML" in summary
     assert "runaiMcp.oidcIssuerUrl" in detail
@@ -556,13 +533,12 @@ def test_oomkilled_overrides_generic_crashloop_actions_in_korean_fallback() -> N
         request, results, candidates, failure_modes, language="ko"
     )
     detail = _detail_from(
-        request,
-        results,
-        [],
-        failure_modes=failure_modes,
-        root_cause_candidates=candidates,
-        language="ko",
-    )
+                 request,
+                 results,
+                 [],
+                 root_cause_candidates=candidates,
+                 knowledge=ReportKnowledge(failure_modes=failure_modes, language="ko"),
+             )
 
     assert "메모리 제한을 초과해 OOMKilled" in summary
     assert "resources.limits.memory" in detail
@@ -602,13 +578,12 @@ def test_image_pull_deterministic_fallback_keeps_core_report_korean() -> None:
 
     summary = _summary_from(request, results, candidates, failure_modes, language="ko")
     detail = _detail_from(
-        request,
-        results,
-        [],
-        failure_modes=failure_modes,
-        root_cause_candidates=candidates,
-        language="ko",
-    )
+                 request,
+                 results,
+                 [],
+                 root_cause_candidates=candidates,
+                 knowledge=ReportKnowledge(failure_modes=failure_modes, language="ko"),
+             )
     core = detail.split("## 부록", 1)[0]
 
     assert "구분할 수 없습니다" in summary
@@ -649,18 +624,15 @@ def test_image_pull_actions_ignore_family_wide_graph_siblings() -> None:
     )
 
     detail = _detail_from(
-        request,
-        results,
-        [],
-        failure_modes=failure_modes,
-        root_cause_candidates=[RankedCause("image_pull_error", "high", 8.0)],
-        graph_fixes=graph,
-        language="ko",
-        self_check_next=(
-            "해당 이미지가 레지스트리에 존재하고 현재 ServiceAccount에 pull 권한이 있는지 "
-            "영향받은 노드에서 `crictl pull`로 확인하세요."
-        ),
-    )
+                 request,
+                 results,
+                 [],
+                 root_cause_candidates=[RankedCause("image_pull_error", "high", 8.0)],
+                 graph_fixes=graph,
+                 self_check_next="해당 이미지가 레지스트리에 존재하고 현재 ServiceAccount에 pull 권한이 있는지 "
+            "영향받은 노드에서 `crictl pull`로 확인하세요.",
+                 knowledge=ReportKnowledge(failure_modes=failure_modes, language="ko"),
+             )
     actions = detail.split("## 3. 권장 조치", 1)[1].split("## 부록", 1)[0]
     appendix = detail.split("### Troubleshooting Playbook", 1)[1]
 
@@ -918,8 +890,8 @@ async def test_translation_runs_after_every_section_is_appended(monkeypatch) -> 
     from app.masking import build_masker
     from app.plan import InvestigationPlan
     from app.progress import ProgressReporter
-    from app.services.kg_enrichment import KGContext
     from app.services import pipeline
+    from app.services.kg_enrichment import KGContext
     from app.services.pipeline import PipelineState, synthesize_stage
     from tests.test_orchestrator import make_target
 

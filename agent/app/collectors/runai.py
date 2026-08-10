@@ -36,14 +36,6 @@ _RUNAI_TOKEN_INFLIGHT: dict[
 ] = {}
 
 
-def _version_from_results(query_results: list[dict[str, Any]]) -> str:
-    """Pull the Run:ai version out of the MCP 'version' query result, if present."""
-    for item in query_results or []:
-        if item.get("name") == "version" and not item.get("error"):
-            return _extract_version(item.get("data"))
-    return ""
-
-
 def _extract_version(data: Any) -> str:
     """Find a semver-ish version string in an arbitrary Run:ai version payload.
 
@@ -103,6 +95,124 @@ def _mcp_cluster_gpu_model(query_results: list[dict[str, object]]) -> str:
     return ""
 
 
+def _unauthorized_result(
+    name: str,
+    settings: Settings,
+    target: AnalysisTarget,
+    missing: list[str],
+    auth_warnings: list[str],
+) -> CollectorResult:
+    """No bearer token: say so as an observation instead of querying blind."""
+    if "runai.auth" not in missing:
+        missing.append("runai.auth")
+    if "runai.query" not in missing:
+        missing.append("runai.query")
+    if target.queue:
+        missing.append("runai.queue_scope")
+        auth_warnings.append(
+            "Run:ai queue scope was not collected because Authorization is unavailable."
+        )
+    summary = (
+        f"{NO_EVIDENCE} Run:ai API authentication is unavailable; direct "
+        "queries were skipped."
+    )
+    details = {
+        "cluster": target.cluster,
+        "project": target.project,
+        "queue": target.queue,
+        "workload_name": target.workload_name,
+        "workload_type": target.workload_type,
+        "runai_workload_id": target.runai_workload_id,
+        "runai_base_url": settings.runai_base_url,
+        "queries": [],
+    }
+    return CollectorResult(
+        agent=name,
+        status="unavailable",
+        summary=summary,
+        confidence="low",
+        details=details,
+        missing_data=missing,
+        warnings=auth_warnings,
+        artifacts=[
+            artifact(
+                agent=name,
+                source="runai",
+                type="workload_context",
+                status="unavailable",
+                confidence="low",
+                query=(
+                    "Run:ai API query skipped because no Authorization header "
+                    "was available."
+                ),
+                summary=summary,
+                result=details,
+            )
+        ],
+    )
+
+
+def _collection_status(
+    settings: Settings,
+    *,
+    successful: list[dict[str, object]],
+    failed: list[dict[str, object]],
+    missing: list[str],
+    used_mcp: bool,
+) -> tuple[str, str, str]:
+    """Collector status/summary/confidence for what the Run:ai reads returned."""
+    if successful and not failed and not missing:
+        if used_mcp:
+            summary = ko_en(
+                settings,
+                "Run:ai MCP에서 워크로드/프로젝트 리소스/클러스터 "
+                "컨텍스트 조회를 완료했습니다.",
+                "Run:ai MCP queries completed for workload, project-resource, "
+                "and cluster context.",
+            )
+        else:
+            summary = ko_en(
+                settings,
+                "Run:ai 직접 API에서 워크로드/프로젝트/큐 컨텍스트 "
+                "조회를 완료했습니다.",
+                "Run:ai direct API queries completed for workload, project, "
+                "and queue context.",
+            )
+        status = "ok"
+        confidence = "high"
+    elif successful:
+        retrieved = ", ".join(
+            sorted({str(item.get("name")) for item in successful if item.get("name")})
+        )
+        gaps = ", ".join(
+            [
+                *(str(item.get("name") or "query") for item in failed),
+                *(item for item in missing if item != "runai.query"),
+            ]
+        ) or "remaining context"
+        transport = "MCP" if used_mcp else "direct API"
+        summary = ko_en(
+            settings,
+            f"Run:ai {transport}에서 {retrieved} 컨텍스트만 조회했습니다. "
+            f"확인하지 못한 항목: {gaps}.",
+            f"Run:ai {transport} returned partial context for {retrieved}; "
+            f"unavailable: {gaps}.",
+        )
+        status = "partial"
+        confidence = "medium"
+    else:
+        summary = f"{NO_EVIDENCE} " + ko_en(
+            settings,
+            "Run:ai API 조회가 실패했습니다.",
+            "Run:ai API direct queries failed.",
+        )
+        status = "unavailable"
+        confidence = "low"
+        if "runai.query" not in missing:
+            missing.append("runai.query")
+    return status, summary, confidence
+
+
 class RunAICollector:
     name = "runai"
 
@@ -135,52 +245,8 @@ class RunAICollector:
         else:
             headers, auth_warnings = await _runai_headers(self._settings)
             if not headers.get("Authorization"):
-                if "runai.auth" not in missing:
-                    missing.append("runai.auth")
-                if "runai.query" not in missing:
-                    missing.append("runai.query")
-                if target.queue:
-                    missing.append("runai.queue_scope")
-                    auth_warnings.append(
-                        "Run:ai queue scope was not collected because Authorization is unavailable."
-                    )
-                summary = (
-                    f"{NO_EVIDENCE} Run:ai API authentication is unavailable; direct "
-                    "queries were skipped."
-                )
-                details = {
-                    "cluster": target.cluster,
-                    "project": target.project,
-                    "queue": target.queue,
-                    "workload_name": target.workload_name,
-                    "workload_type": target.workload_type,
-                    "runai_workload_id": target.runai_workload_id,
-                    "runai_base_url": self._settings.runai_base_url,
-                    "queries": [],
-                }
-                return CollectorResult(
-                    agent=self.name,
-                    status="unavailable",
-                    summary=summary,
-                    confidence="low",
-                    details=details,
-                    missing_data=missing,
-                    warnings=auth_warnings,
-                    artifacts=[
-                        artifact(
-                            agent=self.name,
-                            source="runai",
-                            type="workload_context",
-                            status="unavailable",
-                            confidence="low",
-                            query=(
-                                "Run:ai API query skipped because no Authorization header "
-                                "was available."
-                            ),
-                            summary=summary,
-                            result=details,
-                        )
-                    ],
+                return _unauthorized_result(
+                    self.name, self._settings, target, missing, auth_warnings
                 )
             # Prefer NVIDIA's official Run:ai MCP when configured. Its protected
             # HTTP endpoint verifies the same Run:ai bearer token used by direct
@@ -296,55 +362,13 @@ class RunAICollector:
                 missing.append("runai.query")
             if auth_failed and "runai.auth" not in missing:
                 missing.append("runai.auth")
-            if successful and not failed and not missing:
-                if used_mcp:
-                    summary = ko_en(
-                        self._settings,
-                        "Run:ai MCP에서 워크로드/프로젝트 리소스/클러스터 "
-                        "컨텍스트 조회를 완료했습니다.",
-                        "Run:ai MCP queries completed for workload, project-resource, "
-                        "and cluster context.",
-                    )
-                else:
-                    summary = ko_en(
-                        self._settings,
-                        "Run:ai 직접 API에서 워크로드/프로젝트/큐 컨텍스트 "
-                        "조회를 완료했습니다.",
-                        "Run:ai direct API queries completed for workload, project, "
-                        "and queue context.",
-                    )
-                status = "ok"
-                confidence = "high"
-            elif successful:
-                retrieved = ", ".join(
-                    sorted({str(item.get("name")) for item in successful if item.get("name")})
-                )
-                gaps = ", ".join(
-                    [
-                        *(str(item.get("name") or "query") for item in failed),
-                        *(item for item in missing if item != "runai.query"),
-                    ]
-                ) or "remaining context"
-                transport = "MCP" if used_mcp else "direct API"
-                summary = ko_en(
-                    self._settings,
-                    f"Run:ai {transport}에서 {retrieved} 컨텍스트만 조회했습니다. "
-                    f"확인하지 못한 항목: {gaps}.",
-                    f"Run:ai {transport} returned partial context for {retrieved}; "
-                    f"unavailable: {gaps}.",
-                )
-                status = "partial"
-                confidence = "medium"
-            else:
-                summary = f"{NO_EVIDENCE} " + ko_en(
-                    self._settings,
-                    "Run:ai API 조회가 실패했습니다.",
-                    "Run:ai API direct queries failed.",
-                )
-                status = "unavailable"
-                confidence = "low"
-                if "runai.query" not in missing:
-                    missing.append("runai.query")
+            status, summary, confidence = _collection_status(
+                self._settings,
+                successful=successful,
+                failed=failed,
+                missing=missing,
+                used_mcp=used_mcp,
+            )
             # NVIDIA's focused MCP exposes no generic version endpoint. Retain
             # version-aware known-issue suppression through a direct best-effort
             # read using the same authorization header.

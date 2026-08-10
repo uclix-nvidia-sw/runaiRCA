@@ -449,19 +449,6 @@ func analysisAlreadyRunningAnswer(run *AnalysisRun, inferred bool) string {
 	return fmt.Sprintf("이미 분석 run `%s`가 %s 대상으로 진행 중이야. 새 Agent 요청은 보내지 않았고, Analysis Dashboard에서 이어서 보면 돼.", run.RunID, target)
 }
 
-func anyInt(value any) int {
-	switch typed := value.(type) {
-	case int:
-		return typed
-	case int64:
-		return int(typed)
-	case float64:
-		return int(typed)
-	default:
-		return 0
-	}
-}
-
 func fallbackChatResponse(req ChatRequest, err error) ChatResponse {
 	entity := first(req.IncidentID, req.AlertID, "current RCA workspace")
 	content := first(req.AlertContent, req.IncidentContent, "No RCA content is attached yet.")

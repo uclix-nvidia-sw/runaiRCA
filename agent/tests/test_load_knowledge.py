@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ontology.load_knowledge import _ensure_symptom, _relate_indicates
+from ontology.load_knowledge import _ensure_symptom
+from ontology.upsert import relate_symptom_indicates
 
 
 class _Concept:
@@ -122,7 +123,7 @@ def test_relate_indicates_retires_the_stale_family_edge() -> None:
     # catalog, so purge never touched the old edge and the symptom matched twice.
     tx = _IndicatesTx(["workload_startup_error", "workload_runtime_error"])
 
-    _relate_indicates(tx, "OOMKilled", "workload_runtime_error")
+    relate_symptom_indicates(tx, "OOMKilled", "workload_runtime_error")
 
     assert any(
         '$rc has subtype "workload_startup_error"; delete $rel;' in query
@@ -139,7 +140,19 @@ def test_relate_indicates_retires_the_stale_family_edge() -> None:
 def test_relate_indicates_inserts_for_a_new_symptom() -> None:
     tx = _IndicatesTx([])
 
-    _relate_indicates(tx, "OOMKilled", "workload_runtime_error")
+    relate_symptom_indicates(tx, "OOMKilled", "workload_runtime_error")
 
     assert not any("delete $rel;" in query for query in tx.queries)
     assert any("insert (symptom: $s, cause: $rc) isa indicates;" in q for q in tx.queries)
+
+
+def test_alert_and_known_issue_loaders_retire_stale_family_edges() -> None:
+    """The whole point of sharing relate_symptom_indicates: load_alerts.py and
+    load_known_issues.py used to carry the pre-reconcile copy, so moving a
+    symptom's family in runai_alerts_catalog.yaml / runai_known_issues.yaml left
+    the old indicates edge behind and the symptom counted for two families."""
+    from ontology import load_alerts, load_known_issues
+    from ontology.upsert import relate_symptom_indicates as shared
+
+    assert load_alerts.relate_symptom_indicates is shared
+    assert load_known_issues.relate_symptom_indicates is shared

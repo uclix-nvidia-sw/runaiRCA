@@ -13,7 +13,7 @@ root_cause subtypes no longer present in the YAML catalog, so re-running after
 editing the YAML is safe. Per-incident cause_instance subtypes are exempt.
 Read-your-writes within the single WRITE txn makes the checks see earlier
 inserts in the same run.
-ponytail: uses _exists() rather than inline `not { ... }` negation — TypeDB 3.11
+ponytail: uses exists() rather than inline `not { ... }` negation — TypeDB 3.11
 rejects that negation form here ([TQL03] "expected pattern"). Only syntax proven
 in app/services/kg_enrichment.py is used. First run needs live TypeDB validation;
 TypeQL 3.x is not exercised by the unit tests.
@@ -33,6 +33,13 @@ from app.config import load_settings
 from app.knowledge import load_family_catalog
 from app.ontology.typedb_client import _concept_value, open_driver
 from app.ontology.typedb_client import escape_typeql as esc
+from ontology.upsert import (
+    ensure_action,
+    exists,
+    relate_symptom_indicates,
+    relate_symptom_resolved_by,
+    selected_values,
+)
 
 KNOWLEDGE_FILE = Path(os.getenv("FAILURE_MODES_FILE", "knowledge/failure_modes.yaml"))
 FAMILIES_FILE = Path(os.getenv("FAMILIES_FILE", "knowledge/families.yaml"))
@@ -60,26 +67,6 @@ def _catalog_families(path: str | Path = FAMILIES_FILE) -> set[str]:
 FAMILIES = _catalog_families()
 
 
-def _exists(tx: Any, match: str) -> bool:
-    return bool(list(tx.query(f"match {match} select $x;").resolve().as_concept_rows()))
-
-
-def _selected_values(tx: Any, match: str, variable: str) -> set[str]:
-    rows = list(tx.query(f"match {match} select ${variable};").resolve().as_concept_rows())
-    values: set[str] = set()
-    for row in rows:
-        get = getattr(row, "get", None)
-        if not callable(get):
-            continue
-        concept = get(variable)
-        if concept is None:
-            continue
-        value = str(_concept_value(concept)).strip()
-        if value:
-            values.add(value)
-    return values
-
-
 def purge_legacy_families(tx: Any, catalog_families: set[str]) -> list[str]:
     """Delete root-cause entities whose subtype left the current catalog.
 
@@ -87,10 +74,10 @@ def purge_legacy_families(tx: Any, catalog_families: set[str]) -> list[str]:
     exempt. Curated symptoms remain intact because current families may share
     them after a split or rename.
     """
-    all_subtypes = _selected_values(
+    all_subtypes = selected_values(
         tx, "$rc isa root_cause, has subtype $f;", "f"
     )
-    cause_instance_subtypes = _selected_values(
+    cause_instance_subtypes = selected_values(
         tx, "$ci isa cause_instance, has subtype $f;", "f"
     )
     legacy = sorted(all_subtypes - set(catalog_families) - cause_instance_subtypes)
@@ -109,7 +96,7 @@ def purge_legacy_families(tx: Any, catalog_families: set[str]) -> list[str]:
 
 
 def _ensure_cause(tx: Any, family: str) -> None:
-    if not _exists(tx, f'$x isa {family}, has subtype "{esc(family)}";'):
+    if not exists(tx, f'$x isa {family}, has subtype "{esc(family)}";'):
         tx.query(f'insert $x isa {family}, has subtype "{esc(family)}";').resolve()
 
 
@@ -142,7 +129,7 @@ def _replace_attribute(
     for value in desired_values:
         if not value:
             continue
-        if _exists(
+        if exists(
             tx,
             f'$x isa symptom, has name "{esc(symptom_name)}", '
             f'has {attribute} "{esc(value)}";',
@@ -166,10 +153,10 @@ def _ensure_symptom(
     name_ko: str = "",
     requires_lifecycle_signal: bool = False,
 ) -> None:
-    if not _exists(tx, f'$x isa symptom, has name "{esc(name)}";'):
+    if not exists(tx, f'$x isa symptom, has name "{esc(name)}";'):
         tx.query(f'insert $x isa symptom, has name "{esc(name)}";').resolve()
     for kw in keywords:
-        if _exists(tx, f'$x isa symptom, has name "{esc(name)}", has keyword "{esc(kw)}";'):
+        if exists(tx, f'$x isa symptom, has name "{esc(name)}", has keyword "{esc(kw)}";'):
             continue
         tx.query(
             f'match $s isa symptom, has name "{esc(name)}"; '
@@ -203,14 +190,14 @@ def _ensure_symptom(
     _replace_attribute(tx, name, "reason_ko", [reason_ko])
     _replace_attribute(tx, name, "component", [component])
     _replace_attribute(tx, name, "name_ko", [name_ko])
-    if exclusive_actions and not _exists(
+    if exclusive_actions and not exists(
         tx, f'$x isa symptom, has name "{esc(name)}", has exclusive_actions true;'
     ):
         tx.query(
             f'match $s isa symptom, has name "{esc(name)}"; '
             "insert $s has exclusive_actions true;"
         ).resolve()
-    if requires_lifecycle_signal and not _exists(
+    if requires_lifecycle_signal and not exists(
         tx, f'$x isa symptom, has name "{esc(name)}", has requires_lifecycle_signal true;'
     ):
         tx.query(
@@ -218,52 +205,6 @@ def _ensure_symptom(
             "insert $s has requires_lifecycle_signal true;"
         ).resolve()
     _replace_attribute(tx, name, "statement_ko", actions_ko or [])
-
-
-def _ensure_action(tx: Any, statement: str) -> None:
-    if not _exists(tx, f'$x isa action, has statement "{esc(statement)}";'):
-        tx.query(f'insert $x isa action, has statement "{esc(statement)}";').resolve()
-
-
-def _relate_indicates(tx: Any, symptom_name: str, family: str) -> None:
-    # A symptom name is a single identity with exactly ONE family. When the
-    # YAML moves a symptom between families (OOMKilled: workload_startup_error
-    # -> workload_runtime_error), the old edge must be retired here — purge only
-    # removes families that LEFT the catalog, so an edge to a still-current
-    # family would otherwise survive forever and the symptom would match twice.
-    current = _selected_values(
-        tx,
-        f'$rel isa indicates, links (symptom: $s, cause: $rc); '
-        f'$s isa symptom, has name "{esc(symptom_name)}"; $rc has subtype $f;',
-        "f",
-    )
-    for stale in sorted(current - {family}):
-        tx.query(
-            f'match $rel isa indicates, links (symptom: $s, cause: $rc); '
-            f'$s isa symptom, has name "{esc(symptom_name)}"; '
-            f'$rc has subtype "{esc(stale)}"; delete $rel;'
-        ).resolve()
-    if family in current:
-        return
-    tx.query(
-        f'match $s isa symptom, has name "{esc(symptom_name)}"; $rc isa {family}; '
-        f"insert (symptom: $s, cause: $rc) isa indicates;"
-    ).resolve()
-
-
-def _relate_resolved_by(tx: Any, symptom_name: str, statement: str) -> None:
-    if _exists(
-        tx,
-        f'$x isa symptom, has name "{esc(symptom_name)}"; '
-        f'$a isa action, has statement "{esc(statement)}"; '
-        f"(symptom: $x, remedy: $a) isa resolved_by;",
-    ):
-        return
-    tx.query(
-        f'match $s isa symptom, has name "{esc(symptom_name)}"; '
-        f'$a isa action, has statement "{esc(statement)}"; '
-        f"insert (symptom: $s, remedy: $a) isa resolved_by;"
-    ).resolve()
 
 
 def main() -> int:
@@ -316,14 +257,14 @@ def main() -> int:
                         str(sym.get("name_ko") or "").strip(),
                         sym.get("requires_lifecycle_signal") is True,
                     )
-                    _relate_indicates(tx, name, family)
+                    relate_symptom_indicates(tx, name, family)
                     symptoms += 1
                     for act in sym.get("actions", []):
                         statement = str(act).strip()
                         if not statement:
                             continue
-                        _ensure_action(tx, statement)
-                        _relate_resolved_by(tx, name, statement)
+                        ensure_action(tx, statement)
+                        relate_symptom_resolved_by(tx, name, statement)
                         actions += 1
             tx.commit()
 

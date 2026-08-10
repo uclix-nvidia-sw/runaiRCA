@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -971,231 +972,234 @@ def _prior_is_context_compatible(item: dict[str, Any], target: AnalysisTarget) -
     return True
 
 
-def _query_kg(
-    client: TypeDBClient,
-    target: AnalysisTarget,
-    similar_incidents: list[Any] | None = None,
-) -> dict[str, Any]:
-    # One connection for all three synthesis queries: a transient connect blip on
-    # any single fresh connection would fail the whole enrichment, so opening once
-    # (instead of per query) shrinks that failure surface ~3x.
-    with client.open_reader() as run:
-        workloads: list[str] = []
-        if target.node:
-            rows = run(_BLAST_QUERY.format(node=escape_typeql(target.node)))
-            workloads = sorted({str(r.get("wn")) for r in rows if r.get("wn")})
-
-        # Past resolved incidents at the same location (any alert name) — the
-        # infra layer's "have we seen trouble HERE before" signal.
-        location_history: list[dict[str, str]] = []
-        location_history_truncated = False
-        seen_locations: set[str] = set()
-        for where, query in (
-            ("node " + target.node, _NODE_HISTORY_QUERY.format(node=escape_typeql(target.node)))
-            if target.node
-            else (None, None),
-            (
-                "namespace " + target.namespace,
-                _NAMESPACE_HISTORY_QUERY.format(namespace=escape_typeql(target.namespace)),
-            )
-            if target.namespace
-            else (None, None),
-        ):
-            if not query:
+def _read_location_history(run: Callable, target: AnalysisTarget) -> tuple[list[dict[str, str]], bool]:
+    """Past resolved incidents at the same location (any alert name) — the
+    infra layer's "have we seen trouble HERE before" signal."""
+    location_history: list[dict[str, str]] = []
+    location_history_truncated = False
+    seen_locations: set[str] = set()
+    for where, query in (
+        ("node " + target.node, _NODE_HISTORY_QUERY.format(node=escape_typeql(target.node)))
+        if target.node
+        else (None, None),
+        (
+            "namespace " + target.namespace,
+            _NAMESPACE_HISTORY_QUERY.format(namespace=escape_typeql(target.namespace)),
+        )
+        if target.namespace
+        else (None, None),
+    ):
+        if not query:
+            continue
+        for r in run(query):
+            iid = str(r.get("iid") or "")
+            if not iid or iid in seen_locations:
                 continue
-            for r in run(query):
-                iid = str(r.get("iid") or "")
-                if not iid or iid in seen_locations:
-                    continue
-                seen_locations.add(iid)
-                location_history.append(
+            seen_locations.add(iid)
+            location_history.append(
+                {
+                    "incident_id": iid,
+                    "where": where,
+                    "analysis_summary": str(r.get("sum") or ""),
+                }
+            )
+            if len(location_history) >= 6:
+                location_history_truncated = True
+                break
+        if len(location_history) >= 6:
+            break
+    return location_history, location_history_truncated
+
+
+def _read_workload_topology(run: Callable, target: AnalysisTarget) -> tuple[dict[str, Any], str]:
+    """Topology around the stem workload identity: exposing Services, used
+    PVCs, and the storage blast radius (other workloads on the same PVC)."""
+    workload_topology: dict[str, Any] = {}
+    workload_topology_status = ""
+    # Namespace-less alerts cannot name one graph workload safely: do not
+    # fall back to the ambiguous display name.
+    if target.workload_name and target.namespace:
+        workload_topology_status = "complete"
+        workload = workload_uid(target.namespace, target.workload_name)
+        services = sorted(
+            {
+                str(r.get("sn"))
+                for r in run(
+                    _WORKLOAD_SERVICES_QUERY.format(workload_uid=escape_typeql(workload))
+                )
+                if r.get("sn")
+            }
+        )
+        pvcs = sorted(
+            {
+                str(r.get("pn"))
+                for r in run(
+                    _WORKLOAD_PVCS_QUERY.format(workload_uid=escape_typeql(workload))
+                )
+                if r.get("pn")
+            }
+        )
+        shared: list[str] = []
+        shared_storage_pvcs = pvcs[:3]
+        for pvc in shared_storage_pvcs:
+            for r in run(_SHARED_PVC_QUERY.format(pvc=escape_typeql(pvc))):
+                other = str(r.get("on") or "")
+                other_uid = str(r.get("ou") or "")
+                if other and other_uid != workload and other not in shared:
+                    shared.append(other)
+        if services or pvcs:
+            workload_topology = {
+                "services": services[:10],
+                "pvcs": pvcs[:10],
+                "shared_storage_workloads": shared[:10],
+                "shared_storage_pvcs": shared_storage_pvcs,
+                "shared_storage_truncated": len(pvcs) > len(shared_storage_pvcs),
+            }
+    elif target.workload_name:
+        workload_topology_status = "skipped_missing_namespace"
+    return workload_topology, workload_topology_status
+
+
+def _read_prior_cases(
+    run: Callable, target: AnalysisTarget, similar_incidents: list[Any] | None
+) -> list[dict[str, Any]]:
+    """Approved prior CaseCards: same-alert matches first, then vector hits."""
+    prior: list[dict[str, Any]] = []
+    if target.alert_name:
+        rows = run(_PRIOR_QUERY.format(alert=escape_typeql(target.alert_name)))
+        seen: set[str] = set()
+        for r in rows:
+            iid = str(r.get("iid") or "")
+            if iid and iid not in seen:
+                seen.add(iid)
+                case_id = str(r.get("case_id") or "")
+                prior.append(
                     {
                         "incident_id": iid,
-                        "where": where,
+                        "case_id": case_id,
+                        "family": str(r.get("family") or ""),
                         "analysis_summary": str(r.get("sum") or ""),
+                        "case_card": _case_card_projection(run, case_id),
                     }
                 )
-                if len(location_history) >= 6:
-                    location_history_truncated = True
-                    break
-            if len(location_history) >= 6:
-                break
 
-        # Topology around the stem workload identity: exposing Services, used
-        # PVCs, and the storage blast radius (other workloads on the same PVC).
-        workload_topology: dict[str, Any] = {}
-        workload_topology_status = ""
-        # Namespace-less alerts cannot name one graph workload safely: do not
-        # fall back to the ambiguous display name.
-        if target.workload_name and target.namespace:
-            workload_topology_status = "complete"
-            workload = workload_uid(target.namespace, target.workload_name)
-            services = sorted(
-                {
-                    str(r.get("sn"))
-                    for r in run(
-                        _WORKLOAD_SERVICES_QUERY.format(workload_uid=escape_typeql(workload))
-                    )
-                    if r.get("sn")
-                }
-            )
-            pvcs = sorted(
-                {
-                    str(r.get("pn"))
-                    for r in run(
-                        _WORKLOAD_PVCS_QUERY.format(workload_uid=escape_typeql(workload))
-                    )
-                    if r.get("pn")
-                }
-            )
-            shared: list[str] = []
-            shared_storage_pvcs = pvcs[:3]
-            for pvc in shared_storage_pvcs:
-                for r in run(_SHARED_PVC_QUERY.format(pvc=escape_typeql(pvc))):
-                    other = str(r.get("on") or "")
-                    other_uid = str(r.get("ou") or "")
-                    if other and other_uid != workload and other not in shared:
-                        shared.append(other)
-            if services or pvcs:
-                workload_topology = {
-                    "services": services[:10],
-                    "pvcs": pvcs[:10],
-                    "shared_storage_workloads": shared[:10],
-                    "shared_storage_pvcs": shared_storage_pvcs,
-                    "shared_storage_truncated": len(pvcs) > len(shared_storage_pvcs),
-                }
-        elif target.workload_name:
-            workload_topology_status = "skipped_missing_namespace"
-
-        prior: list[dict[str, Any]] = []
-        if target.alert_name:
-            rows = run(_PRIOR_QUERY.format(alert=escape_typeql(target.alert_name)))
-            seen: set[str] = set()
-            for r in rows:
-                iid = str(r.get("iid") or "")
-                if iid and iid not in seen:
-                    seen.add(iid)
-                    case_id = str(r.get("case_id") or "")
-                    prior.append(
-                        {
-                            "incident_id": iid,
-                            "case_id": case_id,
-                            "family": str(r.get("family") or ""),
-                            "analysis_summary": str(r.get("sum") or ""),
-                            "case_card": _case_card_projection(run, case_id),
-                        }
-                    )
-
-        # A vector memory becomes a CaseCard only when TypeDB independently
-        # verifies that this exact incident has an active approved snapshot.
-        # This prevents unreviewed memory text from entering few-shot context.
-        for vector_rank, similar in enumerate((similar_incidents or [])[:5], start=1):
-            incident_id = _similar_incident_id(similar)
-            if not incident_id or any(item.get("incident_id") == incident_id for item in prior):
-                continue
-            try:
-                rows = run(
-                    _CASE_BY_INCIDENT_QUERY.format(incident_id=escape_typeql(incident_id))
-                )
-            except Exception:  # noqa: BLE001 - stale vector result is non-fatal
-                continue
-            row = next((candidate for candidate in rows if candidate.get("case_id")), None)
-            if not isinstance(row, dict):
-                continue
-            case_id = str(row.get("case_id") or "")
-            prior.append(
-                {
-                    "incident_id": incident_id,
-                    "case_id": case_id,
-                    "family": str(row.get("family") or ""),
-                    "analysis_summary": str(row.get("sum") or _similar_summary(similar)),
-                    "case_card": _case_card_projection(run, case_id),
-                    "vector_rank": vector_rank,
-                    "vector_similarity": _similarity(similar),
-                }
-            )
-
-        knowledge_rows = [*run(_KNOWLEDGE_QUERY), *run(_KNOWLEDGE_ACTIONLESS_QUERY)]
-        knowledge_reason_rows = run(_KNOWLEDGE_REASON_QUERY)
-        knowledge_exclusive_action_rows = run(_KNOWLEDGE_EXCLUSIVE_ACTIONS_QUERY)
-        knowledge_lifecycle_rows = run(_KNOWLEDGE_LIFECYCLE_SIGNAL_QUERY)
-        knowledge_reason_ko_rows = run(_KNOWLEDGE_REASON_KO_QUERY)
-        knowledge_component_rows = run(_KNOWLEDGE_COMPONENT_QUERY)
-        knowledge_name_ko_rows = run(_KNOWLEDGE_NAME_KO_QUERY)
-        knowledge_actions_ko_rows = run(_KNOWLEDGE_ACTIONS_KO_QUERY)
-        knowledge_affected_version_rows = run(_KNOWLEDGE_AFFECTED_VERSION_QUERY)
-        knowledge_fixed_version_rows = run(_KNOWLEDGE_FIXED_VERSION_QUERY)
-        probe_history_rows = run(_PROBE_HISTORY_QUERY)
-        reasoning: dict[str, Any] = {}
-        component = target.workload_name
-        if component:
-            try:
-                dependencies = _values(
-                    run(_FN_DEPENDENCIES_FOR_COMPONENT.format(component=escape_typeql(component)))
-                )
-                reasoning["dependencies"] = sorted({str(item) for item in dependencies if item})[:30]
-                checks = run(_FN_CHECKS_FOR_COMPONENT_PATH.format(component=escape_typeql(component)))
-                reasoning["component_checks"] = [
-                    {"component": str(row.get("x") or ""), "check": str(row.get("y") or "")}
-                    for row in checks
-                    if row.get("x") and row.get("y")
-                ][:30]
-            except Exception as exc:  # noqa: BLE001 - YAML topology remains the fallback
-                reasoning["warning"] = f"ontology component reasoning unavailable: {type(exc).__name__}"
+    # A vector memory becomes a CaseCard only when TypeDB independently
+    # verifies that this exact incident has an active approved snapshot.
+    # This prevents unreviewed memory text from entering few-shot context.
+    for vector_rank, similar in enumerate((similar_incidents or [])[:5], start=1):
+        incident_id = _similar_incident_id(similar)
+        if not incident_id or any(item.get("incident_id") == incident_id for item in prior):
+            continue
         try:
-            diagnostic_tree = _query_diagnostic_tree(run)
-        except Exception:  # noqa: BLE001 - old schema during rolling upgrades
-            _log.warning("TypeDB diagnostic runbook query failed; YAML fallback will be used")
-            diagnostic_tree = {}
+            rows = run(
+                _CASE_BY_INCIDENT_QUERY.format(incident_id=escape_typeql(incident_id))
+            )
+        except Exception:  # noqa: BLE001 - stale vector result is non-fatal
+            continue
+        row = next((candidate for candidate in rows if candidate.get("case_id")), None)
+        if not isinstance(row, dict):
+            continue
+        case_id = str(row.get("case_id") or "")
+        prior.append(
+            {
+                "incident_id": incident_id,
+                "case_id": case_id,
+                "family": str(row.get("family") or ""),
+                "analysis_summary": str(row.get("sum") or _similar_summary(similar)),
+                "case_card": _case_card_projection(run, case_id),
+                "vector_rank": vector_rank,
+                "vector_similarity": _similarity(similar),
+            }
+        )
+    return prior
 
+
+def _read_component_reasoning(run: Callable, component: str) -> dict[str, Any]:
+    """Ontology dependency/check paths for the alert's component, if any."""
+    reasoning: dict[str, Any] = {}
+    if component:
+        try:
+            dependencies = _values(
+                run(_FN_DEPENDENCIES_FOR_COMPONENT.format(component=escape_typeql(component)))
+            )
+            reasoning["dependencies"] = sorted({str(item) for item in dependencies if item})[:30]
+            checks = run(_FN_CHECKS_FOR_COMPONENT_PATH.format(component=escape_typeql(component)))
+            reasoning["component_checks"] = [
+                {"component": str(row.get("x") or ""), "check": str(row.get("y") or "")}
+                for row in checks
+                if row.get("x") and row.get("y")
+            ][:30]
+        except Exception as exc:  # noqa: BLE001 - YAML topology remains the fallback
+            reasoning["warning"] = f"ontology component reasoning unavailable: {type(exc).__name__}"
+    return reasoning
+
+
+def _read_knowledge_rows(run: Callable) -> dict[str, list]:
+    """Every curated-knowledge projection, read on the one open transaction."""
+    return {
+        "symptoms": [*run(_KNOWLEDGE_QUERY), *run(_KNOWLEDGE_ACTIONLESS_QUERY)],
+        "reason": run(_KNOWLEDGE_REASON_QUERY),
+        "exclusive_actions": run(_KNOWLEDGE_EXCLUSIVE_ACTIONS_QUERY),
+        "lifecycle": run(_KNOWLEDGE_LIFECYCLE_SIGNAL_QUERY),
+        "reason_ko": run(_KNOWLEDGE_REASON_KO_QUERY),
+        "component": run(_KNOWLEDGE_COMPONENT_QUERY),
+        "name_ko": run(_KNOWLEDGE_NAME_KO_QUERY),
+        "actions_ko": run(_KNOWLEDGE_ACTIONS_KO_QUERY),
+        "affected_version": run(_KNOWLEDGE_AFFECTED_VERSION_QUERY),
+        "fixed_version": run(_KNOWLEDGE_FIXED_VERSION_QUERY),
+    }
+
+
+def _project_knowledge(rows: dict[str, list]) -> dict[str, list[dict[str, Any]]]:
+    """Group the per-attribute knowledge rows into one entry per symptom."""
     reasons = {
         str(row.get("sn") or ""): str(row.get("reason") or "")
-        for row in knowledge_reason_rows
+        for row in rows["reason"]
         if row.get("sn") and row.get("reason")
     }
     exclusive_actions = {
         str(row.get("sn") or "")
-        for row in knowledge_exclusive_action_rows
+        for row in rows["exclusive_actions"]
         if row.get("sn") and str(row.get("exclusive_actions")).casefold() == "true"
     }
     lifecycle_required = {
         str(row.get("sn") or "")
-        for row in knowledge_lifecycle_rows
+        for row in rows["lifecycle"]
         if row.get("sn") and str(row.get("requires_lifecycle_signal")).casefold() == "true"
     }
     affected_versions = {
         str(row.get("sn") or ""): str(row.get("affected_version") or "")
-        for row in knowledge_affected_version_rows
+        for row in rows["affected_version"]
         if row.get("sn") and row.get("affected_version")
     }
     fixed_versions = {
         str(row.get("sn") or ""): str(row.get("fixed_version") or "")
-        for row in knowledge_fixed_version_rows
+        for row in rows["fixed_version"]
         if row.get("sn") and row.get("fixed_version")
     }
     reasons_ko = {
         str(row.get("sn") or ""): str(row.get("reason_ko") or "")
-        for row in knowledge_reason_ko_rows
+        for row in rows["reason_ko"]
         if row.get("sn") and row.get("reason_ko")
     }
     components = {
         str(row.get("sn") or ""): str(row.get("component") or "")
-        for row in knowledge_component_rows
+        for row in rows["component"]
         if row.get("sn") and row.get("component")
     }
     names_ko = {
         str(row.get("sn") or ""): str(row.get("name_ko") or "")
-        for row in knowledge_name_ko_rows
+        for row in rows["name_ko"]
         if row.get("sn") and row.get("name_ko")
     }
     actions_ko: dict[str, set[str]] = {}
-    for row in knowledge_actions_ko_rows:
+    for row in rows["actions_ko"]:
         sname = str(row.get("sn") or "")
         statement_ko = str(row.get("statement_ko") or "")
         if sname and statement_ko:
             actions_ko.setdefault(sname, set()).add(statement_ko)
     grouped: dict[tuple[str, str], dict[str, set[str]]] = {}
-    for r in knowledge_rows:
+    for r in rows["symptoms"]:
         fam = str(r.get("fam") or "")
         sname = str(r.get("sn") or "")
         if not fam or not sname:
@@ -1223,14 +1227,40 @@ def _query_kg(
                 "fixed_version": fixed_versions.get(sname, ""),
             }
         )
+    return knowledge
 
+
+def _query_kg(
+    client: TypeDBClient,
+    target: AnalysisTarget,
+    similar_incidents: list[Any] | None = None,
+) -> dict[str, Any]:
+    # One connection for all the synthesis queries: a transient connect blip on
+    # any single fresh connection would fail the whole enrichment, so opening
+    # once (instead of per query) shrinks that failure surface.
+    with client.open_reader() as run:
+        workloads: list[str] = []
+        if target.node:
+            rows = run(_BLAST_QUERY.format(node=escape_typeql(target.node)))
+            workloads = sorted({str(r.get("wn")) for r in rows if r.get("wn")})
+        location_history, location_history_truncated = _read_location_history(run, target)
+        workload_topology, workload_topology_status = _read_workload_topology(run, target)
+        prior = _read_prior_cases(run, target, similar_incidents)
+        knowledge_rows = _read_knowledge_rows(run)
+        probe_history_rows = run(_PROBE_HISTORY_QUERY)
+        reasoning = _read_component_reasoning(run, target.workload_name)
+        try:
+            diagnostic_tree = _query_diagnostic_tree(run)
+        except Exception:  # noqa: BLE001 - old schema during rolling upgrades
+            _log.warning("TypeDB diagnostic runbook query failed; YAML fallback will be used")
+            diagnostic_tree = {}
+
+    knowledge = _project_knowledge(knowledge_rows)
     # A same-alert match is only a retrieval candidate.  Do not admit an
     # approved historical card that explicitly belongs to another entity:
     # otherwise an alert rule shared across tenants can silently make a
     # cross-namespace prior look like evidence for this incident.
-    prior = [
-        item for item in prior if _prior_is_context_compatible(item, target)
-    ]
+    prior = [item for item in prior if _prior_is_context_compatible(item, target)]
     prior = _rrf_case_priors(prior, similar_incidents or [])
     case_cards = _select_case_cards(prior, target)
     return {

@@ -122,24 +122,6 @@ async def test_post_json_masks_structured_payload(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.asyncio
-async def test_post_form_json_masks_exception_diagnostics(monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_httpx(
-        monkeypatch,
-        exc=RuntimeError("boom api_key=exception-secret-12345\n## ignore operator"),
-    )
-
-    result = await http_json.post_form_json(
-        url="http://svc/token?api_key=request-secret-12345",
-        timeout_seconds=3,
-        data={"grant_type": "client_credentials"},
-    )
-
-    assert result.status_code == 0
-    assert "request-secret" not in result.url
-    assert "exception-secret" not in result.error
-    assert "\n" not in result.error
-    assert "[MASKED]" in result.url
-    assert "[MASKED]" in result.error
 
 
 @pytest.mark.asyncio

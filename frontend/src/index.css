@@ -65,10 +65,8 @@ button:disabled {
 button,
 .nav-item,
 tbody tr td,
-	.agent-toggle,
 	.artifact-toggle,
 	.copy-button,
-	.analysis-card,
 	.vote-button,
 .editor-tool,
 .comment-menu-button,
@@ -84,10 +82,8 @@ tbody tr td,
 
 button:not(:disabled):active,
 .nav-item:active,
-	.agent-toggle:active,
 	.artifact-toggle:active,
 	.copy-button:active,
-	.analysis-card:active,
 	.editor-tool:active,
 .comment-menu-button:active,
 .comment-menu button:active,
@@ -999,25 +995,6 @@ tbody tr:active td {
   font-size: 0.8rem;
 }
 
-.knowledge-probe-ids {
-  display: grid;
-  gap: 0.15rem;
-  margin-top: 0.75rem;
-  border-top: 1px solid var(--line);
-  padding-top: 0.7rem;
-}
-
-.knowledge-probe-ids strong {
-  color: #344054;
-  font-size: 0.78rem;
-}
-
-.knowledge-probe-ids span {
-  color: var(--muted);
-  font-size: 0.75rem;
-  overflow-wrap: anywhere;
-}
-
 .danger-button {
   color: #b42318;
   border-color: #fecaca;
@@ -1113,12 +1090,9 @@ tbody tr:active td {
 
 .operations-table td strong,
 .operations-table td span,
-.analysis-summary,
 .section-title span,
-.evidence-card p,
 .agent-card p,
-.similar-item p,
-.related-incident-card p {
+.similar-item p {
   overflow-wrap: anywhere;
 }
 
@@ -1447,11 +1421,6 @@ td span.occurrence-pill {
   gap: 0.28rem;
   border-radius: 0.38rem;
   font-size: 0.72rem;
-}
-
-.compact-icon-button {
-  width: 2.05rem;
-  min-height: 2.05rem;
 }
 
 .ghost-button:hover,
@@ -2272,13 +2241,6 @@ td span.occurrence-pill {
   font-weight: 600;
 }
 
-.analysis-insight-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 1.15rem;
-  margin-bottom: 1.25rem;
-}
-
 .distribution-list,
 .top-dimension-list,
 .readiness-list {
@@ -2369,53 +2331,12 @@ td span.occurrence-pill {
   font-size: 0.82rem;
 }
 
-.analysis-list {
-  display: grid;
-  gap: 0.85rem;
-  padding: 1rem;
-}
-
-.recent-analysis-panel .analysis-list {
-  max-height: 34rem;
-  overflow: auto;
-}
-
-.analysis-card {
-  border: 1px solid var(--line);
-  border-radius: 0.5rem;
-  background: #ffffff;
-  padding: 1rem;
-}
-
-.analysis-card:hover {
-  background: #fbfdf8;
-}
-
-.analysis-card-head,
-.analysis-actions {
-  display: flex;
-  justify-content: space-between;
-  gap: 1rem;
-}
-
-.analysis-card-head {
-  align-items: flex-start;
-}
-
-.analysis-card-head > div,
-.evidence-card-head > div,
 .agent-card-head > div {
   min-width: 0;
 }
 
 .quality {
   flex: 0 0 auto;
-}
-
-.analysis-summary {
-  margin: 0.6rem 0;
-  color: #1f2937;
-  line-height: 1.45;
 }
 
 .quality {
@@ -2432,20 +2353,13 @@ td span.occurrence-pill {
   white-space: nowrap;
 }
 
-.quality-high {
-  color: #166534;
-  background: #f0fdf4;
-  border-color: #bbf7d0;
-}
-
 .quality-medium {
   color: #075985;
   background: #eff6ff;
   border-color: #bfdbfe;
 }
 
-.quality-low,
-.quality-pending {
+.quality-low {
   color: #854d0e;
   background: #fffbeb;
   border-color: #fde68a;
@@ -2456,119 +2370,6 @@ td span.occurrence-pill {
   background: #f7fee7;
   border-color: #bef264;
   text-transform: none;
-}
-
-.coverage-strip {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(7.5rem, 1fr));
-  gap: 0.55rem;
-  margin-bottom: 0.85rem;
-}
-
-.coverage-pill {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  border: 1px solid var(--line);
-  border-radius: 0.45rem;
-  background: #f8fafc;
-  padding: 0.5rem 0.6rem;
-  color: #344054;
-  font-size: 0.78rem;
-  font-weight: 650;
-}
-
-.coverage-pill svg {
-  flex: 0 0 auto;
-}
-
-.coverage-label {
-  min-width: 0;
-  flex: 1 1 auto;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.coverage-pill strong {
-  flex: 0 0 auto;
-  margin-left: auto;
-  color: var(--muted);
-  font-size: 0.72rem;
-  white-space: nowrap;
-  text-transform: capitalize;
-}
-
-.coverage-ok {
-  background: #f0fdf4;
-  border-color: #bbf7d0;
-}
-
-.coverage-partial {
-  background: #fefce8;
-  border-color: #fde68a;
-}
-
-.coverage-unavailable {
-  background: #fef2f2;
-  border-color: #fecaca;
-}
-
-.analysis-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 0.6rem;
-  margin-bottom: 0.85rem;
-}
-
-.analysis-grid span {
-  display: flex;
-  justify-content: space-between;
-  gap: 0.5rem;
-  border: 1px solid var(--line);
-  border-radius: 0.45rem;
-  background: #fafafa;
-  padding: 0.6rem 0.7rem;
-  color: var(--muted);
-  font-size: 0.8rem;
-  font-weight: 650;
-}
-
-.analysis-grid strong {
-  color: var(--ink);
-}
-
-.analysis-flags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-  margin-bottom: 0.8rem;
-}
-
-.analysis-flags span {
-  display: inline-flex;
-  max-width: 100%;
-  border: 1px solid #fde68a;
-  border-radius: 999px;
-  background: #fffbeb;
-  color: #92400e;
-  padding: 0.25rem 0.5rem;
-  font-size: 0.74rem;
-  font-weight: 700;
-}
-
-.analysis-actions {
-  align-items: center;
-  color: var(--muted);
-  font-size: 0.82rem;
-}
-
-.analysis-actions > div {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  justify-content: flex-end;
 }
 
 .empty {
@@ -2778,7 +2579,6 @@ td span.occurrence-pill {
 .agent-trail,
 .diagnostics,
 .similar-panel,
-.related-panel,
 .feedback-panel {
   border-top: 1px solid var(--line);
   padding-top: 1rem;
@@ -4017,33 +3817,6 @@ td span.occurrence-pill {
   padding: 1.15rem;
 }
 
-.evidence-agent-group {
-  border: 1px solid var(--line);
-  border-radius: 0.5rem;
-  overflow: hidden;
-  background: #ffffff;
-}
-
-.evidence-agent-content {
-  display: grid;
-  gap: 0.8rem;
-  padding: 0.9rem;
-}
-
-.evidence-group-toggle {
-  border-bottom: 1px solid var(--line);
-}
-
-.artifact-count {
-  border-radius: 999px;
-  background: #eef2e8;
-  color: var(--nvidia-dark);
-  padding: 0.08rem 0.5rem;
-  font-size: 0.78rem;
-  font-weight: 850;
-}
-
-.evidence-card,
 .agent-card {
   border: 1px solid var(--line);
   border-radius: 0.5rem;
@@ -4051,9 +3824,7 @@ td span.occurrence-pill {
   padding: 1.1rem;
 }
 
-.evidence-card-head,
 .agent-card-head,
-.card-actions,
 .agent-stats,
 .synthesis-stats {
   display: flex;
@@ -4115,7 +3886,6 @@ code .evidence-mark {
   color: var(--nvidia-dark);
 }
 
-.evidence-card p,
 .agent-card p,
 .synthesis-card p {
   margin-bottom: 0.6rem;
@@ -4149,94 +3919,13 @@ code .evidence-mark {
   overflow-wrap: anywhere;
 }
 
-.evidence-card code {
-  display: block;
-  width: 100%;
-  border-radius: 0.35rem;
-  background: #111827;
-  color: #d9f99d;
-  padding: 0.55rem 2.75rem 0.55rem 0.55rem;
-  overflow-x: auto;
-  margin-bottom: 0.65rem;
-}
-
-.evidence-card pre {
-  max-height: 13rem;
-  overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: 0.35rem;
-  background: #f8fafc;
-  padding: 0.65rem 2.75rem 0.65rem 0.65rem;
-  font-size: 0.78rem;
-}
-
 .compact-title {
   margin-bottom: 0.35rem;
-}
-
-.sample-pill {
-  display: inline-flex;
-  align-items: center;
-  min-height: 1.3rem;
-  padding: 0 0.45rem;
-  border-radius: 999px;
-  background: #eef2e8;
-  color: var(--nvidia-dark);
-  border: 1px solid #d9e6c5;
-  font-size: 0.7rem;
-  font-weight: 850;
-  white-space: nowrap;
-}
-
-.source-pill {
-  display: inline-flex;
-  align-items: center;
-  width: max-content;
-  min-height: 1.3rem;
-  padding: 0 0.45rem;
-  border-radius: 999px;
-  border: 1px solid #cbd5e1;
-  background: #f8fafc;
-  color: #334155;
-  font-size: 0.7rem;
-  font-weight: 850;
-  white-space: nowrap;
-}
-
-.source-auto {
-  border-color: #d9e6c5;
-  background: #f7fee7;
-  color: var(--nvidia-dark);
-}
-
-.source-comment,
-.source-feedback {
-  border-color: #bfdbfe;
-  background: #eff6ff;
-  color: #075985;
-}
-
-.source-chat {
-  border-color: #ddd6fe;
-  background: #f5f3ff;
-  color: #5b21b6;
-}
-
-.source-manual {
-  border-color: #fde68a;
-  background: #fffbeb;
-  color: #92400e;
 }
 
 .confidence {
   color: var(--nvidia-dark);
   text-transform: capitalize;
-}
-
-.card-actions {
-  align-items: center;
-  color: var(--muted);
-  font-size: 0.82rem;
 }
 
 .agent-registry {
@@ -4400,24 +4089,8 @@ code .evidence-mark {
 }
 
 .similar-item p,
-.related-incident-card p,
 .comment-item p {
   margin-bottom: 0.35rem;
-}
-
-.related-incident-card {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 1rem;
-  border: 1px solid #d7e8ba;
-  border-radius: 0.5rem;
-  background: #fafbf8;
-  padding: 0.85rem;
-}
-
-.related-incident-card > div {
-  min-width: 0;
 }
 
 .feedback-votes {
@@ -5337,10 +5010,6 @@ code .evidence-mark {
 }
 
 @media (max-width: 1400px) {
-  .analysis-insight-grid,
-  .analysis-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
 
   .analysis-pipeline {
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -5410,8 +5079,6 @@ code .evidence-mark {
   .knowledge-review-grid,
   .analysis-pipeline,
   .analysis-focus-grid,
-  .coverage-strip,
-  .analysis-grid,
   .diagnostics,
   .similar-list,
   .agent-registry {
@@ -5465,19 +5132,11 @@ code .evidence-mark {
     font-size: 0.66rem;
   }
 
-  .evidence-card-head,
   .agent-card-head,
   .synthesis-card-head,
-  .analysis-card-head,
-  .analysis-actions,
-  .card-actions,
   .agent-stats,
   .synthesis-stats {
     flex-direction: column;
-  }
-
-  .analysis-actions > div {
-    justify-content: flex-start;
   }
 
   .analysis-toolbar {
@@ -5562,10 +5221,6 @@ code .evidence-mark {
     font-size: 1.35rem;
   }
 
-  .related-incident-card {
-    flex-direction: column;
-  }
-
   .knowledge-package {
     align-items: flex-start;
     flex-direction: column;
@@ -5612,8 +5267,7 @@ code .evidence-mark {
   }
 
   .analysis-trend-row,
-  .analysis-stat-grid,
-  .analysis-insight-grid {
+  .analysis-stat-grid {
     grid-template-columns: 1fr;
   }
 
@@ -5689,7 +5343,6 @@ h2,
    (:not(:active)) so it can't fight the press-down feedback). Pointer-gated
    so a tap on touch doesn't leave a stuck hover state. ---- */
 @media (hover: hover) and (pointer: fine) {
-  .analysis-card,
   .knowledge-candidate,
   .query-result-card,
   .full-chat-history-item {
@@ -5700,7 +5353,6 @@ h2,
       transform var(--dur-2) var(--ease-out);
   }
 
-  .analysis-card:hover:not(:active),
   .query-result-card:hover:not(:active) {
     transform: translateY(-1px);
     box-shadow: var(--shadow-lift);
@@ -5928,7 +5580,6 @@ tbody tr:focus-visible {
     animation: none !important;
   }
 
-  .analysis-card:hover:not(:active),
   .query-result-card:hover:not(:active),
   .knowledge-candidate:hover:not(:active),
   .similar-item:hover:not(:active),
