@@ -140,6 +140,26 @@ def test_probe_templates_have_stable_ids_and_keep_legacy_json_projection() -> No
     assert json.loads(encoded.replace('\\"', '"'))["id"]
 
 
+def test_probe_template_for_insert_binds_entities_only() -> None:
+    """The relation insert's match must NOT assert probe_template_for itself.
+
+    The loader only reaches the insert after that exact pattern matched zero
+    rows, so a match clause containing the relation makes the insert a silent
+    no-op — exit 0, permanently empty relation (live-TypeDB finding
+    2026-08-10; substring assertions alone cannot catch it)."""
+    tx = _Tx()
+    _load(tx, _document(TREE))
+    inserts = [
+        query
+        for query in tx.queries
+        if "insert (step: $s, template: $p) isa probe_template_for" in query
+    ]
+    assert inserts, "loader must attempt the probe_template_for insert"
+    for query in inserts:
+        match_clause = query.split("insert", 1)[0]
+        assert "probe_template_for" not in match_clause
+
+
 def test_bundled_probe_id_must_include_runbook_and_step_scope() -> None:
     with pytest.raises(ValueError, match="bundled diagnostic probe id"):
         _probe_templates(

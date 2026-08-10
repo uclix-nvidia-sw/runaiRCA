@@ -181,10 +181,21 @@ def _supporting_evidence_ids(payload: dict[str, Any]) -> list[str]:
 def _clean_keyword(sig: Any) -> str:
     """Strip a trailing curator annotation like `(reported, raw log unavailable)`
     (which would never appear in a real log, so it's a dead keyword) and collapse
-    whitespace. Salvages the real signal preceding the annotation."""
+    whitespace. Salvages the real signal preceding the annotation.
+
+    Signatures the sanitizer masked in place — `nfs: server <address> not
+    responding, still trying` — can never substring-match real text (real logs
+    carry an actual IP/hostname where the placeholder sits), so the whole
+    keyword was dead. Keep the longest literal fragment around the placeholder
+    instead; the generic-token gate downstream still applies to the salvage."""
     text = re.sub(
         r"\s*\([^)]*(?:reported|unavailable)[^)]*\)\s*$", "", str(sig), flags=re.IGNORECASE
     )
+    if re.search(r"<[^<>]{1,40}>", text):
+        fragments = [
+            fragment.strip(" \t:,-") for fragment in re.split(r"<[^<>]{1,40}>", text)
+        ]
+        text = max(fragments, key=len, default="")
     return " ".join(text.split())
 
 

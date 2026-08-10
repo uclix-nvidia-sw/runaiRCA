@@ -157,13 +157,20 @@ def _insert_probe_template(tx: Any, step_id: str, probe: dict[str, object]) -> N
             f'insert $x isa diagnostic_probe_template, has probe_id "{esc(probe_id)}", '
             f'has probe_tool "{esc(str(probe["tool"]))}";'
         ).resolve()
-    relation = (
+    # The insert's match must bind ONLY the two entities. Re-using the
+    # existence pattern (which asserts the relation itself) as the insert's
+    # match made this a permanent no-op: the pattern had just proved to match
+    # zero rows, so the insert executed zero times — exit 0, empty relation
+    # (caught by live-TypeDB verification 2026-08-10; fake-tx tests can't see it).
+    entities = (
         f'$s isa diagnostic_step, has diagnostic_id "{esc(step_id)}"; '
         f'$p isa diagnostic_probe_template, has probe_id "{esc(probe_id)}"; '
-        "(step: $s, template: $p) isa probe_template_for"
     )
-    if not list(tx.query(f"match {relation}; select $s;").resolve().as_concept_rows()):
-        tx.query(f"match {relation}; insert (step: $s, template: $p) isa probe_template_for;").resolve()
+    exists_query = f"match {entities}(step: $s, template: $p) isa probe_template_for; select $s;"
+    if not list(tx.query(exists_query).resolve().as_concept_rows()):
+        tx.query(
+            f"match {entities}insert (step: $s, template: $p) isa probe_template_for;"
+        ).resolve()
 
 
 def _insert_step(tx: Any, node: dict[str, Any], runbook_id: str) -> None:

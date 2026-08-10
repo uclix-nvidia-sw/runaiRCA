@@ -357,6 +357,27 @@ def test_unresolved_case_has_evidence_but_no_supported_by_or_resolution(monkeypa
     assert "insert $resolution isa resolution" not in emitted
 
 
+def test_clean_keyword_salvages_masked_placeholder_fragment() -> None:
+    # A sanitizer-masked signature can never substring-match real text; the
+    # longest literal fragment around the placeholder is the live signal
+    # (live-TypeDB finding 2026-08-10: the NFS case's exact kernel line was a
+    # dead keyword).
+    assert (
+        lx._clean_keyword("nfs: server <address> not responding, still trying")
+        == "not responding, still trying"
+    )
+    assert (
+        lx._clean_keyword(
+            "MountVolume.SetUp failed for volume <volume>: mount failed: exit status 32"
+        )
+        == "MountVolume.SetUp failed for volume"
+    )
+    assert (
+        lx._clean_keyword("failed to reserve container name")
+        == "failed to reserve container name"
+    )
+
+
 def test_write_case_wires_the_trusted_knowledge_chain(monkeypatch: Any) -> None:
     # Owner decision 2026-07-27: vendor-support cases are trusted knowledge.
     # A catalog-family case with support-confirmed actions must land in the
