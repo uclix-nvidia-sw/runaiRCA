@@ -2700,7 +2700,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 plan,
                 state.target,
                 state.self_check_next,
-                _executed_evidence_queries(state.artifacts),
+                _executed_query_ledger(state.artifacts),
                 _held_evidence_summaries(state.artifacts, eligible_support_ids),
             )
         except Exception:  # noqa: BLE001 - questions are best-effort
@@ -7782,10 +7782,24 @@ def _knowledge_base_lines(
         body.append(
             "- Workload topology (stable identity): lookup skipped because the alert has no namespace."
         )
-    prior = kg_context.get("prior_incidents") or []
-    if prior:
-        body.append(f"- This alert recurred in {len(prior)} prior incident(s):")
-        for item in prior[:5]:
+    prior = (kg_context.get("prior_incidents") or [])[:5]
+    same_alert = [item for item in prior if item.get("matched_by") == "same_alert"]
+    similarity = [item for item in prior if item.get("matched_by") != "same_alert"]
+    prior_groups = (
+        (same_alert, f"- This alert recurred in {len(same_alert)} prior incident(s):"),
+        (
+            similarity,
+            (
+                "- Possibly related past incidents (similarity match, not a recurrence "
+                "of this alert):"
+            ),
+        ),
+    )
+    for items, heading in prior_groups:
+        if not items:
+            continue
+        body.append(heading)
+        for item in items:
             incident_id = _short_sentence(
                 active_masker.mask_text(str(item.get("incident_id") or "(unknown)")),
                 limit=80,
@@ -8524,10 +8538,13 @@ def _already_answered(question: str, held_text: str) -> bool:
     return hits / len(words) >= 0.6
 
 
-def _executed_evidence_queries(artifacts: list[object], limit: int = 12) -> list[str]:
-    queries: list[str] = []
+def _executed_query_ledger(artifacts: list[object]) -> list[str]:
+    """Compact receipts for LLM-generated drill-down and ad-hoc queries."""
+    ledger: list[str] = []
     seen: set[str] = set()
     for item in artifacts:
+        if getattr(item, "type", "") not in {"drilldown_query", "adhoc_query"}:
+            continue
         query = getattr(item, "query", None)
         if not isinstance(query, str):
             continue
@@ -8535,17 +8552,17 @@ def _executed_evidence_queries(artifacts: list[object], limit: int = 12) -> list
         if not compact or compact in seen:
             continue
         seen.add(compact)
-        queries.append(compact)
-        if len(queries) == limit:
+        ledger.append(f"{getattr(item, 'agent', '')}: {compact[:140]}")
+        if len(ledger) == 30:
             break
-    return queries
+    return ledger
 
 
 def _held_evidence_summaries(
     artifacts: list[object], eligible_support_ids: set[str] | None, limit: int = 12
 ) -> list[str]:
     """What an eligible artifact already SAYS -- R4's other half. Query strings
-    alone (``_executed_evidence_queries``) tell a reader what was ASKED, not
+    alone (``_executed_query_ledger``) tell a reader what was ASKED, not
     what came back, so a probe that ran and returned "gpu_capacity 8 /
     gpu_requested 8" gave no signal that the question was already answered."""
     out: list[str] = []
@@ -8582,20 +8599,29 @@ async def _sharpen_operator_questions(
         "to any query in the already-executed evidence list, and never ask for "
         "something an item in held_evidence already states; target only genuinely "
         "missing evidence. "
+        + (
+            "If a listed query's data mattered but it was empty, phrase the item as "
+            "'Already checked <short paraphrase> in the incident window and it was "
+            "empty; capture it if the issue recurs' instead of a request. "
+            if executed_queries
+            else ""
+        )
         + ("반드시 한국어로 작성하세요. " if ko else "Write in English. ")
         + 'Respond with ONLY JSON: {"questions": [str, ...]} containing 2 to 4 questions.'
     )
-    user = _build_settings_masker(settings).mask_text(json.dumps(
-        {
-            "draft_questions": questions,
-            "missing_data": missing,
-            "plan": plan.as_dict() if plan else {},
-            "already_executed_evidence_queries": executed_queries or [],
-            "held_evidence": held_evidence or [],
-        },
-        ensure_ascii=False,
-        default=str,
-    ))
+    prompt = {
+        "draft_questions": questions,
+        "missing_data": missing,
+        "plan": plan.as_dict() if plan else {},
+        "already_executed_evidence_queries": [],
+        "held_evidence": held_evidence or [],
+    }
+    if executed_queries:
+        prompt.pop("already_executed_evidence_queries")
+        prompt["executed_query_ledger"] = executed_queries
+    user = _build_settings_masker(settings).mask_text(
+        json.dumps(prompt, ensure_ascii=False, default=str)
+    )
     data = await complete_json(
         settings,
         system=system,

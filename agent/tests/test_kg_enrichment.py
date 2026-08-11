@@ -18,6 +18,7 @@ from app.services.kg_enrichment import (
     _query_external_cases,
     _query_kg,
     _query_remediation,
+    _read_prior_cases,
     _rrf_case_priors,
     _safe_case_card,
     _select_case_cards,
@@ -923,17 +924,64 @@ def test_query_remediation_does_not_flatten_family_actions() -> None:
     assert client.queries == []
 
 
-def test_knowledge_base_section_renders_when_available() -> None:
+def test_knowledge_base_same_alert_prior_claims_recurrence() -> None:
     kg = KGContext(
         enabled=True,
         available=True,
         blast_radius_workloads=3,
-        prior_incidents=[{"incident_id": "inc-1", "analysis_summary": "node disk pressure"}],
+        prior_incidents=[
+            {
+                "incident_id": "inc-1",
+                "analysis_summary": "node disk pressure",
+                "matched_by": "same_alert",
+            }
+        ],
     ).as_dict()
     text = "\n".join(_knowledge_base_lines(kg))
     assert "## Knowledge Base (Ontology)" in text
     assert "Blast radius: 3" in text
+    assert "This alert recurred in 1 prior incident(s)" in text
     assert "inc-1" in text
+
+
+def test_knowledge_base_similarity_prior_does_not_claim_recurrence() -> None:
+    kg = KGContext(
+        enabled=True,
+        available=True,
+        prior_incidents=[
+            {
+                "incident_id": "inc-similar",
+                "analysis_summary": "different alert, similar symptoms",
+                "matched_by": "similarity",
+            }
+        ],
+    ).as_dict()
+
+    text = "\n".join(_knowledge_base_lines(kg))
+
+    assert "This alert recurred" not in text
+    assert "Possibly related past incidents (similarity match, not a recurrence" in text
+    assert "inc-similar" in text
+
+
+def test_knowledge_base_mixed_priors_render_under_correct_headings() -> None:
+    kg = KGContext(
+        enabled=True,
+        available=True,
+        prior_incidents=[
+            {"incident_id": "inc-same", "matched_by": "same_alert"},
+            {"incident_id": "inc-similar", "matched_by": "similarity"},
+        ],
+    ).as_dict()
+
+    lines = _knowledge_base_lines(kg)
+    recurrence = lines.index("- This alert recurred in 1 prior incident(s):")
+    related = lines.index(
+        "- Possibly related past incidents (similarity match, not a recurrence of this alert):"
+    )
+
+    assert "inc-same" in lines[recurrence + 1]
+    assert "inc-similar" in lines[related + 1]
 
 
 def test_knowledge_base_prior_summary_is_single_trimmed_line() -> None:
@@ -950,7 +998,10 @@ def test_knowledge_base_prior_summary_is_single_trimmed_line() -> None:
     ).as_dict()
 
     line = next(line for line in _knowledge_base_lines(kg) if "inc-long" in line)
+    text = "\n".join(_knowledge_base_lines(kg))
     assert "\n" not in line
+    assert "This alert recurred" not in text
+    assert "Possibly related past incidents" in text
     assert "kg-prior-secret-12345" not in line
     assert "[MASKED]" in line
     assert len(line) < 380
@@ -1128,8 +1179,24 @@ def test_case_cards_include_analog_and_different_family_counterexample() -> None
 
 def test_rrf_case_priors_rewards_graph_vector_agreement_without_admitting_raw_memory() -> None:
     prior = [
-        {"incident_id": "I-graph", "case_id": "C-graph", "family": "k8s_storage_error"},
-        {"incident_id": "I-vector", "case_id": "C-vector", "family": "network_fabric_error"},
+        {
+            "incident_id": "I-graph",
+            "case_id": "C-graph",
+            "family": "k8s_storage_error",
+            "matched_by": "same_alert",
+        },
+        {
+            "incident_id": "I-vector",
+            "case_id": "C-vector-similarity",
+            "family": "network_fabric_error",
+            "matched_by": "similarity",
+        },
+        {
+            "incident_id": "I-vector",
+            "case_id": "C-vector-same-alert",
+            "family": "network_fabric_error",
+            "matched_by": "same_alert",
+        },
     ]
     fused = _rrf_case_priors(
         prior,
@@ -1140,8 +1207,43 @@ def test_rrf_case_priors_rewards_graph_vector_agreement_without_admitting_raw_me
     )
 
     assert fused[0]["incident_id"] == "I-vector"
+    assert fused[0]["case_id"] == "C-vector-same-alert"
+    assert fused[0]["matched_by"] == "same_alert"
     assert fused[0]["retrieval"]["sources"] == ["typedb", "vector"]
     assert all(item["incident_id"] != "I-unapproved-memory" for item in fused)
+
+
+def test_read_prior_cases_tags_same_alert_and_similarity_origins() -> None:
+    def run(query: str) -> list[dict]:
+        if "select $iid, $sum, $case_id, $family" in query:
+            return [
+                {
+                    "iid": "I-same",
+                    "case_id": "C-same",
+                    "family": "gpu_hardware_error",
+                    "sum": "same alert",
+                }
+            ]
+        if 'incident_id "I-similar"' in query and "select $sum, $case_id, $family" in query:
+            return [
+                {
+                    "case_id": "C-similar",
+                    "family": "network_fabric_error",
+                    "sum": "similar incident",
+                }
+            ]
+        return []
+
+    prior = _read_prior_cases(
+        run,
+        _target(),
+        [{"incident_id": "I-similar", "similarity": 0.18}],
+    )
+
+    assert [(item["incident_id"], item["matched_by"]) for item in prior] == [
+        ("I-same", "same_alert"),
+        ("I-similar", "similarity"),
+    ]
 
 
 def test_case_cards_mark_component_matched_vector_case_as_bridge() -> None:
