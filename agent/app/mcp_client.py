@@ -137,7 +137,12 @@ def mcp_fallback_warning(exc: Exception, *, source: str = "MCP") -> str:
     if _QUERY_REJECTION_RE.search(detail):
         label = f"{source} query rejected"
         return f"{label}: {detail}" if detail else label
-    label = f"{MCP_FALLBACK_WARNING}: {type(exc).__name__}"
+    # Name which datasource fell back -- the bare prefix reads identically for
+    # Kubernetes/Loki/Prometheus/Postgres, so a live warning couldn't be
+    # attributed without cluster-side probing. The constant prefix is kept
+    # verbatim so existing MCP_FALLBACK_WARNING substring matchers still hit.
+    source_suffix = f" ({source})" if source else ""
+    label = f"{MCP_FALLBACK_WARNING}{source_suffix}: {type(exc).__name__}"
     return f"{label}: {detail}" if detail else label
 
 
