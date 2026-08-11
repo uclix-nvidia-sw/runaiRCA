@@ -1080,6 +1080,7 @@ def _read_prior_cases(
                         "family": str(r.get("family") or ""),
                         "analysis_summary": str(r.get("sum") or ""),
                         "case_card": _case_card_projection(run, case_id),
+                        "matched_by": "same_alert",
                     }
                 )
 
@@ -1109,6 +1110,7 @@ def _read_prior_cases(
                 "case_card": _case_card_projection(run, case_id),
                 "vector_rank": vector_rank,
                 "vector_similarity": _similarity(similar),
+                "matched_by": "similarity",
             }
         )
     return prior
@@ -1321,8 +1323,18 @@ def _rrf_case_priors(prior: list[dict[str, Any]], similar_incidents: list[Any]) 
         for rank, item in enumerate(similar_incidents, start=1)
         if (incident_id := _similar_incident_id(item))
     }
+    by_id: dict[str, dict[str, Any]] = {}
+    for index, item in enumerate(prior):
+        key = str(item.get("incident_id") or f"__missing_{index}")
+        existing = by_id.get(key)
+        if existing is None or (
+            item.get("matched_by") == "same_alert"
+            and existing.get("matched_by") != "same_alert"
+        ):
+            by_id[key] = item
+
     fused: list[dict[str, Any]] = []
-    for graph_rank, item in enumerate(prior, start=1):
+    for graph_rank, item in enumerate(by_id.values(), start=1):
         incident_id = str(item.get("incident_id") or "")
         ranks = [graph_rank]
         vector = vector_by_id.get(incident_id)

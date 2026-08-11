@@ -735,6 +735,17 @@ func (s *Server) handleAnalysisRunList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	items, total := s.store.ListAnalysisRunsPage(page.Limit, page.Offset)
+	// List rows stay slim: the dashboard table only needs summaries and
+	// artifact counters. The full detail/metadata/artifact payloads remain on
+	// GET /api/v1/analysis-runs/{id}. Items are deep clones, so mutation is safe.
+	for i := range items {
+		items[i].AnalysisDetail = ""
+		items[i].Metadata = nil
+		for j := range items[i].Artifacts {
+			items[i].Artifacts[j].Query = ""
+			items[i].Artifacts[j].Result = nil
+		}
+	}
 	writeJSON(w, http.StatusOK, paginatedEnvelope(items, page, total))
 }
 

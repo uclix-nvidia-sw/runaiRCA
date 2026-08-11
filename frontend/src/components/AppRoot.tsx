@@ -314,17 +314,16 @@ function App() {
   }, [analysisRecords]);
 
   const selectedAnalysisRunID = selectedAnalysisRunIDForDetail(detail);
-  const selectedAnalysisRunOnPage = dashboardAnalysisRuns.find((run) => run.run_id === selectedAnalysisRunID);
   const selectedAnalysisAttemptVersion = detail?.kind === 'incident'
     ? `${detail.data.active_analysis_run_id || ''}:${detail.data.is_analyzing}:${detail.data.analysis_hash || ''}`
     : '';
+  // The runs LIST is slim (no analysis_detail/metadata/artifact payloads), so
+  // an open workspace always fetches the full run — even when a slim copy is
+  // on the current page. analysisRunForDetail prefers the exact run once it
+  // lands; a transient render with the slim page run is acceptable.
   useEffect(() => {
     let cancelled = false;
     if (!selectedAnalysisRunID) {
-      setExactAnalysisRun(undefined);
-      return undefined;
-    }
-    if (selectedAnalysisRunOnPage) {
       setExactAnalysisRun(undefined);
       return undefined;
     }
@@ -339,7 +338,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedAnalysisAttemptVersion, selectedAnalysisRunID, selectedAnalysisRunOnPage]);
+  }, [selectedAnalysisAttemptVersion, selectedAnalysisRunID]);
 
   const workspaceAnalysisRun = useMemo(
     () => analysisRunForDetail(detail, dashboardAnalysisRuns, exactAnalysisRun),

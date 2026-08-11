@@ -1,0 +1,42 @@
+{
+  "asOf": "2026-08-11T05:20:56Z",
+  "byGpuModel": [
+    {
+      "gpuModel": "NVIDIA-A100-SXM4-40GB",
+      "gpusTotal": 8,
+      "nodes": 1
+    },
+    {
+      "gpuModel": "NVIDIA-A100-SXM4-80GB",
+      "gpusTotal": 8,
+      "nodes": 1
+    }
+  ],
+  "byNodePool": [
+    {
+      "cpuCoresAllocated": 60.712,
+      "cpuCoresTotal": 582,
+      "gpuNodes": 2,
+      "gpusAllocatable": 8,
+      "gpusAllocated": 9,
+      "gpusFree": 7,
+      "gpusTotal": 16,
+      "memoryGiBAllocated": 164.817,
+      "memoryGiBTotal": 3887.673,
+      "nodePool": "default"
+    }
+  ],
+  "clusterId": "7877c984-c504-44e1-b578-ae8075fee021",
+  "nodePool": null,
+  "totals": {
+    "cpuCoresAllocated": 60.712,
+    "cpuCoresTotal": 582,
+    "gpuNodes": 2,
+    "gpusAllocatable": 8,
+    "gpusAllocated": 9,
+    "gpusFree": 7,
+    "gpusTotal": 16,
+    "memoryGiBAllocated": 164.817,
+    "memoryGiBTotal": 3887.673
+  }
+}

@@ -196,6 +196,8 @@ class Settings:
     # opt-in: the chart's least-privilege ServiceAccount intentionally cannot
     # list Secrets, while controller/pod/event change detection still works.
     enable_helm_change_detection: bool = False
+    # Conservative rollout for deriving a node from aggregate GPU inventory.
+    enable_quantity_scope_derivation: bool = False
 
 
 def load_settings() -> Settings:
@@ -376,6 +378,7 @@ def load_settings() -> Settings:
             1, _int_env("RUNTIME_KNOWLEDGE_TIMEOUT_SECONDS", 10)
         ),
         enable_helm_change_detection=_bool_env("ENABLE_HELM_CHANGE_DETECTION", False),
+        enable_quantity_scope_derivation=_bool_env("ENABLE_QUANTITY_SCOPE_DERIVATION", False),
     )
 
 

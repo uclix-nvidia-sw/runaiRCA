@@ -3713,23 +3713,14 @@ _NODE_RESOLUTION_MAX_LIST_PAGES = 10
 _NODE_RESOLUTION_MAX_LIST_ITEMS = 500
 
 
-async def _node_resolution_pod_items(
+async def _complete_k8s_list_items(
     settings: Settings,
-    namespace: str,
     listing: dict[str, object],
+    path: str,
 ) -> tuple[list[dict], bool]:
-    """Return bounded namespace Pods and whether the LIST reached its last page.
-
-    Exact named Pod rows remain usable from any page, but generated-name and
-    workload-prefix replacement inference is safe only after Kubernetes proves
-    the namespace LIST is complete. MCP-only adapters that omit List metadata,
-    an unavailable continuation credential, repeated tokens, page errors, and
-    the page/item ceilings all return ``complete=False``.
-    """
+    """Return a bounded Kubernetes List and whether it reached its last page."""
     status_code = listing.get("status_code")
-    if listing.get("error") or (
-        isinstance(status_code, int) and not 200 <= status_code < 300
-    ):
+    if listing.get("error") or (isinstance(status_code, int) and not 200 <= status_code < 300):
         return [], False
     payload = _normalize_k8s_payload(listing.get("data"))
     raw_items = payload.get("items") if isinstance(payload, dict) else None
@@ -3751,11 +3742,8 @@ async def _node_resolution_pod_items(
         pages = 1
         seen_tokens: set[str] = set()
         verify: bool | str = (
-            settings.kubernetes_ca_path
-            if Path(settings.kubernetes_ca_path).exists()
-            else True
+            settings.kubernetes_ca_path if Path(settings.kubernetes_ca_path).exists() else True
         )
-        path = f"/api/v1/namespaces/{quote(namespace, safe='')}/pods"
         next_token = continuation
         while next_token:
             if (
@@ -3778,9 +3766,7 @@ async def _node_resolution_pod_items(
             )
             if not response.ok:
                 return items, False
-            page = _normalize_k8s_payload(
-                _collector_masker(settings).mask_object(response.data)
-            )
+            page = _normalize_k8s_payload(_collector_masker(settings).mask_object(response.data))
             page_items = page.get("items") if isinstance(page, dict) else None
             page_metadata = page.get("metadata") if isinstance(page, dict) else None
             if not isinstance(page_items, list) or not isinstance(page_metadata, dict):
@@ -3801,6 +3787,23 @@ async def _node_resolution_pod_items(
         )
     except TimeoutError:
         return items, False
+
+
+async def _node_resolution_pod_items(
+    settings: Settings,
+    namespace: str,
+    listing: dict[str, object],
+) -> tuple[list[dict], bool]:
+    """Return bounded namespace Pods and whether the LIST reached its last page.
+
+    Exact named Pod rows remain usable from any page, but generated-name and
+    workload-prefix replacement inference is safe only after Kubernetes proves
+    the namespace LIST is complete. MCP-only adapters that omit List metadata,
+    an unavailable continuation credential, repeated tokens, page errors, and
+    the page/item ceilings all return ``complete=False``.
+    """
+    path = f"/api/v1/namespaces/{quote(namespace, safe='')}/pods"
+    return await _complete_k8s_list_items(settings, listing, path)
 
 
 async def resolve_live_pod_node(
@@ -6007,6 +6010,40 @@ def _node_gpu_value(node: dict[str, object], field: str) -> tuple[Decimal | None
         return None, True
     value, valid = _gpu_quantity(values.get(_GPU_RESOURCE))
     return (value if valid else None), valid
+
+
+async def resolve_unique_gpu_deficit_node(
+    settings: Settings,
+) -> tuple[str, Decimal | None]:
+    """Nominate the sole GPU node whose capacity exceeds allocatable GPUs."""
+    listing = await k8s_read(settings, "nodes", full_object=True)
+    items, complete = await _complete_k8s_list_items(settings, listing, "/api/v1/nodes")
+    if not complete:
+        _log.warning("quantity scope Kubernetes Nodes list was incomplete or failed")
+        return "", None
+
+    candidates: list[tuple[str, Decimal]] = []
+    for node in items:
+        capacity, capacity_valid = _node_gpu_value(node, "capacity")
+        allocatable, allocatable_valid = _node_gpu_value(node, "allocatable")
+        if not capacity_valid or not allocatable_valid:
+            _log.warning("quantity scope Kubernetes GPU quantity was malformed")
+            return "", None
+        if capacity is None and allocatable is None:
+            continue
+        if capacity is None or allocatable is None or allocatable > capacity:
+            _log.warning("quantity scope Kubernetes GPU quantities were incomplete")
+            return "", None
+        deficit = capacity - allocatable
+        if deficit <= 0:
+            continue
+        metadata = node.get("metadata")
+        name = metadata.get("name") if isinstance(metadata, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            _log.warning("quantity scope Kubernetes GPU node name was malformed")
+            return "", None
+        candidates.append((name.strip(), deficit))
+    return candidates[0] if len(candidates) == 1 else ("", None)
 
 
 async def _collect_gpu_node_resource_observations(

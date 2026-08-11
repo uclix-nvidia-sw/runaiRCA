@@ -1,0 +1,41 @@
+{
+  "asOf": "2026-08-11T05:20:57Z",
+  "byNodePool": [
+    {
+      "gpusUnschedulable": 8,
+      "nodePool": "default",
+      "nodesUnhealthy": 1
+    }
+  ],
+  "clusterId": "7877c984-c504-44e1-b578-ae8075fee021",
+  "nodePool": null,
+  "totals": {
+    "gpusUnschedulable": 8,
+    "nodesTotal": 7,
+    "nodesUnhealthy": 1
+  },
+  "unhealthyNodes": [
+    {
+      "conditions": [
+        {
+          "message": "node was marked Unschedulable",
+          "reason": "SchedulingDisabled",
+          "type": "SchedulingDisabled"
+        }
+      ],
+      "gpus": {
+        "count": 8,
+        "model": "NVIDIA-A100-SXM4-40GB"
+      },
+      "name": "dgx02",
+      "nodePool": "default",
+      "status": "NotReady",
+      "taints": [
+        {
+          "effect": "NoSchedule",
+          "key": "node.kubernetes.io/unschedulable"
+        }
+      ]
+    }
+  ]
+}

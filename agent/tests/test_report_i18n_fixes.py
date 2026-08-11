@@ -18,6 +18,7 @@ from dataclasses import replace
 
 import pytest
 
+from app.mcp_client import mcp_fallback_warning
 from app.services.pipeline import (
     _runtime_failure_mode_provenance,
     _safe_line,
@@ -160,3 +161,27 @@ async def test_translate_warnings_ko_empty_list_is_a_noop() -> None:
     settings = replace(make_settings(), language="ko")
 
     assert await _translate_warnings_ko(settings, []) == ([], 0)
+
+
+@pytest.mark.asyncio
+async def test_translate_warnings_ko_carries_the_mcp_source(monkeypatch) -> None:
+    """Both languages must show WHICH datasource fell back. The English label
+    mcp_fallback_warning() builds now carries "(source)"; confirm the Korean
+    rendering the localization pass produces still carries it through."""
+    settings = replace(make_settings(), language="ko")
+    warning = mcp_fallback_warning(RuntimeError("self-signed certificate"), source="Kubernetes")
+    assert "(Kubernetes)" in warning  # the English input this test localizes
+
+    async def fake_complete_with_error(*_args, **kwargs):
+        pending = json.loads(kwargs["user"])
+        translated = {key: f"[번역] {value}" for key, value in pending.items()}
+        return json.dumps(translated, ensure_ascii=False), None
+
+    monkeypatch.setattr(
+        "app.services.pipeline.complete_with_error", fake_complete_with_error
+    )
+
+    translated, missing = await _translate_warnings_ko(settings, [warning])
+
+    assert missing == 0
+    assert "(Kubernetes)" in translated[0]

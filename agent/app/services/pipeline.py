@@ -9,7 +9,7 @@ import re
 import textwrap
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, TypeVar
@@ -20,6 +20,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     causal_evidence_time_range,
+    classify_scope_less_quantity_alert,
     parse_incident_time,
     resolve_target,
 )
@@ -89,6 +90,7 @@ _log = logging.getLogger(__name__)
 TModel = TypeVar("TModel", bound=BaseModel)
 Stage = Callable[["PipelineState"], Awaitable["PipelineState"]]
 _SYNTHESIS_ARTIFACT_RESULT_CHARS = 1200
+_QUANTITY_SCOPE_DERIVATION_TIMEOUT_SECONDS = 10.0
 
 # Raw Kubernetes objects contain failure vocabulary even when the observed
 # value is healthy or merely declarative configuration.  Those fields remain
@@ -148,6 +150,8 @@ class PipelineState:
     # the effective post-plan scope for live analysis; keeping this baseline is
     # what lets historical pinning remain stable across repeated evidence runs.
     declared_target: AnalysisTarget | None = None
+    # Provenance only: never materialized as an artifact or blackboard fact.
+    scope_derivation: dict[str, object] | None = None
     runtime_label: str = "fallback"
     agent_souls: str = ""
     kg_context: Any = None
@@ -434,6 +438,108 @@ async def _resolve_free_text_target(state: PipelineState) -> None:
     )
 
 
+async def _quantity_scope_round(
+    state: PipelineState,
+) -> tuple[str, str, str, str, int] | None:
+    from app.collectors.kubernetes import resolve_unique_gpu_deficit_node
+    from app.collectors.runai_mcp import (
+        fetch_quantity_scope_inputs,
+        runai_health_gpu_node,
+        runai_inventory_gpu_deficit,
+    )
+
+    inventory, health, health_failed = await fetch_quantity_scope_inputs(
+        state.settings, state.target
+    )
+    deficit = runai_inventory_gpu_deficit(inventory)
+    if deficit is None:
+        _log.warning("quantity scope inventory payload was malformed")
+        return None
+    if deficit <= 0:
+        return None
+
+    if not health_failed:
+        nomination = runai_health_gpu_node(health, deficit)
+        if nomination is None:
+            _log.warning("quantity scope health payload was malformed")
+            return None
+        node, health_empty = nomination
+        if node:
+            return (
+                node,
+                "runai_cluster_physical_inventory+runai_cluster_infrastructure_health",
+                "aggregate_deficit_single_matching_unhealthy_gpu_node",
+                "MCP get_cluster_physical_inventory + get_cluster_infrastructure_health",
+                deficit,
+            )
+        if not health_empty:
+            return None
+
+    node, kubernetes_deficit = await resolve_unique_gpu_deficit_node(state.settings)
+    if not node or kubernetes_deficit != Decimal(deficit):
+        return None
+    return (
+        node,
+        "runai_cluster_physical_inventory+kubernetes_nodes",
+        "aggregate_deficit_unique_kubernetes_node_deficit",
+        "MCP get_cluster_physical_inventory + Kubernetes Nodes list",
+        deficit,
+    )
+
+
+async def _derive_quantity_alert_scope(state: PipelineState) -> None:
+    if (
+        not getattr(state.settings, "enable_quantity_scope_derivation", False)
+        or not state.settings.runai_mcp_url
+        or state.plan is None
+        or _is_resolved_reanalysis(state.request)
+    ):
+        return
+    if (
+        classify_scope_less_quantity_alert(
+            state.request.alert.labels,
+            state.request.alert.annotations,
+            state.target,
+        )
+        != "gpu"
+    ):
+        return
+
+    deadline = _evidence_deadline_monotonic(state)
+    remaining = deadline - time.monotonic() if deadline is not None else 10.0
+    timeout = min(_QUANTITY_SCOPE_DERIVATION_TIMEOUT_SECONDS, remaining)
+    if timeout <= 0:
+        return
+    try:
+        result = await asyncio.wait_for(_quantity_scope_round(state), timeout=timeout)
+    except TimeoutError:
+        return
+    except Exception as exc:  # noqa: BLE001 - optional scope must fail closed
+        _log.warning("quantity scope derivation call failed: %s", exc)
+        return
+    if result is None:
+        return
+
+    node, source, method, query, deficit = result
+    if state.declared_target is None:
+        state.declared_target = state.target
+    state.plan.node = node
+    state.target = replace(
+        state.target,
+        node=node,
+        node_source="derived_from_inventory_deficit",
+    )
+    state.scope_derivation = {
+        "dimension": "node",
+        "value": node,
+        "source": source,
+        "method": method,
+        "evidence_role": "scope_seed_not_causal_evidence",
+        "query": query,
+        "deficit": deficit,
+    }
+
+
 def _apply_effective_target(state: PipelineState) -> AnalysisTarget:
     """Persist the one target identity used after planning.
 
@@ -450,6 +556,12 @@ def _apply_effective_target(state: PipelineState) -> AnalysisTarget:
     if state.declared_target is None:
         state.declared_target = state.target
     scoped = _scope_target(state.declared_target, state.plan)
+    if (
+        state.target.node_source == "derived_from_inventory_deficit"
+        and state.target.node
+        and state.target.node == scoped.node
+    ):
+        scoped = replace(scoped, node_source=state.target.node_source)
     # ``plan.namespaces`` is an investigation SCOPE and may lead with a platform
     # component's home namespace (the planner puts it first so the component is
     # read). An alert that declares its own namespace has already stated the
@@ -883,6 +995,7 @@ async def plan_stage(state: PipelineState) -> PipelineState:
     # itself. Read the subject out of the operator's own sentence and verify it
     # against the live cluster before adopting it.
     await _resolve_free_text_target(state)
+    await _derive_quantity_alert_scope(state)
     seed_pod = state.plan.pod or state.target.pod
     if state.target.namespace and seed_pod and not _is_resolved_reanalysis(state.request):
         from app.collectors.kubernetes import resolve_live_pod_node
@@ -2647,6 +2760,8 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             language=getattr(settings, "language", "en"),
             masker=state.masker,
         ),
+        effective_target=state.target,
+        scope_derivation=state.scope_derivation,
         eligible_support_ids=eligible_support_ids,
         self_check_next=state.self_check_next,
         runtime_knowledge_hints=state.runtime_knowledge_hints,
@@ -2700,7 +2815,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 plan,
                 state.target,
                 state.self_check_next,
-                _executed_evidence_queries(state.artifacts),
+                _executed_query_ledger(state.artifacts),
                 _held_evidence_summaries(state.artifacts, eligible_support_ids),
             )
         except Exception:  # noqa: BLE001 - questions are best-effort
@@ -2777,6 +2892,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         affected_pods=affected_pods,
         context={
             "target": state.target.__dict__,
+            **({"scope_derivation": state.scope_derivation} if state.scope_derivation else {}),
             "nemo_runtime": "enabled" if state.runtime_label == "enabled" else "fallback",
             "synthesis": {
                 "status": state.synthesis_status,
@@ -2862,6 +2978,36 @@ def _final_conclusion_line(final_family: str, settings: Settings) -> str:
     if getattr(settings, "language", "en") == "ko":
         return f"- **최종 결론** (위 재분석 메모를 대체함): {final_family}"
     return f"- **Final conclusion** (supersedes the re-analysis note above): {final_family}"
+
+
+def _knowledge_consultation_rows(results: list[CollectorResult]) -> list[dict[str, Any]]:
+    """Drill-down knowledge receipts, agent-attributed and capped.
+
+    drilldown.py's _KNOWLEDGE_TOOLS branch writes a receipt into each
+    collector's ``result.details["knowledge_lookups"]`` (never an artifact --
+    see that module for why), but nothing downstream reads it: a mid-loop
+    knowledge consultation is otherwise invisible outside tests. Lifting it
+    into ``response.context["knowledge_consultations"]`` is what makes it
+    reach the operator (and, via store.go's allowlist, persisted metadata).
+
+    Order is chronological/first-seen (results, then each result's own
+    receipts in append order). Capped at 20 rows with a trailing summary
+    entry when more existed, rather than an unbounded transcript dump.
+    """
+    rows = [
+        {"agent": result.agent, **receipt}
+        for result in results
+        if isinstance(result.details, dict)
+        for receipt in result.details.get("knowledge_lookups") or []
+        if isinstance(receipt, dict)
+    ]
+    if len(rows) > 20:
+        omitted = len(rows) - 20
+        rows = rows[:20]
+        rows.append(
+            {"agent": "", "tool": "", "query": "", "source": "", "summary": f"+{omitted} more"}
+        )
+    return rows
 
 
 async def harness_stage(state: PipelineState) -> PipelineState:
@@ -3037,6 +3183,9 @@ async def harness_stage(state: PipelineState) -> PipelineState:
     ]
     response.context["top_root_cause"] = top.as_dict() if top else None
     response.context["specific_cause"] = response.specific_cause
+    knowledge_rows = _knowledge_consultation_rows(state.results)
+    if knowledge_rows:
+        response.context["knowledge_consultations"] = knowledge_rows
     harness_payload = payload(verdict, status=status, repairs=repairs)
     response.context["harness"] = harness_payload
     response.context["confidence_diagnostics"] = _confidence_diagnostics(
@@ -4258,6 +4407,8 @@ def _detail_from(
     runtime_knowledge_hints: list[tuple[str, dict[str, Any]]] | None = None,
     xid_codes: list[int] | None = None,
     *,
+    effective_target: AnalysisTarget | None = None,
+    scope_derivation: dict[str, object] | None = None,
     knowledge: ReportKnowledge,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
@@ -4283,6 +4434,17 @@ def _detail_from(
     # --- 1. Problem -----------------------------------------------------------
     lines.extend([h["problem"], ""])
     lines.append(f"- {h['what']}: {_root_cause_statement(request, language=knowledge.language)}")
+    if (
+        scope_derivation
+        and effective_target is not None
+        and effective_target.node
+        and not target.node
+    ):
+        lines.append(
+            f"- Investigation scope candidate: `node/{effective_target.node}` — derived "
+            "from a unique physical-versus-allocatable GPU deficit; the alert did not "
+            "declare a node."
+        )
     if where:
         lines.append(f"- {h['where']}: {where}")
     if request.occurrence_count > 1:
@@ -4437,6 +4599,29 @@ def _detail_from(
         lines.append("- Agent role contract file was not loaded; fallback guidance was used.")
     lines.extend(_affected_pods_lines(request, knowledge.language))
     lines.extend(["", "### Troubleshooting Playbook", ""])
+    plan_component = getattr(plan, "component", "") if plan is not None else ""
+    # Leads for the insufficient_evidence hedge (_insufficient_evidence_playbook_
+    # lines): the alert target's own component-identity family first (a metric
+    # alert with no error text still resolves one via runai_architecture.yaml),
+    # then ranked candidate families in rank order. Built here, where both
+    # plan.component and root_cause_candidates are already in scope -- no need
+    # to re-derive settings.architecture_file, knowledge.components already IS
+    # load_architecture's output.
+    family_leads: list[str] = []
+    if plan_component:
+        comp_entry = (knowledge.components or {}).get(plan_component) or {}
+        comp_family = str(comp_entry.get("family") or "")
+        if comp_family:
+            family_leads.append(comp_family)
+    for candidate in root_cause_candidates or []:
+        if len(family_leads) >= 2:
+            break
+        if (
+            candidate.family
+            and candidate.family != "insufficient_evidence"
+            and candidate.family not in family_leads
+        ):
+            family_leads.append(candidate.family)
     lines.extend(
         # Same reasoning as _knowledge_base_lines above: a fuzzy hit here can
         # become the headline playbook entry (including the exclusive_actions
@@ -4446,9 +4631,10 @@ def _detail_from(
             observed_text,
             _alert_signature_text(request),
             knowledge=knowledge,
-            component=getattr(plan, "component", "") if plan is not None else "",
+            component=plan_component,
             allow_remediation=allow_cause_specific_actions,
             case_cards=list((kg_context or {}).get("case_cards") or []),
+            family_leads=family_leads,
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -7725,10 +7911,24 @@ def _knowledge_base_lines(
         body.append(
             "- Workload topology (stable identity): lookup skipped because the alert has no namespace."
         )
-    prior = kg_context.get("prior_incidents") or []
-    if prior:
-        body.append(f"- This alert recurred in {len(prior)} prior incident(s):")
-        for item in prior[:5]:
+    prior = (kg_context.get("prior_incidents") or [])[:5]
+    same_alert = [item for item in prior if item.get("matched_by") == "same_alert"]
+    similarity = [item for item in prior if item.get("matched_by") != "same_alert"]
+    prior_groups = (
+        (same_alert, f"- This alert recurred in {len(same_alert)} prior incident(s):"),
+        (
+            similarity,
+            (
+                "- Possibly related past incidents (similarity match, not a recurrence "
+                "of this alert):"
+            ),
+        ),
+    )
+    for items, heading in prior_groups:
+        if not items:
+            continue
+        body.append(heading)
+        for item in items:
             incident_id = _short_sentence(
                 active_masker.mask_text(str(item.get("incident_id") or "(unknown)")),
                 limit=80,
@@ -7834,6 +8034,7 @@ def _playbook_lines(
     knowledge: ReportKnowledge,
     allow_remediation: bool = True,
     case_cards: list[dict] | None = None,
+    family_leads: Sequence[str] = (),
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
@@ -7915,7 +8116,11 @@ def _playbook_lines(
         # must not swallow the hedged reference block — an evidence-poor run
         # with a component identity is exactly where these references matter.
         hedged = _insufficient_evidence_playbook_lines(
-            symptom_matches, case_cards, knowledge=knowledge, masker=active_masker
+            symptom_matches,
+            case_cards,
+            knowledge=knowledge,
+            masker=active_masker,
+            family_leads=family_leads,
         )
         if lines:
             return [*lines, *hedged]
@@ -8004,6 +8209,7 @@ def _insufficient_evidence_playbook_lines(
     *,
     knowledge: ReportKnowledge,
     masker: Masker,
+    family_leads: Sequence[str] = (),
 ) -> list[str]:
     """Reference-only guidance for a run that never settled on a cause family.
 
@@ -8014,10 +8220,19 @@ def _insufficient_evidence_playbook_lines(
     reference material -- never as this run's cause -- so the section stops
     dead-ending at "no playbook matched" without pretending to know more than
     the evidence supports.
+
+    ``family_leads`` are families the run points to WITHOUT a keyword match --
+    typically the alert target's own component identity, then ranked
+    candidates -- so an evidence-poor run (a metric alert with no error text)
+    still gets a reference block instead of falling through to "nothing
+    matched" despite carrying a real lead. Also unconfirmed reference
+    material, same as a keyword hit.
     """
     ko = knowledge.language == "ko"
     body: list[str] = []
+    covered_families: set[str] = set()
     for family, symptom in symptom_matches[:2]:
+        covered_families.add(family)
         tag = "(지식 매칭 — 미확정)" if ko else "(knowledge match — unconfirmed)"
         symptom_name = _safe_line(
             _localized_failure_mode_name(symptom, knowledge.language), limit=180, masker=masker
@@ -8032,6 +8247,34 @@ def _insufficient_evidence_playbook_lines(
         )
         if reason:
             body.append(f"  - {reason}")
+    lead_tag = (
+        "(컴포넌트 정체성 기반 — 미확정)" if ko else "(component-identity lead — unconfirmed)"
+    )
+    rendered_leads = 0
+    for family in family_leads:
+        if rendered_leads >= 2:
+            break
+        if family in covered_families:
+            continue
+        lead_actions: list[str] = []
+        for symptom in knowledge.failure_modes.get(family) or []:
+            for action in _localized_failure_mode_actions(symptom, knowledge.language):
+                if action not in lead_actions:
+                    lead_actions.append(action)
+                if len(lead_actions) >= 3:
+                    break
+            if len(lead_actions) >= 3:
+                break
+        if not lead_actions:
+            # No knowledge for this family to reference -- skip it silently
+            # rather than render a bare, actionless header.
+            continue
+        covered_families.add(family)
+        rendered_leads += 1
+        body.append(f"- **{_family_label(family)}** {lead_tag}")
+        body.extend(
+            f"  - {_safe_line(action, limit=360, masker=masker)}" for action in lead_actions
+        )
     body.extend(_external_reference_case_lines(case_cards or [], ko, masker))
     if not body:
         # Nothing to reference: the caller renders its own fallback (or keeps
@@ -8424,10 +8667,13 @@ def _already_answered(question: str, held_text: str) -> bool:
     return hits / len(words) >= 0.6
 
 
-def _executed_evidence_queries(artifacts: list[object], limit: int = 12) -> list[str]:
-    queries: list[str] = []
+def _executed_query_ledger(artifacts: list[object]) -> list[str]:
+    """Compact receipts for LLM-generated drill-down and ad-hoc queries."""
+    ledger: list[str] = []
     seen: set[str] = set()
     for item in artifacts:
+        if getattr(item, "type", "") not in {"drilldown_query", "adhoc_query"}:
+            continue
         query = getattr(item, "query", None)
         if not isinstance(query, str):
             continue
@@ -8435,17 +8681,17 @@ def _executed_evidence_queries(artifacts: list[object], limit: int = 12) -> list
         if not compact or compact in seen:
             continue
         seen.add(compact)
-        queries.append(compact)
-        if len(queries) == limit:
+        ledger.append(f"{getattr(item, 'agent', '')}: {compact[:140]}")
+        if len(ledger) == 30:
             break
-    return queries
+    return ledger
 
 
 def _held_evidence_summaries(
     artifacts: list[object], eligible_support_ids: set[str] | None, limit: int = 12
 ) -> list[str]:
     """What an eligible artifact already SAYS -- R4's other half. Query strings
-    alone (``_executed_evidence_queries``) tell a reader what was ASKED, not
+    alone (``_executed_query_ledger``) tell a reader what was ASKED, not
     what came back, so a probe that ran and returned "gpu_capacity 8 /
     gpu_requested 8" gave no signal that the question was already answered."""
     out: list[str] = []
@@ -8482,20 +8728,29 @@ async def _sharpen_operator_questions(
         "to any query in the already-executed evidence list, and never ask for "
         "something an item in held_evidence already states; target only genuinely "
         "missing evidence. "
+        + (
+            "If a listed query's data mattered but it was empty, phrase the item as "
+            "'Already checked <short paraphrase> in the incident window and it was "
+            "empty; capture it if the issue recurs' instead of a request. "
+            if executed_queries
+            else ""
+        )
         + ("반드시 한국어로 작성하세요. " if ko else "Write in English. ")
         + 'Respond with ONLY JSON: {"questions": [str, ...]} containing 2 to 4 questions.'
     )
-    user = _build_settings_masker(settings).mask_text(json.dumps(
-        {
-            "draft_questions": questions,
-            "missing_data": missing,
-            "plan": plan.as_dict() if plan else {},
-            "already_executed_evidence_queries": executed_queries or [],
-            "held_evidence": held_evidence or [],
-        },
-        ensure_ascii=False,
-        default=str,
-    ))
+    prompt = {
+        "draft_questions": questions,
+        "missing_data": missing,
+        "plan": plan.as_dict() if plan else {},
+        "already_executed_evidence_queries": [],
+        "held_evidence": held_evidence or [],
+    }
+    if executed_queries:
+        prompt.pop("already_executed_evidence_queries")
+        prompt["executed_query_ledger"] = executed_queries
+    user = _build_settings_masker(settings).mask_text(
+        json.dumps(prompt, ensure_ascii=False, default=str)
+    )
     data = await complete_json(
         settings,
         system=system,

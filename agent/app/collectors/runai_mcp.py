@@ -14,6 +14,7 @@ the reason before falling back to its direct HTTP reads.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from uuid import UUID
 
@@ -29,6 +30,8 @@ from app.mcp_client import (
     mcp_tls_verify,
     mcp_tool_json,
 )
+
+_log = logging.getLogger(__name__)
 
 
 async def gather_runai_via_mcp(
@@ -127,6 +130,84 @@ async def _gather_physical_inventory(
             headers=headers,
         )
     ]
+
+
+async def fetch_quantity_scope_inputs(
+    settings: Settings, target: AnalysisTarget
+) -> tuple[Any, Any | None, bool]:
+    """Read the two authenticated MCP payloads used only for scope derivation."""
+    from app.collectors.runai import _runai_headers
+
+    headers, _warnings = await _runai_headers(settings)
+    if not headers.get("Authorization"):
+        raise RuntimeError("Run:ai MCP authentication is unavailable")
+    cluster_id = await resolve_runai_cluster_id(settings, target)
+
+    async def call(tool: str) -> Any:
+        result = await mcp_call(
+            settings.runai_mcp_url,
+            tool,
+            {"clusterId": cluster_id},
+            headers=headers,
+        )
+        if getattr(result, "isError", False):
+            raise RuntimeError(mcp_error(result) or f"MCP {tool} failed")
+        return _tool_json(result)
+
+    inventory = await call("get_cluster_physical_inventory")
+    try:
+        health = await call("get_cluster_infrastructure_health")
+    except Exception as exc:  # noqa: BLE001 - Kubernetes may still nominate safely
+        _log.warning("quantity scope health call failed: %s", _safe_text(str(exc), limit=300))
+        return inventory, None, True
+    return inventory, health, False
+
+
+def runai_inventory_gpu_deficit(payload: Any) -> int | None:
+    """Strictly parse totals.gpusTotal - totals.gpusAllocatable."""
+    totals = payload.get("totals") if isinstance(payload, dict) else None
+    if not isinstance(totals, dict):
+        return None
+    total = totals.get("gpusTotal")
+    allocatable = totals.get("gpusAllocatable")
+    if (
+        isinstance(total, bool)
+        or not isinstance(total, int)
+        or isinstance(allocatable, bool)
+        or not isinstance(allocatable, int)
+        or total < 0
+        or allocatable < 0
+        or allocatable > total
+    ):
+        return None
+    return total - allocatable
+
+
+def runai_health_gpu_node(payload: Any, deficit: int) -> tuple[str, bool] | None:
+    """Return (matching node, health-list-empty), or None for malformed input."""
+    unhealthy = payload.get("unhealthyNodes") if isinstance(payload, dict) else None
+    if not isinstance(unhealthy, list):
+        return None
+    candidates: list[tuple[str, int]] = []
+    for row in unhealthy:
+        if not isinstance(row, dict):
+            return None
+        name = row.get("name")
+        gpus = row.get("gpus")
+        count = gpus.get("count") if isinstance(gpus, dict) else None
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+        ):
+            return None
+        if count > 0:
+            candidates.append((name.strip(), count))
+    if len(candidates) != 1 or candidates[0][1] != deficit:
+        return "", not unhealthy
+    return candidates[0][0], False
 
 
 async def _call_tool(

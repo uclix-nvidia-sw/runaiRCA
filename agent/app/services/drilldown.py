@@ -851,8 +851,13 @@ async def _run_query(
                         or args.get("component")
                         or args.get("family")
                         or ""
-                    )[:200],
-                    "summary": str(outcome.get("summary") or error or ""),
+                    )[:120],
+                    "summary": str(outcome.get("summary") or error or "")[:160],
+                    # case_lookup legitimately has no "source" (it answers from
+                    # TypeDB-backed external-case retrieval, not the catalog/
+                    # ontology dichotomy the other four tools tag their answer
+                    # with) -- "" is the honest value, not a bug.
+                    "source": str(outcome.get("source") or "")[:32],
                 }
             )
         return False
@@ -1569,6 +1574,13 @@ def _system_prompt(agent: str, tools: dict[str, dict[str, Any]]) -> str:
         "registry and resolve their placeholders from the incident scope. External-case "
         "investigation leads are also unverified hypotheses, not evidence or fixes; use them "
         "only to choose a narrow query available in your registry.\n"
+        "- When you form or revise a hypothesis, first check what is already known: call "
+        "knowledge_lookup (your hypothesis), case_lookup (a verbatim observed error line), "
+        "xid_lookup (an XID number you saw), component_checks (the platform component you are "
+        "investigating), or steps_lookup (a candidate family). Batch the lookup alongside your "
+        "evidence queries in the same round. Its answer is guidance to TEST with your own "
+        "domain tools — never evidence and never something to re-report; one lookup per new "
+        "hypothesis is enough.\n"
         "- operator_already_attempted lists fixes the operator says they ALREADY applied "
         "without resolving the problem. Treat each as a fact about the system, not as "
         "evidence and not as a refutation: verify it actually took effect (the live spec, "

@@ -321,6 +321,74 @@ def test_component_and_catalog_reach_the_rendered_report() -> None:
     assert "COMPONENT-CHECK" not in actions and "CATALOG-ACTION" not in actions
 
 
+# --- P1-C: the insufficient_evidence hedge consumes a family lead ----------
+#
+# The real gap: a metric alert has no error text, so symptom_matches and
+# case_cards are both empty and the hedge (_insufficient_evidence_playbook_
+# lines) rendered nothing -- despite the run holding a component-identity or
+# ranked-candidate family lead. _detail_from now builds family_leads from
+# plan.component's family (runai_architecture.yaml) and the ranked candidates
+# and threads it through _playbook_lines.
+
+
+def _detail_with_cause_specific_actions_allowed(**kwargs) -> str:
+    # _evidence_free_detail hard-codes eligible_support_ids=set() (empty, not
+    # None), which makes allow_cause_specific_actions False and short-circuits
+    # _playbook_lines before family_leads ever renders -- exactly the
+    # "General Guidance is still available when remediation is withheld" case
+    # that file's own tests exercise. The family_leads hedge is a
+    # cause-specific action, so it needs eligible_support_ids=None here
+    # (unscoped-but-allowed) instead.
+    return pipeline._detail_from(
+        AlertAnalysisRequest(
+            alert=Alert(
+                status="firing",
+                labels={"alertname": "OperatorRequestedAnalysis"},
+                annotations={"summary": "runai 스케줄링 오류가 나면 어떻게 하나요?"},
+            )
+        ),
+        [],
+        [],
+        eligible_support_ids=None,
+        **{"knowledge": ReportKnowledge(failure_modes=SCHEDULING_MODES), **kwargs},
+    )
+
+
+def test_component_identity_family_feeds_the_insufficient_evidence_hedge() -> None:
+    components = {
+        "runai-scheduler-default": {
+            "purpose": "Places Run:ai workloads onto GPUs.",
+            "failure_effect": "COMPONENT-EFFECT workloads stay Pending.",
+            "checks": ["COMPONENT-CHECK kubectl logs -n runai deploy/runai-scheduler-default"],
+            "family": "runai_scheduling_quota",
+        }
+    }
+    detail = _detail_with_cause_specific_actions_allowed(
+        root_cause_candidates=[
+            RankedCause(family="insufficient_evidence", confidence="low", score=0.0)
+        ],
+        plan=InvestigationPlan(component="runai-scheduler-default"),
+        knowledge=ReportKnowledge(failure_modes=SCHEDULING_MODES, components=components),
+    )
+    playbook = detail.split("### Troubleshooting Playbook", 1)[1].split("### ", 1)[0]
+    assert "(component-identity lead — unconfirmed)" in playbook
+    assert "ONTOLOGY-PREEMPT" in playbook
+
+
+def test_ranked_candidates_feed_the_insufficient_evidence_hedge() -> None:
+    # No plan/component at all -- the lead comes purely from a lower-ranked,
+    # non-insufficient_evidence candidate.
+    detail = _detail_with_cause_specific_actions_allowed(
+        root_cause_candidates=[
+            RankedCause(family="insufficient_evidence", confidence="low", score=0.0),
+            RankedCause(family="runai_scheduling_quota", confidence="low", score=1.0),
+        ],
+    )
+    playbook = detail.split("### Troubleshooting Playbook", 1)[1].split("### ", 1)[0]
+    assert "(component-identity lead — unconfirmed)" in playbook
+    assert "ONTOLOGY-PREEMPT" in playbook
+
+
 def test_supported_run_gets_no_general_guidance() -> None:
     detail = pipeline._detail_from(
                  AlertAnalysisRequest(

@@ -216,6 +216,61 @@ func TestAnalysisRunStoresUsageAndPreservesLastGoodMetadataOnReanalysis(t *testi
 	}
 }
 
+// TestAnalysisRunPersistsKnowledgeConsultations covers P1-A's backend half:
+// response.context["knowledge_consultations"] (agent/app/services/pipeline.py)
+// is a JSON ARRAY of receipt objects, not an object -- it decodes to []any,
+// not the map[string]any the rest of metadataFromAgentContext's allowlist
+// loop expects. This pins that the []any shape actually survives into
+// persisted run metadata (a plain string append to that loop's key list
+// would silently never match the type assertion).
+func TestAnalysisRunPersistsKnowledgeConsultations(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "knowledge-consult"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-knowledge-consult",
+	})
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	rows := []any{
+		map[string]any{
+			"agent":   "kubernetes",
+			"tool":    "knowledge_lookup",
+			"query":   "OOMKilled",
+			"summary": "1 known symptom(s), 0 known issue(s) — guidance to test, not evidence",
+			"source":  "catalog_fallback",
+		},
+	}
+	completed, ok := store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "done",
+		Context: map[string]any{
+			"knowledge_consultations": rows,
+			// P2-E's derivation receipt is map-shaped, so the allowlist loop
+			// handles it — pin that the key is actually in the list.
+			"scope_derivation": map[string]any{
+				"dimension":     "node",
+				"value":         "dgx02",
+				"evidence_role": "scope_seed_not_causal_evidence",
+			},
+		},
+	})
+	if !ok {
+		t.Fatalf("complete failed")
+	}
+	got, ok := completed.Metadata["knowledge_consultations"].([]any)
+	if !ok || len(got) != 1 {
+		t.Fatalf("knowledge_consultations metadata missing or wrong shape: %+v", completed.Metadata)
+	}
+	derivation, ok := completed.Metadata["scope_derivation"].(map[string]any)
+	if !ok || derivation["value"] != "dgx02" {
+		t.Fatalf("scope_derivation metadata missing or wrong shape: %+v", completed.Metadata)
+	}
+	row, ok := got[0].(map[string]any)
+	if !ok || row["tool"] != "knowledge_lookup" || row["source"] != "catalog_fallback" {
+		t.Fatalf("knowledge_consultations row did not round-trip: %+v", got[0])
+	}
+}
+
 func TestFailedReanalysisRestoresLastGoodMetadata(t *testing.T) {
 	store := NewStore()
 	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "metadata-restore"}, Alert{
@@ -2263,5 +2318,78 @@ func TestPostAnalysisSimilarIncidentsSkipsStaleCompletion(t *testing.T) {
 	got, ok := store.PostAnalysisSimilarIncidentsForIncident("INC-stale-guard")
 	if !ok || len(got) != 1 || got[0].IncidentID != "INC-fresh-match" {
 		t.Fatalf("a stale refresh clobbered the newer completion's snapshot: ok=%t got=%+v", ok, got)
+	}
+}
+
+func TestAnalysisRunListIsSlimAndDetailStaysFull(t *testing.T) {
+	server := NewServer()
+	incident, alert := seedAlert(t, server, "fp-slim-list")
+	run := server.store.CreateAnalysisRun("manual", "alert", alert.AlertID, incident.IncidentID, alert.AlertID, "Manual", "why is it stuck")
+	if _, ok := server.store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		Status:          "ok",
+		AnalysisSummary: "Queue gpu-a saturated.",
+		AnalysisDetail:  "## Root Cause\n\nQuota exhausted.",
+		Context:         map[string]any{"llm_usage": map[string]any{"total_tokens": float64(42)}},
+		Artifacts: []Artifact{{
+			EvidenceID: "EV-1",
+			Agent:      "k8s",
+			Source:     "kubectl",
+			Type:       "pod_events",
+			Status:     "SUPPORTS",
+			Confidence: "high",
+			Query:      "kubectl get events -n runai",
+			Result:     map[string]any{"huge": "payload"},
+			Summary:    "Events show preemption.",
+		}},
+	}); !ok {
+		t.Fatalf("could not complete seeded run")
+	}
+
+	rec := httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/analysis-runs", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var list struct {
+		Data []AnalysisRun `json:"data"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&list); err != nil || len(list.Data) != 1 {
+		t.Fatalf("list decode err=%v items=%d", err, len(list.Data))
+	}
+	item := list.Data[0]
+	if item.AnalysisDetail != "" || item.Metadata != nil {
+		t.Fatalf("list row not slim: detail=%q metadata=%v", item.AnalysisDetail, item.Metadata)
+	}
+	if item.AnalysisSummary != "Queue gpu-a saturated." || item.Prompt != "why is it stuck" {
+		t.Fatalf("list row lost summary/prompt: %+v", item)
+	}
+	if len(item.Artifacts) != 1 {
+		t.Fatalf("list row lost artifacts: %+v", item.Artifacts)
+	}
+	artifact := item.Artifacts[0]
+	if artifact.Query != "" || artifact.Result != nil {
+		t.Fatalf("list artifact not slim: query=%q result=%v", artifact.Query, artifact.Result)
+	}
+	if artifact.Agent != "k8s" || artifact.Status != "SUPPORTS" || artifact.Summary != "Events show preemption." {
+		t.Fatalf("list artifact lost identity fields: %+v", artifact)
+	}
+
+	rec = httptest.NewRecorder()
+	server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/analysis-runs/"+run.RunID, nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detail status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var detail struct {
+		Data AnalysisRun `json:"data"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&detail); err != nil {
+		t.Fatalf("detail decode err=%v", err)
+	}
+	full := detail.Data
+	if full.AnalysisDetail == "" || full.Metadata == nil {
+		t.Fatalf("detail endpoint went slim: detail=%q metadata=%v", full.AnalysisDetail, full.Metadata)
+	}
+	if len(full.Artifacts) != 1 || full.Artifacts[0].Query == "" || full.Artifacts[0].Result == nil {
+		t.Fatalf("detail endpoint lost artifact payload: %+v", full.Artifacts)
 	}
 }

@@ -200,6 +200,30 @@ def test_query_rejection_warning_is_not_labeled_mcp_unavailable() -> None:
     assert "MCP unavailable" not in warning
 
 
+def test_fallback_warning_names_the_source_datasource() -> None:
+    # Root cause of a live run whose warning could not be attributed to a
+    # datasource without cluster-side probing: the transport-fallback branch
+    # dropped the caller's ``source`` on the floor. The constant prefix must
+    # survive verbatim (existing substring matchers key off it) with the
+    # source parenthesized right after it.
+    warning = mcp_client.mcp_fallback_warning(
+        RuntimeError("self-signed certificate"), source="Kubernetes"
+    )
+
+    assert warning == (
+        f"{mcp_client.MCP_FALLBACK_WARNING} (Kubernetes): "
+        "RuntimeError: self-signed certificate"
+    )
+    assert warning.startswith(mcp_client.MCP_FALLBACK_WARNING)
+
+
+def test_fallback_warning_omits_empty_parens_without_a_source() -> None:
+    warning = mcp_client.mcp_fallback_warning(RuntimeError("boom"), source="")
+
+    assert warning == f"{mcp_client.MCP_FALLBACK_WARNING}: RuntimeError: boom"
+    assert "(" not in warning
+
+
 def test_mcp_tool_json_masks_structured_and_raw_text() -> None:
     structured = mcp_client.mcp_tool_json(
         _Result(structured={"message": "ok", "api_key": "mcp-structured-secret-12345"})

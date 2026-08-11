@@ -920,11 +920,91 @@ async def test_operator_question_prompt_includes_already_executed_queries(monkey
         None,
         AnalysisTarget("", "", "", "", "", "", "", "", "", "warning", "X"),
         "Check the remaining evidence gap.",
-        ["kubectl rollout status deployment/permission-manager -n permission-manager"],
+        ["kubernetes: kubectl rollout status deployment/permission-manager -n permission-manager"],
     )
 
     assert "Do not ask the operator to run checks equivalent" in captured["system"]
+    assert "Already checked <short paraphrase> in the incident window" in captured["system"]
+    assert "capture it if the issue recurs" in captured["system"]
+    assert "executed_query_ledger" in captured["user"]
     assert "kubectl rollout status deployment/permission-manager -n permission-manager" in captured["user"]
+
+
+def test_executed_query_ledger_is_filtered_deduplicated_and_bounded() -> None:
+    duplicate = "{namespace=\"runai\"} |= \"XidCriticalError\""
+    artifacts = [
+        artifact(
+            agent="loki",
+            source="loki",
+            type="drilldown_query",
+            status="ok",
+            confidence="medium",
+            summary="empty",
+            query=duplicate,
+        ),
+        artifact(
+            agent="prometheus",
+            source="prometheus",
+            type="metric",
+            status="ok",
+            confidence="medium",
+            summary="not ad hoc",
+            query="up",
+        ),
+        artifact(
+            agent="loki",
+            source="loki",
+            type="adhoc_query",
+            status="ok",
+            confidence="medium",
+            summary="duplicate",
+            query=duplicate,
+        ),
+        *[
+            artifact(
+                agent="kubernetes",
+                source="kubernetes",
+                type="adhoc_query",
+                status="ok",
+                confidence="medium",
+                summary="empty",
+                query=f"query-{index}-" + ("x" * 180),
+            )
+            for index in range(35)
+        ],
+    ]
+
+    ledger = pipeline._executed_query_ledger(artifacts)
+
+    assert len(ledger) == 30
+    assert ledger[0] == f"loki: {duplicate}"
+    assert all("prometheus: up" != line for line in ledger)
+    assert sum(duplicate in line for line in ledger) == 1
+    assert all(len(line.split(": ", 1)[1]) <= 140 for line in ledger)
+
+
+@pytest.mark.asyncio
+async def test_operator_question_prompt_is_unchanged_without_query_ledger(monkeypatch) -> None:
+    captured: list[tuple[str, str]] = []
+
+    async def fake_complete_json(*_args, system, user, **_kwargs):
+        captured.append((system, user))
+        return {"questions": ["Which pod is affected?", "Which queue is affected?"]}
+
+    monkeypatch.setattr(pipeline, "complete_json", fake_complete_json)
+    args = (
+        llm_settings(),
+        ["Which pod?", "Which queue?"],
+        ["kubernetes.events"],
+        None,
+    )
+    await pipeline._sharpen_operator_questions(*args)
+    await pipeline._sharpen_operator_questions(*args, executed_queries=[])
+
+    assert captured[0] == captured[1]
+    assert "executed_query_ledger" not in captured[0][1]
+    assert '"already_executed_evidence_queries": []' in captured[0][1]
+    assert "Already checked <short paraphrase>" not in captured[0][0]
 
 
 @pytest.mark.asyncio

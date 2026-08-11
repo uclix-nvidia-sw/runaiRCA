@@ -18,6 +18,7 @@ from app.services.kg_enrichment import (
     _query_external_cases,
     _query_kg,
     _query_remediation,
+    _read_prior_cases,
     _rrf_case_priors,
     _safe_case_card,
     _select_case_cards,
@@ -923,17 +924,64 @@ def test_query_remediation_does_not_flatten_family_actions() -> None:
     assert client.queries == []
 
 
-def test_knowledge_base_section_renders_when_available() -> None:
+def test_knowledge_base_same_alert_prior_claims_recurrence() -> None:
     kg = KGContext(
         enabled=True,
         available=True,
         blast_radius_workloads=3,
-        prior_incidents=[{"incident_id": "inc-1", "analysis_summary": "node disk pressure"}],
+        prior_incidents=[
+            {
+                "incident_id": "inc-1",
+                "analysis_summary": "node disk pressure",
+                "matched_by": "same_alert",
+            }
+        ],
     ).as_dict()
     text = "\n".join(_knowledge_base_lines(kg))
     assert "## Knowledge Base (Ontology)" in text
     assert "Blast radius: 3" in text
+    assert "This alert recurred in 1 prior incident(s)" in text
     assert "inc-1" in text
+
+
+def test_knowledge_base_similarity_prior_does_not_claim_recurrence() -> None:
+    kg = KGContext(
+        enabled=True,
+        available=True,
+        prior_incidents=[
+            {
+                "incident_id": "inc-similar",
+                "analysis_summary": "different alert, similar symptoms",
+                "matched_by": "similarity",
+            }
+        ],
+    ).as_dict()
+
+    text = "\n".join(_knowledge_base_lines(kg))
+
+    assert "This alert recurred" not in text
+    assert "Possibly related past incidents (similarity match, not a recurrence" in text
+    assert "inc-similar" in text
+
+
+def test_knowledge_base_mixed_priors_render_under_correct_headings() -> None:
+    kg = KGContext(
+        enabled=True,
+        available=True,
+        prior_incidents=[
+            {"incident_id": "inc-same", "matched_by": "same_alert"},
+            {"incident_id": "inc-similar", "matched_by": "similarity"},
+        ],
+    ).as_dict()
+
+    lines = _knowledge_base_lines(kg)
+    recurrence = lines.index("- This alert recurred in 1 prior incident(s):")
+    related = lines.index(
+        "- Possibly related past incidents (similarity match, not a recurrence of this alert):"
+    )
+
+    assert "inc-same" in lines[recurrence + 1]
+    assert "inc-similar" in lines[related + 1]
 
 
 def test_knowledge_base_prior_summary_is_single_trimmed_line() -> None:
@@ -950,7 +998,10 @@ def test_knowledge_base_prior_summary_is_single_trimmed_line() -> None:
     ).as_dict()
 
     line = next(line for line in _knowledge_base_lines(kg) if "inc-long" in line)
+    text = "\n".join(_knowledge_base_lines(kg))
     assert "\n" not in line
+    assert "This alert recurred" not in text
+    assert "Possibly related past incidents" in text
     assert "kg-prior-secret-12345" not in line
     assert "[MASKED]" in line
     assert len(line) < 380
@@ -1128,8 +1179,24 @@ def test_case_cards_include_analog_and_different_family_counterexample() -> None
 
 def test_rrf_case_priors_rewards_graph_vector_agreement_without_admitting_raw_memory() -> None:
     prior = [
-        {"incident_id": "I-graph", "case_id": "C-graph", "family": "k8s_storage_error"},
-        {"incident_id": "I-vector", "case_id": "C-vector", "family": "network_fabric_error"},
+        {
+            "incident_id": "I-graph",
+            "case_id": "C-graph",
+            "family": "k8s_storage_error",
+            "matched_by": "same_alert",
+        },
+        {
+            "incident_id": "I-vector",
+            "case_id": "C-vector-similarity",
+            "family": "network_fabric_error",
+            "matched_by": "similarity",
+        },
+        {
+            "incident_id": "I-vector",
+            "case_id": "C-vector-same-alert",
+            "family": "network_fabric_error",
+            "matched_by": "same_alert",
+        },
     ]
     fused = _rrf_case_priors(
         prior,
@@ -1140,8 +1207,43 @@ def test_rrf_case_priors_rewards_graph_vector_agreement_without_admitting_raw_me
     )
 
     assert fused[0]["incident_id"] == "I-vector"
+    assert fused[0]["case_id"] == "C-vector-same-alert"
+    assert fused[0]["matched_by"] == "same_alert"
     assert fused[0]["retrieval"]["sources"] == ["typedb", "vector"]
     assert all(item["incident_id"] != "I-unapproved-memory" for item in fused)
+
+
+def test_read_prior_cases_tags_same_alert_and_similarity_origins() -> None:
+    def run(query: str) -> list[dict]:
+        if "select $iid, $sum, $case_id, $family" in query:
+            return [
+                {
+                    "iid": "I-same",
+                    "case_id": "C-same",
+                    "family": "gpu_hardware_error",
+                    "sum": "same alert",
+                }
+            ]
+        if 'incident_id "I-similar"' in query and "select $sum, $case_id, $family" in query:
+            return [
+                {
+                    "case_id": "C-similar",
+                    "family": "network_fabric_error",
+                    "sum": "similar incident",
+                }
+            ]
+        return []
+
+    prior = _read_prior_cases(
+        run,
+        _target(),
+        [{"incident_id": "I-similar", "similarity": 0.18}],
+    )
+
+    assert [(item["incident_id"], item["matched_by"]) for item in prior] == [
+        ("I-same", "same_alert"),
+        ("I-similar", "similarity"),
+    ]
 
 
 def test_case_cards_mark_component_matched_vector_case_as_bridge() -> None:
@@ -1718,3 +1820,137 @@ def test_non_insufficient_top_family_playbook_unchanged_by_new_branch() -> None:
     assert "Raise the memory limit." in joined
     assert "(knowledge match — unconfirmed)" not in joined
     assert "confirmed diagnosis" not in joined
+
+
+# --- insufficient_evidence playbook: family_leads (P1-C) --------------------
+#
+# A metric alert with no error text has empty symptom_matches AND case_cards,
+# so the hedge above rendered nothing (real incident gap). family_leads --
+# the component-identity family, then ranked candidates -- gives the hedge a
+# reference block even on a pure metric alert.
+
+
+def test_insufficient_evidence_playbook_renders_family_lead_en() -> None:
+    masker = build_masker((r"gpu-worker-9",))
+    failure_modes = {
+        "gpu_hardware_error": [
+            {
+                "symptom": "Xid 79 GPU Fell Off The Bus",
+                "keywords": ["fell off the bus"],
+                "actions": ["Drain and reboot gpu-worker-9 before re-scheduling."],
+            }
+        ]
+    }
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+
+    lines = _playbook_lines(
+        candidates,
+        "pod stuck pending; no error text was observed",  # matches no keyword
+        knowledge=ReportKnowledge(
+            failure_modes=failure_modes, known_issues=[], cases="", masker=masker
+        ),
+        family_leads=["gpu_hardware_error"],
+    )
+    joined = "\n".join(lines)
+
+    assert "The available evidence cannot confirm a root cause" in joined
+    assert "- **GPU hardware error** (component-identity lead — unconfirmed)" in joined
+    assert "Drain and reboot" in joined
+    assert "gpu-worker-9" not in joined
+    assert MASK_TOKEN in joined
+
+
+def test_insufficient_evidence_playbook_renders_family_lead_ko() -> None:
+    masker = build_masker((r"gpu-worker-9",))
+    failure_modes = {
+        "gpu_hardware_error": [
+            {
+                "symptom": "Xid 79 GPU Fell Off The Bus",
+                "keywords": ["fell off the bus"],
+                "actions": ["Drain and reboot gpu-worker-9 before re-scheduling."],
+            }
+        ]
+    }
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+
+    lines = _playbook_lines(
+        candidates,
+        "pod stuck pending; no error text was observed",
+        knowledge=ReportKnowledge(
+            failure_modes=failure_modes, known_issues=[], cases="", language="ko", masker=masker
+        ),
+        family_leads=["gpu_hardware_error"],
+    )
+    joined = "\n".join(lines)
+
+    assert "현재 증거만으로는 원인을 확정할 수 없습니다" in joined
+    assert "- **GPU hardware error** (컴포넌트 정체성 기반 — 미확정)" in joined
+    assert "Drain and reboot" in joined
+    assert "gpu-worker-9" not in joined
+    assert MASK_TOKEN in joined
+
+
+def test_insufficient_evidence_playbook_no_leads_is_byte_identical_to_fallback() -> None:
+    # matches empty + leads empty (the default) must be untouched by P1-C.
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+    observed = "pod recovered after a transient retry; no other signal was observed"
+
+    lines = _playbook_lines(
+        candidates,
+        observed,
+        knowledge=ReportKnowledge(failure_modes={}, known_issues=[], cases=""),
+        family_leads=(),
+    )
+    assert lines == ["- No troubleshooting playbook matched the available evidence yet."]
+
+
+def test_insufficient_evidence_playbook_lead_dedupes_against_keyword_match() -> None:
+    # A lead for a family already rendered by a keyword match must not
+    # duplicate it; a lead for a DIFFERENT family still renders.
+    failure_modes = {
+        "gpu_hardware_error": [
+            {
+                "symptom": "Xid 79 GPU Fell Off The Bus",
+                "keywords": ["fell off the bus"],
+                "actions": ["Reset or replace the GPU."],
+            }
+        ],
+        "node_kubelet_pressure": [
+            {
+                "symptom": "Node Disk Pressure",
+                "keywords": ["diskpressure"],
+                "actions": ["Cordon or drain the node"],
+            }
+        ],
+    }
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+
+    lines = _playbook_lines(
+        candidates,
+        "node reported the gpu fell off the bus during training",
+        knowledge=ReportKnowledge(failure_modes=failure_modes, known_issues=[], cases=""),
+        family_leads=["gpu_hardware_error", "node_kubelet_pressure"],
+    )
+    joined = "\n".join(lines)
+
+    # gpu_hardware_error renders exactly once, in the keyword-match form.
+    assert joined.count("GPU hardware error") == 1
+    assert "(knowledge match — unconfirmed) **Xid 79 GPU Fell Off The Bus**" in joined
+    assert "(component-identity lead — unconfirmed)" in joined
+    assert "- **node kubelet pressure** (component-identity lead — unconfirmed)" in joined
+    assert "Cordon or drain the node" in joined
+
+
+def test_insufficient_evidence_playbook_lead_without_knowledge_is_skipped() -> None:
+    # A lead family absent from the knowledge map has no actions to source --
+    # it is skipped silently, and (nothing else rendering) no header appears.
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+    observed = "pod recovered after a transient retry; no other signal was observed"
+
+    lines = _playbook_lines(
+        candidates,
+        observed,
+        knowledge=ReportKnowledge(failure_modes={}, known_issues=[], cases=""),
+        family_leads=["gpu_hardware_error"],
+    )
+    assert lines == ["- No troubleshooting playbook matched the available evidence yet."]
