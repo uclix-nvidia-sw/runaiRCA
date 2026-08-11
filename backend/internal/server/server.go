@@ -289,6 +289,9 @@ type HostedCostEstimate struct {
 // Prices below were read from those pages on 2026-07-31. Google's Pro tier
 // charges more above a 200k-token prompt; the cheaper band is used here because
 // a single RCA call never reaches it.
+// Sonnet 5: the $2/$10 introductory price was made permanent on 2026-08-10
+// (anthropic.com/news/claude-sonnet-5 edit; the $3/$15 rate scheduled for
+// Sept 1 was withdrawn) — the docs pricing page may lag that announcement.
 var hostedRates = []struct {
 	Provider string
 	Model    string
@@ -296,7 +299,7 @@ var hostedRates = []struct {
 	Out      float64
 }{
 	{"Anthropic", "Claude Opus 5", 5.00, 25.00},
-	{"Anthropic", "Claude Sonnet 5", 3.00, 15.00},
+	{"Anthropic", "Claude Sonnet 5", 2.00, 10.00},
 	{"Anthropic", "Claude Haiku 4.5", 1.00, 5.00},
 	{"OpenAI", "GPT-5.6 Sol", 5.00, 30.00},
 	{"OpenAI", "GPT-5.6 Terra", 2.00, 12.00},

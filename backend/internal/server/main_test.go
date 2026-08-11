@@ -3739,6 +3739,11 @@ func TestHostedCostEstimatesPriceInputAndOutputSeparately(t *testing.T) {
 	if want := 30.0; byModel["Claude Opus 5"] != want {
 		t.Fatalf("Claude Opus 5 estimate = %v, want %v", byModel["Claude Opus 5"], want)
 	}
+	// Claude Sonnet 5 lists at $2 in / $10 out per 1M tokens — the introductory
+	// price made permanent on 2026-08-10 (see the hostedRates comment).
+	if want := 12.0; byModel["Claude Sonnet 5"] != want {
+		t.Fatalf("Claude Sonnet 5 estimate = %v, want %v", byModel["Claude Sonnet 5"], want)
+	}
 	if len(got) != len(hostedRates) {
 		t.Fatalf("expected one estimate per rate row, got %d of %d", len(got), len(hostedRates))
 	}
