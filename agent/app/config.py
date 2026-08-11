@@ -162,9 +162,9 @@ class Settings:
     # mid-`detail` and the run falls back to the deterministic report. Keep this
     # bounded so one generation cannot monopolize the 15-minute analysis deadline.
     llm_synthesis_max_tokens: int = 16384
-    # Short collector insights still need enough room for reasoning models to
-    # spend internal reasoning tokens and emit their requested 1-2 sentences.
-    llm_insight_max_tokens: int = 512
+    # A truncated 512-token reasoning call costs 512 tokens plus its 1024-token retry;
+    # a direct 1024 ceiling is strictly cheaper whenever truncation would occur.
+    llm_insight_max_tokens: int = 1024
     llm_model_insight: str = ""
     # Ceiling applied to LLM calls that pass no explicit max_tokens — the
     # small-output JSON steps (planner refine, drill-down decisions, self-check).
@@ -331,7 +331,7 @@ def load_settings() -> Settings:
         # spend this on reasoning tokens first, but a 32K ceiling can consume most
         # of a 15-minute run before emitting the JSON report.
         llm_synthesis_max_tokens=_int_env("LLM_SYNTHESIS_MAX_TOKENS", 16384),
-        llm_insight_max_tokens=_int_env("LLM_INSIGHT_MAX_TOKENS", 512),
+        llm_insight_max_tokens=_int_env("LLM_INSIGHT_MAX_TOKENS", 1024),
         llm_default_max_tokens=_int_env("LLM_DEFAULT_MAX_TOKENS", 4096),
         analysis_response_max_bytes=max(
             64 << 10,
