@@ -10,6 +10,30 @@
 - **전제조건(구현 착수 차단기)**: Run:ai MCP `get_cluster_physical_inventory`의 **노드별 실제 payload가 레포에 fixture로 없다**(현재 파싱되는 건 집계 `byGpuModel`뿐). 실 클러스터에서 응답 1건을 캡처해 fixture로 박은 뒤에만 파서를 구현한다 — 실측 없는 MCP 계약 커밋 금지 원칙. 캡처 전이면 Kubernetes Nodes 폴백(`nvidia.com/gpu` capacity/allocatable)만으로 1차 구현하는 축소안도 가능.
 - **롤아웃**: 차트 플래그 기본 off → 리플레이/카나리 검증 후 on. 예상 규모 ~180–250 프로덕션 라인 + 150–220 테스트 라인, 6–8 파일.
 
+## 실측 수정 (AMENDMENT, 2026-08-11 payload 캡처 후) — 유도 규칙 확정
+
+운영 클러스터에서 두 MCP 응답을 캡처해 fixture로 커밋했다
+(`agent/tests/fixtures/runai_mcp/cluster_physical_inventory.json`, `cluster_infrastructure_health.json`).
+실측 결과가 아래 §3의 가정을 뒤집는다:
+
+- **inventory에는 per-node 행이 존재하지 않는다** (`byGpuModel` 모델 합계, `byNodePool`/`totals` 집계뿐).
+  설계의 1차 유도식(노드별 physical−allocatable)은 이 payload로 구현 불가 — 설계가 fail-closed로
+  예고한 케이스가 실제로 확인됐다.
+- **확정 유도 규칙 (교차 대조, 원안보다 강함)**:
+  1. inventory `totals`: `deficit = gpusTotal − gpusAllocatable` (두 값 모두 유한 정수 ≥0,
+     allocatable ≤ total). `deficit ≤ 0` → inconclusive.
+  2. health `unhealthyNodes[]`: `gpus.count > 0`인 항목만 후보. **정확히 1개** 존재하고
+     그 `gpus.count == deficit`일 때만 그 `name`을 승격. GPU 보유 unhealthy 노드가 2개 이상이면
+     (합이 맞아떨어져도) inconclusive.
+  3. Kubernetes Nodes 폴백(§3의 unique-positive-deficit 규칙)은 유지하되, inventory 결손값이
+     확보된 상태에서 폴백 결과와 불일치하면 inconclusive.
+- §3의 "health는 노드를 독립 선정할 수 없다" 규칙은 **완화가 아니라 대체**된다: health가 노드를
+  지명하되 inventory의 수량 게이트와 정확 일치해야만 하므로, 두 독립 소스의 합치가 필수가 됐다.
+- 실측 검증: 이 인시던트에서 `16 − 8 = 8` == dgx02(`gpus.count 8`, NotReady/SchedulingDisabled),
+  유일 후보 → 정답 노드가 도출된다.
+- 그 외 정직성 규칙(§4)·실패 봉쇄(§5)·엣지 케이스·테스트 계획은 원안 유지. 전제조건(fixture)은
+  이 캡처로 해소되어 **구현 착수 가능** 상태다.
+
 이하 Codex 설계 원문(영문, 무수정).
 
 ---
