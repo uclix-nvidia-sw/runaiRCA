@@ -26,7 +26,7 @@ import json
 import logging
 import re
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from app.collectors.base import resolve_target
@@ -452,7 +452,11 @@ def _replace_attr(
 
 
 def _iso_or_empty(value: object) -> str:
-    """Keep only ISO-8601 UTC strings; string-backed schema stays compatible."""
+    """Keep only ISO-8601 UTC strings; string-backed schema stays compatible.
+
+    An aware non-UTC offset (e.g. an operator's local +09:00) is converted to
+    the same instant in UTC rather than dropped. Only a naive or unparseable
+    timestamp is genuinely ambiguous, so those still warn-and-drop."""
     text = str(value or "").strip()
     if not text:
         return ""
@@ -461,9 +465,11 @@ def _iso_or_empty(value: object) -> str:
     except ValueError:
         _log.warning("dropping malformed ontology timestamp: %r", text)
         return ""
-    if parsed.tzinfo is None or parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
         _log.warning("dropping non-UTC ontology timestamp: %r", text)
         return ""
+    if parsed.utcoffset().total_seconds() != 0:
+        return parsed.astimezone(UTC).isoformat()
     return text
 
 

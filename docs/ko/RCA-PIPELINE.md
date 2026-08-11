@@ -179,23 +179,46 @@ PromQL을 끌어옵니다. 이는 LLM이 없을 때에도 수집을 반복적으
 | kubernetes | `k8s_read` | 18종 허용 목록, GET/LIST 전용(시크릿 없음) |
 | prometheus | `promql_query` | query 엔드포인트 전용 |
 | loki | `logql_query` | range query 전용 |
-| runai | `runai_api_search` + `runai_api_get` | GET 전용, 경로는 `/api/`로 시작해야 함(메서드 하드코딩) |
+| runai | 고정 `runai_*` view 15종(`runai_workload_summary`, `runai_workload_status`, …) | [공식 Run:ai MCP 서버](#run-ai-mcp-service)에 대한 읽기 전용 래퍼. 자유 인자 없음 — 모든 호출이 알림 자신의 workload/project/node로 사전 스코프됨 |
 | postgres | `sql_select` | 단일 `SELECT`/`WITH`, READ ONLY 트랜잭션, 자동 `LIMIT 50` |
-| *모든* 에이전트 | `knowledge_lookup` | 프로세스 내 카탈로그 조회. 클러스터 호출 없음, 도메인 경계 넘지 않음 |
+| *모든* 에이전트 | `knowledge_lookup`, `case_lookup`, `xid_lookup`, `component_checks`, `steps_lookup` | 온톨로지 우선 / 카탈로그 폴백 조회. 클러스터 호출 없음, 도메인 경계 넘지 않음, 답변은 결코 증거가 되지 않음 |
 
 각 루프는 plan의 `operator_already_attempted` 목록도 함께 받습니다 — 그 조치가 실제로
 적용됐는지 확인하고, 왜 문제가 살아남았는지 설명하는 쿼리를 우선하며, 다음 단계로 다시
 제안하지 말라는 지시와 함께.
 
-`knowledge_lookup`은 루프 도중 "이것에 대해 이미 알려진 것이 무엇인가"에 답하므로, 쿼리를
-세 번 돌린 뒤에 새 가설을 세운 에이전트가 plan 단계에서 가져온 지식에만 묶이지 않습니다.
-랭커가 쓰는 것과 동일한 병합 맵 — 버전 관리되는 카탈로그 + 운영자 승인 런타임 지식 — 을
-읽으므로, plan 작성 이후에 승인된 지식에도 도달합니다. 각 항목은 출처(`curated` /
-`learned` / `novel`)와 `matcher_only`를 함께 실어 보냅니다. novel family는 보고할 root
-cause가 아니라 검증할 안내이기 때문입니다. 이 도구의 답변은 의도적으로 **artifact를 만들지
-않습니다** — 에이전트는 루프 안에서 답을 보고 실행 기록은 `details.knowledge_lookups`에
-남지만, 큐레이션 문구가 관측 증거 텍스트에 들어가면 시그니처 매처가 우리 카탈로그를
-클러스터가 보고한 내용으로 되읽기 때문입니다.
+**모든 에이전트는 하나가 아니라 5개의 읽기 전용 지식 tool을 받습니다** — 쿼리를 세 번
+돌린 뒤에 새 가설을 세운 에이전트가 plan 단계에서 가져온 지식에만 묶이지 않도록:
+
+| Tool | 답하는 질문 | args |
+|---|---|---|
+| `knowledge_lookup` | "이 symptom/가설에 대해 이미 알려진 것이 무엇인가?" — 매칭되는 카탈로그 symptom + 운영자 승인 지식(family, 확인된 remediation), Run:ai known issue | `hypothesis` |
+| `case_lookup` | "외부 벤더 서포트 케이스가 이 에러를 이미 본 적 있는가?" — family, mechanism, 시도한 것(효과 **없었던** 것 포함) | `text`(실제로 관측한 원문 에러/로그 텍스트) |
+| `xid_lookup` | "이 NVIDIA XID는 무슨 뜻인가?" — 정체, 심각도, 해결 안내, 양방향 `leads_to` escalation chain | `xid` |
+| `component_checks` | "이 플랫폼 컴포넌트는 무엇을 하며 어떻게 점검하는가?" — 목적, 실패 영향, 바로 실행 가능한 점검, 직접 의존성 | `component` |
+| `steps_lookup` | "이 family의 다른 케이스는 어떻게 진단됐는가?" — 스레드 순서 그대로의 케이스 간 서포트 진단 step | `family`(닫힌 카탈로그), 선택적 `text` 필터 |
+
+`knowledge_lookup`, `xid_lookup`, `component_checks`는 live TypeDB 온톨로지를 먼저
+조회하고 실패하거나 TypeDB가 비활성화됐을 때 버전 관리되는 YAML 카탈로그로 폴백합니다.
+`steps_lookup`은 그래프 전용입니다 — 케이스별 playbook step(`agent/ontology/
+load_external_cases.py`)은 YAML로 미러링되지 않으므로 저하될 폴백 자체가 없습니다.
+정상적으로 응답한 조회의 `source` 필드는 답이 어디서 왔는지 말해 줍니다: `ontology`(live
+그래프), `catalog_fallback`(내장 YAML), `unavailable`(온톨로지도 폴백도 없음 —
+TypeDB가 꺼져 있거나 도달 불가능할 때의 `steps_lookup`), `unresolved`(어떤 지식 소스도
+참조하기 전에 로컬 이름 해석 자체가 실패 — 이름을 모르는 컴포넌트를 물은 `component_checks`).
+`case_lookup`의 외부 케이스 검색은 TypeDB 전용이며 별도의 `source` 필드를 싣지 않습니다.
+TypeDB가 꺼져 있거나 도달 불가능하거나 시간 초과되면 "no external support case matches
+that text"라는 빈 결과로 조용히 저하됩니다.
+
+`knowledge_lookup`은 랭커가 쓰는 것과 동일한 병합 맵 — 버전 관리되는 카탈로그 + 운영자
+승인 런타임 지식 — 을 읽으므로, plan 작성 이후에 승인된 지식에도 도달합니다. 각 항목은
+출처(`curated` / `learned` / `novel`)와 `matcher_only`를 함께 실어 보냅니다. novel
+family는 보고할 root cause가 아니라 검증할 안내이기 때문입니다.
+
+다섯 tool의 답변은 모두 의도적으로 **artifact를 만들지 않습니다** — 에이전트는 자신의
+추론 루프 안에서 답을 보고 실행 기록은 `details.knowledge_lookups`에 남지만, 큐레이션
+문구가 관측 증거 텍스트에 들어가면 시그니처 매처가 우리 카탈로그를 클러스터가 보고한
+내용으로 되읽기 때문입니다.
 
 postgres 에이전트는 `RUNAI_DB_DSN`이 설정되면 RCA 스토어뿐 아니라 **Run:ai 컨트롤 플레인
 데이터베이스 자체**에 질의합니다(workloads/audit/authorization/… 스키마). 도구 설명은
@@ -344,6 +367,16 @@ cap에 걸려 리포트가 들어갈 때보다 짧게 돌아오곤 했기 때문
 **의존성 점검 순서**(예: `cluster-sync → status-updater → runai-backend-traefik`), 그리고 바로
 실행 가능한 `kubectl` 점검을 [아키텍처 토폴로지](KNOWLEDGE-BASE.md)에서 가져와 덧붙입니다.
 
+**run이 끝내 family를 확정하지 못하면** (`insufficient_evidence`), Troubleshooting
+Playbook과 "### Knowledge Base (Ontology)" 부록 모두 침묵하거나 과신하는 대신 명시적으로
+헤지된 형태로 전환됩니다: 랭커가 채택하지 않은 cross-family symptom 매치를 최대 2개까지
+`(지식 매칭 — 미확정)`으로 태그해 보여 주고, 여기에 가장 잘 매칭된 외부 서포트 케이스
+하나를 더합니다 — 그 케이스가 기록한 결과에서 뽑은 "당시 유효했던 조치" / "당시 효과
+없던 조치", 또는 기록된 fix가 없을 때는 "당시 지원팀의 진단 수순 참고 가능"이라는
+안내입니다. 헤더는 이 항목들이 축적된 지식과 과거 사례에 근거한 참고 조치일 뿐 확정
+진단이 아니라고 명시적으로 밝힙니다. 랭킹 자체는 건드리지 않습니다 — 헤드라인 원인이
+되지 못한 family에 대해 playbook이 무엇을 렌더링하는지만 바뀝니다.
+
 ## 9. Runtime harness
 
 Synthesis 뒤에는 응답 경계 하네스가 artifact에 `E01`, `E02` ID를 부여하고 root-cause
@@ -363,7 +396,7 @@ self-check 전후 confidence, 그리고 harness 점수·hard gate·수정 횟수
 
 - **`title`** — 사람이 읽는 카드 이름(`파드 조회`, `메트릭 조회 (PromQL)`, `DB 조회 (SQL)`).
 - **`query`** — 재실행할 *실제* 명령: `kubectl get pods t-0 -n runai`, 원시 PromQL/LogQL/SQL,
-  `GET /api/v1/workloads?name=…` — 결코 내부 파라미터 덤프가 아닙니다.
+  `MCP get_workload_status {…}` — 결코 내부 파라미터 덤프가 아닙니다.
 - **`highlights`** — 결과에서 추출한 문제 신호(`salient_markers`: `CrashLoopBackOff`, `Xid 79`,
   `no space left`, … — 문자열 리프만 스캔하며, 결코 JSON 키가 아님). Frontend는 이를 빨간색으로
   표시하여 상용구보다 발견 사항이 먼저 읽히도록 합니다.
@@ -375,8 +408,9 @@ self-check 전후 confidence, 그리고 harness 점수·hard gate·수정 횟수
 
 - **구조적으로 읽기 전용**: 수집기와 드릴다운 도구는 읽기만 합니다. Kubernetes 읽기는 종별 허용
   목록, pod-exec는 거부 목록(denylist)으로 게이트되어 상태를 바꾸는 명령, shell/인터프리터,
-  shell 메타문자를 차단하고 shell 없이 단일 argv만 실행합니다. Run:ai는 `/api/` 아래 GET 전용, SQL은 READ ONLY
-  트랜잭션의 `SELECT`.
+  shell 메타문자를 차단하고 shell 없이 단일 argv만 실행합니다. Run:ai 드릴다운은 알림 범위로
+  사전 스코프된 공식 MCP 읽기 view 고정 세트를 거치고(수집기의 직접 REST 읽기는 GET 전용),
+  SQL은 READ ONLY 트랜잭션의 `SELECT`.
 - **프롬프트 인젝션 가드**(`agent/app/llm.py`): 수집된 텍스트(로그, 이벤트, 알림 어노테이션)는
   클러스터 쓰기가 가능하므로, 임베디드 명령을 데이터로 선언하는 가드가 **모든** LLM 시스템
   프롬프트에 덧붙여집니다. `operator_prompt`가 유일하게 의도된 명령 채널입니다.

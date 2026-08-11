@@ -106,7 +106,22 @@ diagnostic step (the walk and all probe IDs live there), and per-domain
 runbooks (`…:domain:gpu_stack`, `…:domain:runai_scheduling`, …) group the same
 steps so browsing shows the real coverage instead of "Kubernetes only".
 External support cases add per-case playbook runbooks (`ext:…:playbook`) with
-the diagnostic steps the vendor thread actually walked.
+the diagnostic steps the vendor thread actually walked, each stamped with its
+`outcome` (`diagnostic` or `preventive`) and an `interpretation` of what the
+thread actually observed at that step. A `runbook_for` edge links a case's
+playbook to its incident, so the `steps_for_family` function can pull every
+case's steps for one root-cause family across the whole casebook — not only
+the one case a live investigation happens to match — surfaced mid-analysis
+through the `steps_lookup` tool (see
+[RCA Pipeline](RCA-PIPELINE.md#4-per-collector-autonomous-drill-down)).
+
+Three of the executable tree's newest branches —
+`backend_nfs_unresponsive_retry`, `runai_stale_workload_reference`, and
+`thanos_receive_ingestion_pressure` — started as exactly this kind of
+per-case playbook entry. Once the pattern proved worth checking on every
+future incident, not only the one case that surfaced it, a curator promoted
+it into a full executable node: its own match condition, probe, and
+differential `alternatives`.
 
 ## 3. Ingestion: how safe knowledge enters TypeDB
 
@@ -170,6 +185,18 @@ alternative branches, disconfirmations, and declarative probe templates. Only
 alert-scope placeholders resolve. No directive executes anything; each agent's
 registered tool set is the enforcement boundary.
 
+Retrieval is not frozen at plan time. Mid-analysis, every evidence agent can
+also pull the same knowledge on demand through five read-only tools —
+`knowledge_lookup`, `case_lookup`, `xid_lookup`, `component_checks`, and
+`steps_lookup` — each querying the live ontology first and falling back to the
+version-controlled catalog (`steps_lookup` is graph-only: per-case playbook
+steps are never mirrored to YAML, so there is no fallback to degrade to).
+Their answers are guidance to test, never evidence: they never become an
+artifact, so a signature matcher can never read our own catalog back as
+something the cluster reported. See
+[RCA Pipeline](RCA-PIPELINE.md#4-per-collector-autonomous-drill-down) for the
+full tool table and the `source` vocabulary.
+
 ## 5. Worked example: NVIDIA Xid 79
 
 | Moment | System behaviour | Operator-visible result |
@@ -182,6 +209,10 @@ registered tool set is the enforcement boundary.
 The graph avoids a generic “GPU issue” response. It does not turn Xid text alone
 into a verdict. Missing target scope, post-resolution observations, or
 contradictory live evidence remain context rather than proof.
+
+A drill-down agent that encounters a *different* XID mid-investigation is not
+stuck waiting for a new plan: it can call the `xid_lookup` tool itself to pull
+that code's identity and escalation chain on the spot.
 
 ## 6. Studio checks and operations
 
@@ -231,6 +262,7 @@ afterward so TypeDB Studio does not collect test databases.
 | Symptom | A named observable pattern, such as an XID or scheduling event |
 | Known issue | Curated product behaviour/bug with version-aware context |
 | Probe | One bounded, read-only evidence check |
+| Knowledge tool | A mid-analysis, read-only lookup every evidence agent can call; ontology first, catalog fallback, never evidence for the current run |
 | Diagnostic directive | Planner guidance: questions, checks, branches, and safe templates |
 | Blackboard | The evidence ledger that compares support and refutation |
 | Evidence card | An operator-readable record of one probe observation |

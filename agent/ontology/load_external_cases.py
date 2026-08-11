@@ -35,7 +35,7 @@ import argparse
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -181,10 +181,21 @@ def _supporting_evidence_ids(payload: dict[str, Any]) -> list[str]:
 def _clean_keyword(sig: Any) -> str:
     """Strip a trailing curator annotation like `(reported, raw log unavailable)`
     (which would never appear in a real log, so it's a dead keyword) and collapse
-    whitespace. Salvages the real signal preceding the annotation."""
+    whitespace. Salvages the real signal preceding the annotation.
+
+    Signatures the sanitizer masked in place — `nfs: server <address> not
+    responding, still trying` — can never substring-match real text (real logs
+    carry an actual IP/hostname where the placeholder sits), so the whole
+    keyword was dead. Keep the longest literal fragment around the placeholder
+    instead; the generic-token gate downstream still applies to the salvage."""
     text = re.sub(
         r"\s*\([^)]*(?:reported|unavailable)[^)]*\)\s*$", "", str(sig), flags=re.IGNORECASE
     )
+    if re.search(r"<[^<>]{1,40}>", text):
+        fragments = [
+            fragment.strip(" \t:,-") for fragment in re.split(r"<[^<>]{1,40}>", text)
+        ]
+        text = max(fragments, key=len, default="")
     return " ".join(text.split())
 
 
@@ -383,6 +394,19 @@ def _to_incident(
         "approved_by": approved_by,
         "searchable_context": payload.get("searchable_context") or {},
         "historical_actions": payload.get("historical_actions") or [],
+        # Bounded evidence projection so a hint can say what an action found,
+        # not just what it was. No `supports`/`source_message_ids`: those name
+        # F00x/H00x/M00x ids that are never shipped in this payload.
+        "evidence_refs": [
+            {
+                "evidence_id": str(e.get("evidence_id") or ""),
+                "source": str(e.get("source_actor") or "external"),
+                "kind": str(e.get("evidence_kind") or "statement"),
+                "summary": " ".join(str(e.get("masked_summary") or "").split())[:240],
+            }
+            for e in payload.get("evidence_refs") or []
+            if e.get("evidence_id")
+        ],
         "context": {"incident_status_at_approval": status},
         "family_candidates": _family_candidates(payload),
         "failure_mode_matches": _knowledge_links_matches(
@@ -542,7 +566,8 @@ def _delete_playbook(tx: Any, incident_id: str) -> None:
         f'match $s isa diagnostic_step, has runbook_name "{name}"; '
         f"$x isa diagnostic_transition(prior: $s); delete $x;"
     ).resolve()
-    for relation in ("runbook_entry", "runbook_contains"):
+    # runbook_for must go before the runbook itself is deleted (below).
+    for relation in ("runbook_entry", "runbook_contains", "runbook_for"):
         tx.query(
             f'match $r isa runbook, has name "{name}"; '
             f"$x isa {relation}(runbook: $r); delete $x;"
@@ -606,9 +631,31 @@ def _sweep_missing_cases(settings: Any, keep_ids: set[str]) -> tuple[list[str], 
     return removed, failed
 
 
+def _observed_from_evidence(action: dict[str, Any], evidence_refs: list[Any]) -> str:
+    """<=2 masked summaries for one playbook action's evidence_ids, resolved
+    through the SAME case_card["evidence_refs"] projection kg_enrichment's
+    external-case hint path reads (see _to_incident) -- joined and capped.
+    "" when nothing resolves (e.g. a diagnostic step that cited no evidence)."""
+    summaries = {
+        str(ref["evidence_id"]): str(ref.get("summary") or "").strip()
+        for ref in evidence_refs
+        if isinstance(ref, dict) and ref.get("evidence_id")
+    }
+    evidence_ids = action.get("evidence_ids")
+    if not isinstance(evidence_ids, list):
+        return ""
+    observed = [
+        " ".join(summaries[key].split())
+        for eid in evidence_ids
+        if (key := str(eid)) in summaries and summaries[key]
+    ]
+    return " / ".join(observed[:2])[:400]
+
+
 def _write_diagnostic_playbook(tx: Any, inc: OntologyIncident) -> None:
     """Mirror the support thread's diagnostic/preventive steps one-by-one as a
-    per-case mini-runbook of ``diagnostic_step`` entities.
+    per-case mini-runbook of ``diagnostic_step`` entities, linked to its
+    incident by ``runbook_for`` for cross-case retrieval (``steps_for_family``).
 
     These are the commands/checks actually exchanged with vendor support —
     valuable as an ordered sequence, not as resolved_by fixes. The runbook name
@@ -617,12 +664,13 @@ def _write_diagnostic_playbook(tx: Any, inc: OntologyIncident) -> None:
     per case: rerunning the loader must not duplicate steps."""
     from app.ontology.typedb_client import escape_typeql as esc
 
-    leads = [
-        str(action.get("normalized_action") or "").strip()
-        for action in inc.case_card.get("historical_actions") or []
-        if str(action.get("outcome") or "").strip() in _PLAYBOOK_STEP_OUTCOMES
-        and str(action.get("normalized_action") or "").strip()
-    ]
+    evidence_refs = inc.case_card.get("evidence_refs") or []
+    leads: list[tuple[str, str, str]] = []
+    for action in inc.case_card.get("historical_actions") or []:
+        outcome = str(action.get("outcome") or "").strip()
+        statement = str(action.get("normalized_action") or "").strip()
+        if outcome in _PLAYBOOK_STEP_OUTCOMES and statement:
+            leads.append((statement, outcome, _observed_from_evidence(action, evidence_refs)))
     runbook_name = f"{inc.incident_id}:playbook"
     name = esc(runbook_name)
     _delete_playbook(tx, inc.incident_id)
@@ -632,14 +680,20 @@ def _write_diagnostic_playbook(tx: Any, inc: OntologyIncident) -> None:
     tx.query(
         f'insert $x isa runbook, has name "{name}", has summary "{esc(summary)}";'
     ).resolve()
+    ingest._relate(
+        tx,
+        ("runbook", "name", runbook_name),
+        ("incident", "incident_id", inc.incident_id),
+        "runbook_for", "runbook", "incident",
+    )
     previous = ""
-    for index, statement in enumerate(leads, start=1):
+    for index, (statement, outcome, observed) in enumerate(leads, start=1):
         step_id = f"{inc.incident_id}:d{index:02d}"
         tx.query(
             f'insert $x isa diagnostic_step, has diagnostic_id "{esc(step_id)}", '
             f'has runbook_name "{name}", has question "{esc(statement)}", '
-            f'has verification "", has interpretation "", has avoidance "", '
-            f'has match_expression "";'
+            f'has verification "", has interpretation "{esc(observed)}", '
+            f'has avoidance "", has match_expression "", has outcome "{esc(outcome)}";'
         ).resolve()
         tx.query(
             f'match $r isa runbook, has name "{name}"; '
@@ -727,7 +781,7 @@ def main() -> int:
         return 2
 
     paths = args.paths or [_DEFAULT_DIR]
-    approved_at = datetime.now().astimezone().isoformat()
+    approved_at = datetime.now(UTC).isoformat()
     prepared: list[tuple[OntologyIncident, dict[str, Any], list[str]]] = []
     seen_cases: set[str] = set()
     for path in _find_payloads(paths):

@@ -103,7 +103,20 @@ step을 담고(walk와 모든 probe ID가 여기 있음), 도메인별 runbook
 (`…:domain:gpu_stack`, `…:domain:runai_scheduling`, …)이 같은 step을 묶어서
 브라우징할 때 "Kubernetes만 있다"가 아니라 실제 커버리지가 보이게 합니다.
 외부 서포트 케이스는 벤더 스레드가 실제로 밟은 진단 절차를 케이스별 playbook
-runbook(`ext:…:playbook`)으로 추가합니다.
+runbook(`ext:…:playbook`)으로 추가하며, 각 step에는 `outcome`(`diagnostic` 또는
+`preventive`)과 그 step에서 스레드가 실제로 관찰한 내용을 담은
+`interpretation`이 함께 찍힙니다. `runbook_for` edge가 이 playbook을 해당
+incident와 연결하므로, `steps_for_family` 함수는 live 조사가 실제로 매치한 케이스
+하나가 아니라 전체 케이스북에서 하나의 root-cause family에 속한 모든 step을
+끌어올 수 있습니다 — 분석 도중에는 `steps_lookup` tool로 노출됩니다 ([RCA
+Pipeline](RCA-PIPELINE.md#4-per-collector-autonomous-drill-down) 참고).
+
+실행 가능한 트리의 최신 분기 3개 — `backend_nfs_unresponsive_retry`,
+`runai_stale_workload_reference`, `thanos_receive_ingestion_pressure` — 는
+바로 이런 케이스별 playbook 항목으로 시작했습니다. 그 패턴이 처음 드러난
+케이스 하나뿐 아니라 앞으로의 모든 인시던트에서도 점검할 가치가 있다고
+판명되자, 큐레이터가 이를 자체 match 조건·probe·차등 `alternatives`를 갖춘
+완전한 실행형 노드로 승격했습니다.
 
 ## 3. 안전한 지식이 TypeDB로 들어오는 과정
 
@@ -165,6 +178,16 @@ known issue를 모든 family에서 찾습니다. family ranker는 후보 순서�
 선언형 probe template이 들어갑니다. alert scope의 placeholder만 해결되며 directive 자체는
 아무것도 실행하지 않습니다. 각 Agent에 등록된 tool set이 권한을 강제하는 경계입니다.
 
+검색은 plan 시점에 고정되지 않습니다. 분석 도중에도 모든 증거 Agent는 5개의 읽기 전용
+tool — `knowledge_lookup`, `case_lookup`, `xid_lookup`, `component_checks`,
+`steps_lookup` — 로 같은 지식을 그때그때 끌어올 수 있습니다. 각 tool은 live 온톨로지를
+먼저 조회하고 버전 관리되는 카탈로그로 폴백합니다(`steps_lookup`은 그래프 전용입니다 —
+케이스별 playbook step은 YAML로 미러링되지 않으므로 저하될 폴백 자체가 없습니다). 이
+tool들의 답변은 검증할 안내일 뿐 결코 증거가 아닙니다. artifact가 되지 않으므로 시그니처
+매처가 우리 카탈로그를 클러스터가 보고한 내용으로 되읽을 수 없습니다. 전체 tool 표와
+`source` 어휘는 [RCA Pipeline](RCA-PIPELINE.md#4-per-collector-autonomous-drill-down)을
+참고하세요.
+
 ## 5. 전체 예시: NVIDIA Xid 79
 
 | 단계 | 시스템 동작 | 운영자가 보는 결과 |
@@ -177,6 +200,10 @@ known issue를 모든 family에서 찾습니다. family ranker는 후보 순서�
 덕분에 뭉뚱그린 “GPU 문제”가 아니라 구체적인 후보에서 출발하지만, Xid 텍스트만으로
 판정을 내리지는 않습니다. 대상 범위가 없거나 해결 후 관찰이거나 live evidence가 모순되면 증명이 아니라
 문맥으로 남습니다.
+
+조사 도중 *다른* XID를 만난 drill-down Agent는 새 plan을 기다릴 필요가 없습니다.
+`xid_lookup` tool을 직접 호출해 그 코드의 정체와 escalation chain을 그 자리에서
+가져올 수 있습니다.
 
 ## 6. Studio 점검과 운영
 
@@ -226,6 +253,7 @@ Helm schema hook은 ingest CronJob보다 먼저 추가형 스키마/함수를 �
 | Symptom | XID나 scheduling event처럼 이름 붙은 관찰 패턴 |
 | Known issue | 버전 인식 문맥이 있는 큐레이션 제품 동작/버그 |
 | Probe | 범위가 정해진 하나의 읽기 전용 evidence 점검 |
+| Knowledge tool | 모든 증거 Agent가 분석 도중 호출할 수 있는 읽기 전용 조회. 온톨로지 우선, 카탈로그 폴백, 현재 run의 증거로는 절대 쓰이지 않음 |
 | Diagnostic directive | 질문, 점검, 분기, 안전한 template을 담은 플래너 안내 |
 | Blackboard | 지지 증거와 반증 증거를 나란히 놓고 비교하는 증거 장부 |
 | Evidence card | 하나의 probe 관찰을 운영자가 읽을 수 있게 만든 기록 |

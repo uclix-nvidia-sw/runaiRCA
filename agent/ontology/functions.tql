@@ -225,3 +225,28 @@ fun diagnostic_alternatives_for_runbook($runbook: string) -> {
     $s has diagnostic_id $id;
     $c has subtype $family;
   return { $id, $family, $reason, $disc, $seq };
+
+# Cross-case support-thread step patterns for a root-cause family: every
+# playbook step (ontology/load_external_cases.py) whose case's runbook_for
+# edge links it to an incident diagnosed with $family. Same
+# incident->diagnosis->cause->subtype join kg_enrichment._EXTERNAL_CASE_QUERY
+# uses to find a family's external cases. Steps from the bundled executable
+# tree carry no runbook_for edge, so they are excluded naturally -- this is
+# external-case history only. NOTE: `has outcome $o` in this conjunction drops
+# any step missing that attribute -- acceptable here: every playbook step gets
+# it from this schema version on, and a pre-upgrade graph self-heals the next
+# time the external-cases loader rewrites that case's playbook.
+fun steps_for_family($family: string) -> {
+  incident_id, diagnostic_id, question, outcome, interpretation
+}:
+  match
+    $i isa incident, has incident_id $iid;
+    (incident: $i, cause: $rc) isa diagnosis;
+    $rc has subtype $fam; $fam == $family;
+    (runbook: $r, incident: $i) isa runbook_for;
+    (runbook: $r, step: $s) isa runbook_contains;
+    $s has diagnostic_id $id,
+       has question $q,
+       has outcome $o,
+       has interpretation $it;
+  return { $iid, $id, $q, $o, $it };

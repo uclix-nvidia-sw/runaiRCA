@@ -244,7 +244,16 @@ def test_every_conclusion_has_executable_diagnostic_reasoning() -> None:
     """Conclusion nodes must tell drill-down how to prove and disprove the diagnosis."""
     runbook = yaml.safe_load((ROOT / "knowledge/k8s_troubleshooting_tree.yaml").read_text())
     families = {entry["family"] for entry in FAMILY_ENTRIES}
-    allowed_tools = {"k8s_read", "k8s_describe", "k8s_logs", "logql_query", "promql_query"}
+    # system_log_query is executable by the system domain agent; the
+    # windowable-source constraint on its probes lives in test_decision_tree.
+    allowed_tools = {
+        "k8s_read",
+        "k8s_describe",
+        "k8s_logs",
+        "logql_query",
+        "promql_query",
+        "system_log_query",
+    }
     required_probe_fields = {
         "tool", "arguments_template", "incident_time_window", "expected_result_shape",
         "supports_when", "refutes_when", "support_signal_any", "refute_signal_any", "source_group",

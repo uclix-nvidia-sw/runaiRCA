@@ -265,6 +265,63 @@ def test_knowledge_links_matches_default_to_empty_list_without_knowledge_links()
     assert inc.case_card["known_issue_matches"] == []
 
 
+# --- case_card.evidence_refs (bounded projection for hint narration in
+# kg_enrichment._external_case_hint_projection) -----------------------------
+
+
+def test_evidence_refs_reach_the_case_card_bounded() -> None:
+    """Only evidence_id/source/kind/summary survive -- never `supports` or
+    `source_message_ids` (those name F00x/H00x/M00x ids this payload never
+    ships)."""
+    inc = lx._to_incident(_payload(), "op", "t")
+
+    assert inc.case_card["evidence_refs"] == [
+        {"evidence_id": "E002", "source": "customer", "kind": "transcript_quote",
+         "summary": "QP transition failure."},
+        {"evidence_id": "E018", "source": "customer", "kind": "statement",
+         "summary": "Switch L3 routing corrected."},
+        {"evidence_id": "E011", "source": "nvidia_support", "kind": "statement",
+         "summary": "Repeated QP transition failures."},
+    ]
+
+
+def test_evidence_refs_collapse_whitespace_in_summary() -> None:
+    p = _payload(evidence_refs=[
+        {"evidence_id": "E900", "source_actor": "customer", "evidence_kind": "statement",
+         "masked_summary": "line one\n   line   two  "},
+    ])
+    inc = lx._to_incident(p, "op", "t")
+    assert inc.case_card["evidence_refs"][0]["summary"] == "line one line two"
+
+
+def test_evidence_refs_trim_summary_to_240_chars() -> None:
+    p = _payload(evidence_refs=[
+        {"evidence_id": "E901", "source_actor": "customer", "evidence_kind": "statement",
+         "masked_summary": "x" * 300},
+    ])
+    inc = lx._to_incident(p, "op", "t")
+    summary = inc.case_card["evidence_refs"][0]["summary"]
+    assert summary == "x" * 240
+    assert len(summary) == 240
+
+
+def test_evidence_refs_entries_without_evidence_id_are_dropped() -> None:
+    p = _payload(evidence_refs=[
+        {"evidence_id": "E100", "source_actor": "customer", "evidence_kind": "statement",
+         "masked_summary": "kept"},
+        {"source_actor": "customer", "evidence_kind": "statement", "masked_summary": "no id"},
+        {"evidence_id": "", "source_actor": "customer", "evidence_kind": "statement",
+         "masked_summary": "blank id"},
+    ])
+    inc = lx._to_incident(p, "op", "t")
+    assert [r["evidence_id"] for r in inc.case_card["evidence_refs"]] == ["E100"]
+
+
+def test_evidence_refs_default_to_empty_list_without_evidence_refs() -> None:
+    inc = lx._to_incident(_payload(evidence_refs=[]), "op", "t")
+    assert inc.case_card["evidence_refs"] == []
+
+
 def test_unconfirmed_mechanism_is_prefixed_and_fingerprinted() -> None:
     p = _payload()
     p["incident"] = {**p["incident"], "confirmed_mechanism": None}
@@ -298,6 +355,27 @@ def test_unresolved_case_has_evidence_but_no_supported_by_or_resolution(monkeypa
     # (the run-clear DELETEs mention supported_by, so target the insert form).
     assert "insert $s isa supported_by" not in emitted
     assert "insert $resolution isa resolution" not in emitted
+
+
+def test_clean_keyword_salvages_masked_placeholder_fragment() -> None:
+    # A sanitizer-masked signature can never substring-match real text; the
+    # longest literal fragment around the placeholder is the live signal
+    # (live-TypeDB finding 2026-08-10: the NFS case's exact kernel line was a
+    # dead keyword).
+    assert (
+        lx._clean_keyword("nfs: server <address> not responding, still trying")
+        == "not responding, still trying"
+    )
+    assert (
+        lx._clean_keyword(
+            "MountVolume.SetUp failed for volume <volume>: mount failed: exit status 32"
+        )
+        == "MountVolume.SetUp failed for volume"
+    )
+    assert (
+        lx._clean_keyword("failed to reserve container name")
+        == "failed to reserve container name"
+    )
 
 
 def test_write_case_wires_the_trusted_knowledge_chain(monkeypatch: Any) -> None:
@@ -443,6 +521,99 @@ def test_write_case_projects_support_thread_as_diagnostic_playbook(monkeypatch: 
     assert "isa runbook_entry" in emitted
     # Confirmed fixes are resolved_by actions, not playbook steps.
     assert 'has question "Correct switch routing."' not in emitted
+
+
+# --- playbook step outcome/interpretation + runbook_for case link ----------
+
+
+def test_playbook_step_carries_outcome_and_resolved_interpretation(monkeypatch: Any) -> None:
+    monkeypatch.setattr(
+        ingest, "load_family_catalog",
+        lambda _: SimpleNamespace(families={"network_fabric_error"}),
+    )
+    p = _payload(historical_actions=[
+        {"action_id": "A003", "normalized_action": "Run inter-node ping.",
+         "outcome": "diagnostic", "evidence_ids": ["E002", "E011"]},
+    ])
+    inc = lx._to_incident(p, "op", "t")
+
+    tx = _Tx()
+    lx._write_case(tx, inc, lx._symptom_keywords(p))
+    emitted = "\n".join(tx.queries)
+
+    assert 'has outcome "diagnostic"' in emitted
+    assert (
+        'has interpretation "QP transition failure. / Repeated QP transition failures."'
+        in emitted
+    )
+
+
+def test_playbook_step_interpretation_empty_when_no_evidence_resolves(monkeypatch: Any) -> None:
+    # Default fixture's only diagnostic/preventive action (A003) cites no
+    # evidence -- current behavior (empty interpretation) must survive the
+    # new outcome/interpretation stamping.
+    monkeypatch.setattr(
+        ingest, "load_family_catalog",
+        lambda _: SimpleNamespace(families={"network_fabric_error"}),
+    )
+    inc = lx._to_incident(_payload(), "op", "t")
+
+    tx = _Tx()
+    lx._write_case(tx, inc, lx._symptom_keywords(_payload()))
+    emitted = "\n".join(tx.queries)
+
+    assert 'has interpretation ""' in emitted
+    assert 'has outcome "diagnostic"' in emitted
+
+
+def test_observed_from_evidence_caps_two_summaries_and_400_chars() -> None:
+    refs = [
+        {"evidence_id": "E1", "summary": "a" * 240},
+        {"evidence_id": "E2", "summary": "b" * 240},
+        {"evidence_id": "E3", "summary": "c" * 240},
+    ]
+    observed = lx._observed_from_evidence({"evidence_ids": ["E1", "E2", "E3"]}, refs)
+    assert observed == ("a" * 240 + " / " + "b" * 240)[:400]
+    assert len(observed) == 400
+
+
+def test_observed_from_evidence_empty_without_resolvable_evidence() -> None:
+    refs = [{"evidence_id": "E1", "summary": "kept"}]
+    assert lx._observed_from_evidence({"evidence_ids": []}, refs) == ""
+    assert lx._observed_from_evidence({}, refs) == ""
+    assert lx._observed_from_evidence({"evidence_ids": ["missing"]}, refs) == ""
+
+
+def test_runbook_for_insert_binds_entities_only(monkeypatch: Any) -> None:
+    """Same static guard as test_probe_template_for_insert_binds_entities_only
+    (tests/test_troubleshooting_ontology.py): the relation insert's match must
+    NOT assert runbook_for itself, or the insert silently no-ops on a live
+    TypeDB even though the loader exits 0."""
+    monkeypatch.setattr(
+        ingest, "load_family_catalog",
+        lambda _: SimpleNamespace(families={"network_fabric_error"}),
+    )
+    inc = lx._to_incident(_payload(), "op", "t")
+
+    tx = _Tx()
+    lx._write_case(tx, inc, lx._symptom_keywords(_payload()))
+    inserts = [
+        q for q in tx.queries if "insert (runbook: $a, incident: $b) isa runbook_for" in q
+    ]
+    assert inserts, "loader must attempt the runbook_for insert"
+    for query in inserts:
+        match_clause = query.split("insert", 1)[0]
+        assert "runbook_for" not in match_clause
+
+
+def test_delete_playbook_deletes_runbook_for_before_runbook() -> None:
+    tx = _Tx()
+    lx._delete_playbook(tx, "ext:sc-gone000000")
+    emitted = "\n".join(tx.queries)
+    assert "isa runbook_for(runbook: $r); delete $x;" in emitted
+    assert emitted.index("isa runbook_for(runbook: $r); delete $x;") < emitted.index(
+        'match $x isa runbook, has name "ext:sc-gone000000:playbook"; delete $x;'
+    )
 
 
 def test_symptom_keywords_lowercase_dedup_and_error_signatures_only() -> None:

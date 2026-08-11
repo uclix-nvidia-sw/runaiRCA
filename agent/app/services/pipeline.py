@@ -4448,6 +4448,7 @@ def _detail_from(
             knowledge=knowledge,
             component=getattr(plan, "component", "") if plan is not None else "",
             allow_remediation=allow_cause_specific_actions,
+            case_cards=list((kg_context or {}).get("case_cards") or []),
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -7770,6 +7771,12 @@ def _kb_remediation_lines(
     # such as gpu_hardware_error). The ranker only orders the matches.
     top_family = candidates[0].family if candidates else ""
     filter_to_top = _top_family_settled(candidates)
+    # insufficient_evidence never settles (_top_family_settled), so a cross-family
+    # graph match here is the same unacted-on keyword hit the playbook hedges
+    # (_insufficient_evidence_playbook_lines) -- tag it the same way instead of
+    # asserting it as this run's confirmed diagnosis. One vocabulary, same tag.
+    unsettled = top_family == "insufficient_evidence"
+    tag = "(knowledge match — unconfirmed)"
     active_masker = masker or build_masker(())
     for family, symptom in match_failure_mode_symptoms(
         knowledge, observed_text, top_family, fuzzy_query=fuzzy_query
@@ -7780,14 +7787,35 @@ def _kb_remediation_lines(
         if actions:
             symptom_name = _safe_line(symptom.get("symptom"), limit=160, masker=active_masker)
             learned = is_matcher_only_family(family)
-            header = ("- Learned from a previous incident (not a catalog family): " if learned else "") + (
-                f"Matched symptom **{symptom_name}** ({_family_label(family)}); known fixes from the knowledge base:"
-            )
+            if unsettled:
+                learned_prefix = (
+                    "Learned from a previous incident (not a catalog family): "
+                    if learned
+                    else ""
+                )
+                header = (
+                    f"- {learned_prefix}{tag} **{symptom_name}** ({_family_label(family)}) "
+                    "— not confirmed by this run's evidence; reference only:"
+                )
+            else:
+                header = (
+                    "- Learned from a previous incident (not a catalog family): "
+                    if learned
+                    else ""
+                ) + (
+                    f"Matched symptom **{symptom_name}** ({_family_label(family)}); "
+                    "known fixes from the knowledge base:"
+                )
             return [
                 header,
                 *[f"  - {_safe_line(a, limit=360, masker=active_masker)}" for a in actions[:5]],
             ]
         symptom_name = _safe_line(symptom.get("symptom"), limit=160, masker=active_masker)
+        if unsettled:
+            return [
+                f"{tag} Matched symptom **{symptom_name}** ({_family_label(family)}); "
+                "family prior from the knowledge base (no verified action recorded)."
+            ]
         return [
             f"Matched symptom **{symptom_name}** ({_family_label(family)}); "
             "family prior from the knowledge base (no verified action recorded)."
@@ -7805,6 +7833,7 @@ def _playbook_lines(
     *,
     knowledge: ReportKnowledge,
     allow_remediation: bool = True,
+    case_cards: list[dict] | None = None,
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
@@ -7813,6 +7842,11 @@ def _playbook_lines(
     curated symptoms for the settled top family. Cross-family signatures have
     already been used to pick that top family; unrelated side text should not
     become playbook guidance.
+
+    ``case_cards`` are this run's already-retrieved historical priors (see
+    ``KGContext.case_cards`` / ``kg_enrichment.external_case_cards``) -- passed
+    through so the insufficient_evidence branch can cite the best-matched
+    external vendor case without re-querying TypeDB at render time.
     """
     if not allow_remediation:
         return [
@@ -7845,24 +7879,53 @@ def _playbook_lines(
     symptom_matches = _actionable_failure_mode_matches(
         knowledge.failure_modes, observed_text, candidates, fuzzy_query=fuzzy_query
     )
-    if symptom_matches[0:1] and symptom_matches[0][1].get("exclusive_actions"):
-        lines = []
-    for family, symptom in symptom_matches[:1]:
-        symptom_name = _safe_line(
-            _localized_failure_mode_name(symptom, knowledge.language),
-            limit=180,
-            masker=active_masker,
+    # insufficient_evidence renders symptom_matches itself, hedged, further down
+    # (_insufficient_evidence_playbook_lines) -- the confident, unhedged framing
+    # below is only for a settled (or named-but-low-confidence) top family.
+    if top_family != "insufficient_evidence":
+        if symptom_matches[0:1] and symptom_matches[0][1].get("exclusive_actions"):
+            lines = []
+        for family, symptom in symptom_matches[:1]:
+            symptom_name = _safe_line(
+                _localized_failure_mode_name(symptom, knowledge.language),
+                limit=180,
+                masker=active_masker,
+            )
+            learned = is_matcher_only_family(family)
+            prefix = (
+                "- 이전 인시던트에서 학습된 지식(카탈로그 계열 아님): "
+                if learned and knowledge.language == "ko"
+                else "- Learned from a previous incident (not a catalog family): "
+                if learned
+                else "- "
+            )
+            lines.append(f"{prefix}**{symptom_name}** ({_family_label(family)})")
+            lines.extend(
+                f"  - {_safe_line(action, limit=360, masker=active_masker)}"
+                for action in _localized_failure_mode_actions(symptom, knowledge.language)[:5]
+            )
+            # Architecture layer: the implicated platform component's failure effect,
+            # dependency check order, and ready-to-run checks (runai_architecture.yaml).
+            if symptom.get("component"):
+                lines.extend(
+                    component_check_lines(knowledge.components or {}, str(symptom["component"]))
+                )
+    if top_family == "insufficient_evidence":
+        # BEFORE the early return below: component-identity/known-issue lines
+        # must not swallow the hedged reference block — an evidence-poor run
+        # with a component identity is exactly where these references matter.
+        hedged = _insufficient_evidence_playbook_lines(
+            symptom_matches, case_cards, knowledge=knowledge, masker=active_masker
         )
-        learned = is_matcher_only_family(family)
-        lines.append(("- 이전 인시던트에서 학습된 지식(카탈로그 계열 아님): " if learned and knowledge.language == "ko" else "- Learned from a previous incident (not a catalog family): " if learned else "- ") + f"**{symptom_name}** ({_family_label(family)})")
-        lines.extend(
-            f"  - {_safe_line(action, limit=360, masker=active_masker)}"
-            for action in _localized_failure_mode_actions(symptom, knowledge.language)[:5]
-        )
-        # Architecture layer: the implicated platform component's failure effect,
-        # dependency check order, and ready-to-run checks (runai_architecture.yaml).
-        if symptom.get("component"):
-            lines.extend(component_check_lines(knowledge.components or {}, str(symptom["component"])))
+        if lines:
+            return [*lines, *hedged]
+        if hedged:
+            return hedged
+        return [
+            "- 현재 증거와 정확히 일치하는 트러블슈팅 playbook이 없습니다."
+            if knowledge.language == "ko"
+            else "- No troubleshooting playbook matched the available evidence yet."
+        ]
     if lines:
         # Preserve sibling symptom discriminators as explicitly unconfirmed
         # appendix context. The family has no independent executable remedy.
@@ -7875,12 +7938,6 @@ def _playbook_lines(
                 )
             )
         return lines
-    if top_family == "insufficient_evidence":
-        return [
-            "- 현재 증거와 정확히 일치하는 트러블슈팅 playbook이 없습니다."
-            if knowledge.language == "ko"
-            else "- No troubleshooting playbook matched the available evidence yet."
-        ]
     if top_family:
         family_context = [
             "- 원인 family는 추정됐지만 세부 증상은 확인되지 않았습니다. "
@@ -7939,6 +7996,115 @@ def _family_supplemental_playbook_lines(
         else "- **Alternative symptoms in the same family (not confirmed by current evidence)**"
     )
     return [heading, *rendered]
+
+
+def _insufficient_evidence_playbook_lines(
+    symptom_matches: list[tuple[str, dict]],
+    case_cards: list[dict] | None,
+    *,
+    knowledge: ReportKnowledge,
+    masker: Masker,
+) -> list[str]:
+    """Reference-only guidance for a run that never settled on a cause family.
+
+    Neither source here is a diagnosis: a cross-family symptom match is a
+    keyword hit the ranker did not act on (candidates/ranking are untouched --
+    this only changes what the playbook renders), and an external case is a
+    vendor record for a similar signature. Both render as unconfirmed
+    reference material -- never as this run's cause -- so the section stops
+    dead-ending at "no playbook matched" without pretending to know more than
+    the evidence supports.
+    """
+    ko = knowledge.language == "ko"
+    body: list[str] = []
+    for family, symptom in symptom_matches[:2]:
+        tag = "(지식 매칭 — 미확정)" if ko else "(knowledge match — unconfirmed)"
+        symptom_name = _safe_line(
+            _localized_failure_mode_name(symptom, knowledge.language), limit=180, masker=masker
+        )
+        body.append(f"- {tag} **{symptom_name}** ({_family_label(family)})")
+        body.extend(
+            f"  - {_safe_line(action, limit=360, masker=masker)}"
+            for action in _localized_failure_mode_actions(symptom, knowledge.language)[:3]
+        )
+        reason = _safe_line(
+            symptom.get("reason_ko" if ko else "reason"), limit=360, masker=masker
+        )
+        if reason:
+            body.append(f"  - {reason}")
+    body.extend(_external_reference_case_lines(case_cards or [], ko, masker))
+    if not body:
+        # Nothing to reference: the caller renders its own fallback (or keeps
+        # the component-identity lines it already has) — never an empty hedge.
+        return []
+    header = (
+        "- 현재 증거만으로는 원인을 확정할 수 없습니다. 아래는 축적된 지식·과거 사례 "
+        "매칭에 근거한 참고 조치이며, 확정 진단이 아닙니다."
+        if ko
+        else "- The available evidence cannot confirm a root cause. The items below are "
+        "reference actions grounded in accumulated knowledge and past cases — not a "
+        "confirmed diagnosis."
+    )
+    return [header, *body]
+
+
+def _external_reference_case_lines(case_cards: list[dict], ko: bool, masker: Masker) -> list[str]:
+    """The single best-matched external support case, framed as history only.
+
+    Same non-diagnostic framing as ``general_guidance._external_case_lines``,
+    keyed on ``mechanism`` (this branch's own summary field) and bounded to the
+    one case whose error signature actually matched this run's evidence --
+    an insufficient_evidence report gets one clear reference, not a dump of
+    every retrieved prior. ``case_cards`` is the already-retrieved list from
+    ``KGContext.case_cards``; nothing here re-queries TypeDB.
+    """
+    card = next(
+        (
+            c
+            for c in case_cards
+            if c.get("kind") == "external" and c.get("matched_error_signatures")
+        ),
+        None,
+    )
+    if not card:
+        return []
+    mechanism = _safe_line(card.get("mechanism"), limit=400, masker=masker)
+    if not mechanism:
+        return []
+    lines = [
+        f"- 과거 유사 사례(외부 지원 케이스, 참고용): {mechanism}"
+        if ko
+        else f"- A similar past case (external support case, reference only): {mechanism}"
+    ]
+    successful = [a for a in (card.get("successful_actions") or []) if a.get("statement")]
+    if successful:
+        label = "당시 유효했던 조치" if ko else "Action that helped then"
+        lines.extend(
+            f"  - {label}: {_safe_line(a.get('statement'), limit=300, masker=masker)}"
+            for a in successful[:3]
+        )
+    else:
+        # Knowing this case exists but has no recorded fix is still useful --
+        # never fabricate a remedy the case card doesn't actually carry.
+        lines.append(
+            "  - 당시 지원팀의 진단 수순 참고 가능"
+            if ko
+            else "  - That case's support-team diagnostic steps may be worth reviewing"
+        )
+    failed = [
+        _safe_line(a.get("statement"), limit=300, masker=masker)
+        for a in (card.get("failed_actions") or [])
+        if a.get("statement")
+    ][:2]
+    failed = [item for item in failed if item]
+    if failed:
+        joined = "; ".join(failed)
+        lines.append(
+            f"  - 당시 효과 없던 조치: {joined}"
+            if ko
+            else f"  - Actions that did not help then: {joined}"
+        )
+    return lines
 
 
 _family_label = family_label

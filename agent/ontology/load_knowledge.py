@@ -229,7 +229,13 @@ def main() -> int:
     valid_families = _catalog_families(settings.families_file)
     with open_driver(settings) as driver:
         with driver.transaction(settings.typedb_database, TransactionType.WRITE) as tx:
-            purge_legacy_families(tx, catalog_families)
+            # Purge only what left the CLOSED catalog (families.yaml), not every
+            # family without a knowledge-yaml entry: sentinel/version families
+            # (insufficient_evidence, platform_version_bug, ...) have no
+            # symptoms here but are legitimate — purging them just made the
+            # chained schema job delete-then-recreate the same entities and log
+            # a false "purged legacy families" warning on every rerun.
+            purge_legacy_families(tx, catalog_families | valid_families)
             for entry in raw:
                 family = str(entry.get("family", "")).strip()
                 if family not in valid_families:

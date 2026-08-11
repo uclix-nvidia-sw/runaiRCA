@@ -159,18 +159,43 @@ run/hash를 기준으로 재검증하고, 부적격 candidate가 유지될 때 �
   파일명, 산문)에서 제거하고, 케이스 키를 불투명 해시로 바꾸고, 타임스탬프를 날짜로
   뭉갭니다. 비식별화된 사본만 커밋됩니다 — known-issues 카탈로그와 같은
   "기록이 아니라 교훈을 공개" 관행입니다. 번호가 남은 파일은 sanitizer가 출력을
-  거부합니다.
+  거부합니다. sanitizer가 그 자리에서 마스킹한 시그니처(`nfs: server <address>
+  not responding, still trying`)는 실제 로그 라인과 substring으로 매치될 수
+  없습니다. 로더는 그 키워드를 그냥 버리는 대신 placeholder 주변에서 가장 긴
+  리터럴 조각을 살려 둡니다.
 - **승인은 명시적.** Helm 스키마 로드 Job은 운영자가 지정한 승인자
   (`typedb.externalCases.approvedBy`)가 있을 때만 로더를 실행하고, 그 값을 모든 사례에
   기록합니다 — 1절과 동일한 승인 게이트입니다.
-- **지식 계층 권위가 될 수 없음.** TypeDB에는 사례 로컬 symptom을 가진 라벨된 case
-  snapshot으로 들어가지만, 로더는 지식 계층이 요구하는 `indicates`/`resolved_by` 엣지를
-  구조적으로 절대 만들지 않으므로, 원인을 단정하는 카탈로그 규칙이 될 수 없습니다.
+- **신뢰하지만, 스레드가 실제로 확인한 것에 한해서만.** 케이스는 큐레이션 지식과
+  *같은* `indicates`/`resolved_by` 체인에 들어가 `knowledge_lookup`, plan 시점
+  symptom lead, 안내·조치에서 도달할 수 있습니다 — 단, 서포트 스레드가
+  mechanism을 단순히 관찰이 아니라 *확인*했고 family가 닫힌 카탈로그에 속할
+  때만입니다. 확인되지 않은 케이스는 검색 전용으로 남고 이 edge들을 절대
+  얻지 않습니다. 체인에 들어간 케이스라도 `resolved_by`는 스레드가 실제로
+  인시던트를 해결하거나 완화했다고 확인한 조치에만 붙습니다. 시도만 한
+  진단/예방 step은 조치 확정으로 취급되지 않으며, 대신 아래의 playbook step이
+  됩니다.
+- **진단/예방 step은 체인 진입 여부와 무관하게 케이스별 playbook이 됩니다.**
+  ingest된 모든 케이스의 서포트 스레드 진단·예방 조치는 `diagnostic_step` 미니
+  runbook(`<incident>:playbook`)으로 하나씩 미러링되며, 각 step에는 `outcome`
+  (`diagnostic` 또는 `preventive`)과 `interpretation` — 그 step에서 스레드가
+  인용한 마스킹된 evidence 요약 최대 2개, case card 자체의 bounded
+  `evidence_refs` 투영으로 해석됨 — 이 함께 찍힙니다. `runbook_for` edge가
+  playbook을 그 incident와 연결하므로, `steps_for_family` 그래프 함수는 live
+  조사가 실제로 매치한 케이스 하나가 아니라 전체 케이스북에서 하나의
+  root-cause family에 속한 모든 진단 step을 끌어올 수 있습니다 — 분석
+  도중에는 `steps_lookup` tool로 노출됩니다. 이 케이스 범위 runbook 이름은
+  번들 실행형 트리와 절대 겹치지 않으므로, live diagnostic walk가 여기로
+  들어올 수 없습니다.
 - **에러 시그니처로 검색.** 이후 분석은 에러 시그니처(예: `ibv_modify_qp failed with 19
   No such device`)가 그 실행의 관측 증거에 실제로 나타날 때만 사례를 표면화합니다. 그때
   사용 등급(`evaluation_only`, `mitigated_context`, `unresolved_context`)이 붙은 과거
   맥락으로 나타납니다. 시도된 조치 — **효과가 없었던** 것 포함 — 는 "과거 외부 사례에서
   시도됨"으로만 표시되며, 현재 사건의 검증된 해결책으로는 절대 제시되지 않습니다.
+  drill-down Agent가 분석 도중 받는 힌트도 같은 스레드 서사를 담습니다: 그
+  케이스의 진단/예방 step 중 몇 번째인지 나타내는 1부터 시작하는 `order`,
+  `outcome`, 그리고 최대 2개의 `observed` evidence 요약입니다 — 그래서 힌트는
+  맨 명령문이 아니라 "2번째 step, 예방 점검이었고 X를 발견함"처럼 읽힙니다.
 
 비식별화 계약과 사례 추가 방법은 `agent/knowledge/external_cases/README.md`를 참고하세요.
 

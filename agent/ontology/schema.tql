@@ -231,7 +231,8 @@ entity incident,
     plays has_symptom:incident,
     plays analyzed_by:incident,
     plays diagnosis:incident,
-    plays hypothesis_for:incident;
+    plays hypothesis_for:incident,
+    plays runbook_for:incident;
 
 entity analysis_run,
     owns run_id @key,
@@ -390,7 +391,8 @@ entity runbook,
     owns source_url @card(0..),
     owns principle @card(0..),
     plays runbook_contains:runbook,
-    plays runbook_entry:runbook;
+    plays runbook_entry:runbook,
+    plays runbook_for:runbook;
 
 entity diagnostic_step,
     owns diagnostic_id @key,
@@ -401,6 +403,10 @@ entity diagnostic_step,
     owns avoidance,
     owns match_expression,
     owns probe_template @card(0..),
+    # The support thread's step class (diagnostic|preventive). Stamped only on
+    # external-case playbook steps (ontology/load_external_cases.py); the
+    # bundled executable tree's steps never carry it.
+    owns outcome @card(0..1),
     plays runbook_contains:step,
     plays runbook_entry:step,
     plays diagnostic_transition:prior,
@@ -484,6 +490,11 @@ relation case_projection, relates case, relates finding;
 # ontology/load_troubleshooting.py mirrors it here for runtime traversal.
 relation runbook_contains, relates runbook, relates step;
 relation runbook_entry, relates runbook, relates step;
+# Links a case's playbook runbook (ontology/load_external_cases.py) to its
+# incident, so cross-case retrieval (steps_for_family, functions.tql) can walk
+# from a family to the incidents whose support-thread steps are worth reading.
+# One edge per case; the bundled executable tree has none.
+relation runbook_for, relates runbook, relates incident;
 relation diagnostic_transition,
     relates prior,
     relates next,

@@ -355,7 +355,7 @@ nodes:
           any: ["KubeAPIDown", "KubeControllerManagerDown", "KubeSchedulerDown", "etcd quorum", "etcd member"]
         next: control_plane_failure
       - match:
-          any: [runai-backend, cluster-sync, "runai scheduler unavailable", "database error", "reconcile failed"]
+          any: [runai-backend, cluster-sync, "runai scheduler unavailable", "database error", "reconcile failed", workloadsdao]
         next: runai_control_plane_failure
       - match:
           any: ["RunaiSchedulerDown", "RunaiBackendDown", "runai controller unavailable", "runai platform alert"]
@@ -389,7 +389,7 @@ nodes:
           any: [failedmount, failedattachvolume, "unable to attach or mount volumes", "unbound immediate persistentvolumeclaims", volumebinding, provisioningfailed]
         next: storage_failure
       - match:
-          any: ["stale file handle", "read-only file system", "nfs server", cephfs, "ceph health", "input/output error", "mount access denied", "access denied by server", "storage latency"]
+          any: ["stale file handle", "read-only file system", "nfs server", cephfs, "ceph health", "input/output error", "mount access denied", "access denied by server", "storage latency", "not responding, still trying"]
         next: storage_backend_failure
       - match:
           any: ["failed to create pod sandbox", "failed to setup network for sandbox", "cni plugin", "network plugin", ipam]
@@ -1357,8 +1357,11 @@ nodes:
         refutes_when: ["the earliest event is a pod-local failure unrelated to Run:ai control plane"]
         source_group: kubernetes_api
     match:
-      any: [runai-backend, cluster-sync, "runai scheduler unavailable", "database error", "reconcile failed"]
+      any: [runai-backend, cluster-sync, "runai scheduler unavailable", "database error", "reconcile failed", workloadsdao]
     branches:
+      - match:
+          any: [workloadsdao]
+        next: runai_stale_workload_reference
       - match:
           any: [cluster-sync, "out of sync", "cluster disconnected", "reconcile failed"]
         next: runai_cluster_sync_failure
@@ -1403,6 +1406,44 @@ nodes:
         - "Identify the first failing backend endpoint and its owning dependency."
         - "Check database saturation, connection exhaustion, migrations, and recent backend rollout."
         - "Verify recovery from both the backend API and one affected cluster."
+
+  # External-case promotion (enterprise_support:934783274205): a WorkloadsDao
+  # "does not exist" loop is a stale backend-database reference when the named
+  # workload is truly gone — cosmetic, not a live reconciliation fault.
+  - id: runai_stale_workload_reference
+    <<: *runai_control_plane
+    question: "Does the runai-backend error name a workload/workspace record that no longer has a live Kubernetes counterpart, and is the error confined to that one stale identifier? Healthy cluster-agent sync only reports current workloads. If the named pod/RunaiJob is truly gone, this is a stale backend-database reference rather than a live reconciliation fault; if it still exists and is healthy, treat the repeated error as an active sync bug instead."
+    verify: "Read the alert target pod (and its owning RunaiJob, if any) in the affected namespace; a NotFound/absent result confirms the backend is repeatedly referencing an already-deleted workload."
+    interpretation: "A missing Kubernetes counterpart makes the repeated backend error a stale-record symptom (cosmetic, cleanup-only); an existing healthy counterpart turns the same error into an active cluster-agent/backend synchronization defect."
+    probes:
+      - id: k8s_troubleshooting:runai_stale_workload_reference:p01
+        tool: k8s_read
+        arguments_template:
+          kind: pods
+          name: "{{pod}}"
+          namespace: "{{namespace}}"
+        incident_time_window: incident
+        expected_result_shape: "current existence and phase of the pod the backend record names, or a NotFound result"
+        supports_when: ["the pod/RunaiJob the backend names no longer exists in the cluster"]
+        refutes_when: ["the pod/RunaiJob still exists and is running normally, with no other reconcile error"]
+        support_signal_any: ["notfound", "not found"]
+        refute_signal_any: ["running"]
+        source_group: kubernetes_api
+    match:
+      any: [workloadsdao]
+    conclusion:
+      family: runai_control_plane_error
+      summary: "The runai-backend cluster-agent sync repeatedly reports a workload/workspace record with no live Kubernetes counterpart."
+      confidence: "high only when the exact named pod/RunaiJob is confirmed absent and no other control-plane symptom accompanies it"
+      disconfirm:
+        - "The named pod/RunaiJob still exists and is healthy, or a separate cluster-sync/backend dependency failure occurs alongside it."
+      next_steps:
+        - "Confirm the named workload has no corresponding RunaiJob or pod in the cluster."
+        - "If it is gone, record this as a benign stale backend-database reference (cosmetic) rather than escalating as a live outage; clean up the orphaned record only through the supported workflow."
+        - "If the workload still exists and is healthy, escalate as an active cluster-agent/backend synchronization defect instead of dismissing it as cosmetic."
+    alternatives:
+      - {family: runai_scheduling_quota, reason: "A PodGroup stuck in a status-update conflict can also block a workload from progressing while the control plane repeats an error.", discriminator: "A podgroups.scheduling.run.ai 'object has been modified' conflict and a stalled schedulingConditions/Pod Group Assigner handoff, rather than a does-not-exist DAO lookup, identifies a scheduler status-update conflict instead (see case-197057479f19)."}
+      - {family: platform_version_bug, reason: "A repeated DAO error that began right after a Run:ai upgrade can be a known control-plane regression rather than one orphaned record.", discriminator: "The error naming CURRENT, live workloads too — or matching a version-linked known issue for the installed release — identifies a platform regression; a single already-deleted identifier identifies a stale record."}
 
   - id: gpu_stack_failure
     question: "Which NVIDIA layer emitted the first typed signal on the affected node: XID, driver, runtime handler, device plugin, fabric manager, or Operator reconciliation? Healthy nodes advertise GPUs and initialize all operands. Follow the first node-scoped signal, not a downstream CUDA or scheduling symptom."
@@ -1969,6 +2010,9 @@ nodes:
       any: ["no metrics", "metrics missing", "stale metrics", "thanos-receive", "dcgm_fi_dev", "target down", "dashboard shows"]
     branches:
       - match:
+          any: ["head series", "wal replay"]
+        next: thanos_receive_ingestion_pressure
+      - match:
           any: ["thanos-receive", "target down", "scrape failed", "remote write", "metrics missing"]
         next: metrics_pipeline_failure
       - match:
@@ -2004,6 +2048,44 @@ nodes:
         - "Locate the first hop whose last-sample timestamp stops advancing."
         - "Check exporter health, scrape error, receiver/storage capacity, and recent config changes at that hop."
         - "Verify data freshness end-to-end after recovery."
+
+  # External-case promotion (enterprise_support:e38f69ff583a): Thanos Receive
+  # destabilized by its own ingestion volume (head series / WAL replay), a
+  # capacity fault on the pipeline itself — distinct from a broken scrape hop.
+  - id: thanos_receive_ingestion_pressure
+    <<: *observability
+    question: "Is Thanos Receive being OOMKilled or destabilized by its own ingestion volume (active head series, remote-write sample rate, WAL replay after restart) rather than a stale/missing scrape hop? Healthy ingestion keeps head series and remote-write rate within the sized resource limits. If ingestion volume/cardinality is high and growing, treat this as a capacity problem on the metrics pipeline itself, not a downstream dashboard or scrape defect."
+    verify: "Read Thanos Receive's own restart/OOM history plus its head-series count and remote-write samples/sec around the incident, and list recently added scrape targets (new workloads, ServiceMonitors/PodMonitors) that could have grown cardinality."
+    interpretation: "Restart/OOMKilled cycles at the receiver's own memory limit while head series or WAL replay grows indicate an ingestion-capacity fault on the pipeline itself; a receiver running clean with missing metrics points back to a scrape/transport hop instead."
+    probes:
+      - id: k8s_troubleshooting:thanos_receive_ingestion_pressure:p01
+        tool: k8s_describe
+        arguments_template:
+          kind: pods
+          name: "{{pod}}"
+          namespace: "{{namespace}}"
+        incident_time_window: incident
+        expected_result_shape: "Thanos Receive container restart count, last-state OOMKilled reason, and its memory limit"
+        supports_when: ["Thanos Receive shows OOMKilled/restart cycles at its own memory limit during the incident"]
+        refutes_when: ["Thanos Receive runs without restarts while metrics are missing — the gap lies elsewhere in the pipeline"]
+        support_signal_any: ["oomkilled"]
+        refute_signal_any: ["running"]
+        source_group: kubernetes_api
+    match:
+      any: ["head series", "wal replay"]
+    conclusion:
+      family: observability_accuracy
+      summary: "Thanos Receive's own ingestion volume (active series and remote-write rate) is pressuring its memory limit and causing restarts, rather than a stale or broken scrape hop."
+      confidence: "high only when head-series/remote-write growth coincides with Thanos Receive OOMKilled/restart events during the incident"
+      disconfirm:
+        - "Head-series and remote-write rate are stable and a stale scrape target, receiver outage, or backend I/O error better explains the metrics gap."
+      next_steps:
+        - "Capture head-series count, remote-write samples/sec, and Thanos Receive's restart/OOM history for the incident window."
+        - "List recently added scrape sources (new workloads, ServiceMonitors, PodMonitors) that could have grown active series, and confirm no external system is also remote-writing to the same endpoint."
+        - "Size CPU/memory to the confirmed ingestion volume, or reduce cardinality, before assuming the pipeline needs no change."
+    alternatives:
+      - {family: storage_backend_error, reason: "Thanos Receive can also fail to commit samples because its WAL/PVC-backed storage is unavailable, which looks like the same metric-gap symptom.", discriminator: "A stale file handle, I/O error, or NFS server signature in Thanos Receive's own logs identifies a storage-backend failure instead of ingestion-volume pressure (see case-62582d633330)."}
+      - {family: node_kubelet_pressure, reason: "Node-level memory pressure can evict or OOM the receiver even when its own ingestion volume is normal.", discriminator: "A node MemoryPressure condition or system-level eviction identifies node pressure; a container OOMKilled at the pod's own memory limit on a healthy node identifies ingestion capacity."}
 
   - id: observed_state_mismatch
     <<: *observability
@@ -2111,8 +2193,11 @@ nodes:
     interpretation: "This router separates k8s_storage_error (PVC/PV/CSI object control path) from storage_backend_error (NFS/Ceph/filesystem server path)."
     avoid: "Do not turn a generic mount retry or a Bound PVC into proof of backend health without the affected node's exact error."
     match:
-      any: ["stale file handle", "read-only file system", "nfs server", cephfs, "ceph health", "input/output error", "mount access denied", "access denied by server", "storage latency", provisioningfailed]
+      any: ["stale file handle", "read-only file system", "nfs server", cephfs, "ceph health", "input/output error", "mount access denied", "access denied by server", "storage latency", provisioningfailed, "not responding, still trying"]
     branches:
+      - match:
+          any: ["not responding, still trying"]
+        next: backend_nfs_unresponsive_retry
       - match:
           any: ["stale file handle", "nfs server not responding", "nfs server"]
         next: backend_nfs_stale_handle
@@ -2138,6 +2223,44 @@ nodes:
       confidence: "high only when the incident-era mount/CSI/workload error names a stale handle or NFS server response"
       disconfirm: ["PVC/PV object failure predates any NFS error, or the affected node has no matching NFS/server signature."]
       next_steps: ["Capture the export, server, and affected-node error timestamps.", "Restore export/server availability or remount only under the storage recovery procedure.", "Confirm I/O from the affected node before retrying the workload."]
+
+  # External-case promotion (enterprise_support:052176a42016): transient NFS
+  # "not responding, still trying" retry window vs the permanent stale handle
+  # above — different mechanism, different remediation (wait/scope vs remount).
+  - id: backend_nfs_unresponsive_retry
+    <<: *storage_backend
+    question: "Did the affected node's NFS client report the server as temporarily not responding, with its own automatic retry and recovery, before the workload's timeout — rather than a permanent stale file handle? Healthy mounts show no not-responding window during the incident. A self-recovering window still explains a downstream CreateContainer/mount-stat timeout; do not treat that timeout as a separate Run:ai or kubelet defect."
+    verify: "Read the affected node's journal for the exact 'nfs: server ... not responding, still trying' line and its matching recovery line, then repeat the same check on a healthy peer node sharing the same export to scope the failure to one node or the whole pool."
+    interpretation: "A transient not-responding window that recovers on its own implicates the NFS server or that node's path to it for exactly that window; the downstream CreateContainer/mount-stat timeout is collateral of the window, not an independent kubelet or Run:ai defect."
+    probes:
+      - id: k8s_troubleshooting:backend_nfs_unresponsive_retry:p01
+        tool: system_log_query
+        arguments_template:
+          source: journal
+          node: "{{node}}"
+          grep: "not responding, still trying"
+        incident_time_window: incident
+        expected_result_shape: "timestamped kernel NFS client not-responding/recovery lines for the affected node"
+        supports_when: ["the affected node logs an NFS server not-responding window that overlaps the workload's timeout"]
+        refutes_when: ["no not-responding window exists on the affected node during the incident, or the journal shows a permanent stale handle instead"]
+        support_signal_any: ["not responding, still trying"]
+        refute_signal_any: ["stale file handle"]
+        source_group: node_system
+    match:
+      any: ["not responding, still trying"]
+    conclusion:
+      family: storage_backend_error
+      summary: "The affected node's NFS client reported the server as temporarily unresponsive before the workload's startup/runtime timeout."
+      confidence: "high only when the not-responding window on the affected node overlaps the workload's timeout"
+      disconfirm:
+        - "No not-responding window exists on the affected node, or a stale-handle, access-denial, or unrelated startup event explains the timeout first."
+      next_steps:
+        - "Capture the not-responding and recovery timestamps on the affected node."
+        - "Repeat the same journal check on a healthy peer node using the same export; a shared window points to the export/server, a node-only window points to that node's network or client path."
+        - "Do not force-clear the stale container-name reservation or restart the workload until the recovery timestamp confirms the retry window finished."
+    alternatives:
+      - {family: workload_startup_error, reason: "The resulting CreateContainerError/context-deadline-exceeded and container-name-reservation conflict match the generic container-creation-timeout signature.", discriminator: "An NFS not-responding window on the same node immediately before the timeout identifies the storage backend as the trigger instead of a kubelet/containerd defect."}
+      - {family: k8s_storage_error, reason: "A CSI attach/publish or PVC binding failure produces the same stalled volume path without any NFS server fault.", discriminator: "FailedMount/FailedAttachVolume events on the pod identify the CSI/PVC layer; kernel 'not responding, still trying' retry lines on the node identify the backend server window instead."}
 
   - id: backend_mount_access_denied
     <<: *storage_backend

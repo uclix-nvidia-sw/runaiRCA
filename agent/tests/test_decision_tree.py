@@ -29,9 +29,20 @@ def test_curated_probe_templates_use_only_executable_read_only_tools() -> None:
     an unknown placeholder is added to YAML and silently becomes a no-op at
     runtime.  Optional backends (Prometheus/Loki) are still valid: the domain
     registry decides whether they are available for a particular deployment.
+    system_log_query is executable too (system domain registry), but only with
+    a time-windowable source — live-tail sources cannot see a past incident.
     """
+    from app.collectors.system import _TIME_WINDOWABLE_SOURCES
+
     raw = yaml.safe_load(TREE.read_text(encoding="utf-8"))
-    allowed_tools = {"k8s_read", "k8s_describe", "k8s_logs", "promql_query", "logql_query"}
+    allowed_tools = {
+        "k8s_read",
+        "k8s_describe",
+        "k8s_logs",
+        "promql_query",
+        "logql_query",
+        "system_log_query",
+    }
     allowed_placeholders = {
         "namespace",
         "pod",
@@ -62,6 +73,8 @@ def test_curated_probe_templates_use_only_executable_read_only_tools() -> None:
             assert resolve_read_kind(str(arguments["kind"])) is not None
         if probe["tool"] == "k8s_read":
             assert resolve_read_kind(str(arguments.get("kind") or "")) is not None
+        if probe["tool"] == "system_log_query":
+            assert str(arguments.get("source") or "") in _TIME_WINDOWABLE_SOURCES
         support_signals = probe.get("support_signal_any") or []
         refute_signals = probe.get("refute_signal_any") or []
         assert isinstance(support_signals, list)
