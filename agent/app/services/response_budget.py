@@ -14,6 +14,7 @@ _PROTECTED_CONTEXT_KEYS = frozenset(
         "llm_usage",
         "response_budget",
         "root_cause_candidates",
+        "scope_derivation",
         "target",
         "top_root_cause",
     }

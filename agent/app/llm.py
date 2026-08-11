@@ -269,6 +269,7 @@ async def complete_with_error(
             temperature=temperature,
             max_tokens=max_tokens,
             model=selected_model,
+            purpose=purpose,
         )
         if text:
             return text, None
@@ -386,6 +387,7 @@ async def _complete_with_nat_client(
     temperature: float,
     max_tokens: int | None,
     model: str,
+    purpose: str,
 ) -> tuple[str | None, str | None]:
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -411,7 +413,9 @@ async def _complete_with_nat_client(
             return text, error
         budget *= 2
         _log.warning(
-            "NAT LLM reply truncated at max_tokens (model=%s); retrying with max_tokens=%s",
+            "NAT LLM reply truncated at max_tokens "
+            "(purpose=%s, model=%s); retrying with max_tokens=%s",
+            purpose or "unspecified",
             model,
             budget,
         )

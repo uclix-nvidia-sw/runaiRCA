@@ -436,7 +436,9 @@ async def test_unusable_nat_reply_logs_why(monkeypatch, caplog) -> None:
 
 
 @pytest.mark.asyncio
-async def test_nat_length_truncation_retries_once_with_a_doubled_cap(monkeypatch) -> None:
+async def test_nat_length_truncation_retries_once_with_a_doubled_cap(
+    monkeypatch, caplog
+) -> None:
     """A reasoning model that spends the whole cap on thinking gets one bigger try.
 
     The direct-HTTP path has doubled once on finish_reason=length for a long
@@ -476,7 +478,11 @@ async def test_nat_length_truncation_retries_once_with_a_doubled_cap(monkeypatch
     token = llm.set_nat_client(ThinksTooLongClient())
     try:
         text, error = await llm.complete_with_error(
-            _settings(), system="system", user="user", max_tokens=3072
+            _settings(),
+            system="system",
+            user="user",
+            max_tokens=3072,
+            purpose="korean_translation",
         )
     finally:
         llm.reset_nat_client(token)
@@ -484,6 +490,7 @@ async def test_nat_length_truncation_retries_once_with_a_doubled_cap(monkeypatch
     assert caps == [3072, 6144], caps
     assert text == '{"ok": true}'
     assert error is None
+    assert "purpose=korean_translation" in caplog.text
     # The owner decision stands: doubling happens on NAT, never by switching.
     assert http_calls == []
 

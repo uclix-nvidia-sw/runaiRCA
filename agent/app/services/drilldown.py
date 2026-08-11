@@ -95,6 +95,7 @@ from app.mcp_client import (
     mcp_tool_json,
 )
 from app.plan import InvestigationPlan
+from app.progress import ProgressReporter
 from app.services.evidence_projection import observed_payload
 from app.services.probe_evaluation import ProbeAssessment, evaluate_probe
 from app.services.query_memory import QueryMemory, domain_query_key
@@ -111,6 +112,10 @@ _KNOWLEDGE_TOOLS = frozenset(
     {"knowledge_lookup", "case_lookup", "xid_lookup", "component_checks", "steps_lookup"}
 )
 _KNOWLEDGE_MATCH_CAP = 5
+
+
+def _normalize_knowledge_query(text: str) -> str:
+    return re.sub(r"[\s-]+", "_", text.strip().lower())
 _RUNAI_PROJECT_ID_CACHE: dict[tuple[str, str], str] = {}
 _USER_PROMPT_CHARS = 6000
 # An adapter-owned sentinel cannot be supplied by a JSON/MCP response.  It
@@ -185,6 +190,7 @@ async def run_drilldowns(
     evidence_sufficient: bool = False,
     deadline_monotonic: float | None = None,
     external_case_hints: list[dict[str, Any]] | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> None:
     """Run only the optional domain drill-downs still needed. Never raises."""
     if not settings.enable_agent_drilldown or not llm_configured(
@@ -217,6 +223,7 @@ async def run_drilldowns(
                     external_case_hints=_external_case_hints_for_domain(
                         result.agent, external_case_hints
                     ),
+                    reporter=reporter,
                 )
             ),
         )
@@ -272,6 +279,7 @@ class _Drilldown:
     blackboard: Any = None
     deadline_monotonic: float | None = None
     external_case_hints: list[dict[str, Any]] | None = None
+    reporter: ProgressReporter | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
     probe_attempts: dict[str, int] = field(default_factory=dict)
     # One fold ledger per agent run, spanning every round below: repeat calls to
@@ -294,6 +302,7 @@ class _Drilldown:
         query_memory: QueryMemory | None,
         deadline_monotonic: float | None,
         external_case_hints: list[dict[str, Any]] | None,
+        reporter: ProgressReporter | None,
     ) -> _Drilldown:
         memory = query_memory if query_memory is not None else QueryMemory()
         memory.seed_result(result, target)
@@ -313,6 +322,7 @@ class _Drilldown:
             blackboard=blackboard,
             deadline_monotonic=deadline_monotonic,
             external_case_hints=external_case_hints,
+            reporter=reporter,
         )
 
     def out_of_budget(self) -> bool:
@@ -466,6 +476,12 @@ class _Drilldown:
                 )
                 break
             step += 1
+            if self.reporter:
+                self.reporter.emit(
+                    "investigation",
+                    f"{self.result.agent} drill-down step {step}",
+                    step=step,
+                )
             decision, decision_error = await self.decide()
             if decision is None:
                 self.result.warnings.append(
@@ -539,6 +555,7 @@ async def _drill_one(
     skip_optional: bool = False,
     deadline_monotonic: float | None = None,
     external_case_hints: list[dict[str, Any]] | None = None,
+    reporter: ProgressReporter | None = None,
 ) -> None:
     """One agent's adaptive think->query->observe loop over its own evidence."""
     masker = _drilldown_masker(settings)
@@ -556,6 +573,7 @@ async def _drill_one(
             query_memory=query_memory,
             deadline_monotonic=deadline_monotonic,
             external_case_hints=external_case_hints,
+            reporter=reporter,
         )
         if not await session.run_declared_probes():
             return
@@ -2124,11 +2142,16 @@ def _knowledge_lookup_from_catalogs(settings: Settings, text: str) -> dict[str, 
         match_runai_known_issues,
     )
 
-    lowered = text.lower()
+    failure_modes = load_failure_modes(settings.failure_modes_file)
+    normalized = _normalize_knowledge_query(text)
     symptoms: list[dict[str, Any]] = []
-    for family, symptom in match_failure_mode_symptoms(
-        load_failure_modes(settings.failure_modes_file), lowered
-    )[:_KNOWLEDGE_MATCH_CAP]:
+    family_match = normalized if normalized in failure_modes else ""
+    matches = (
+        [(family_match, symptom) for symptom in failure_modes[family_match]]
+        if family_match
+        else match_failure_mode_symptoms(failure_modes, text.lower())
+    )
+    for family, symptom in matches[:_KNOWLEDGE_MATCH_CAP]:
         if symptom.get("runtime_package_id"):
             source = "novel" if is_matcher_only_family(family) else "learned"
         else:
@@ -2138,13 +2161,26 @@ def _knowledge_lookup_from_catalogs(settings: Settings, text: str) -> dict[str, 
                 "symptom": symptom.get("symptom"),
                 "family": family,
                 "source": source,
-                "matched_keywords": symptom.get("matched_keywords") or [],
+                "matched_keywords": (
+                    [f"family:{family}"]
+                    if family_match
+                    else symptom.get("matched_keywords") or []
+                ),
                 "actions": list(symptom.get("actions") or [])[:3],
                 # A novel family is guidance only — it can never headline an RCA,
                 # and the agent should not treat it as a settled root cause.
                 "matcher_only": is_matcher_only_family(family),
             }
         )
+    if family_match:
+        return {
+            "source": "catalog_fallback",
+            "summary": (
+                f"family '{family_match}': {len(symptoms)} known symptom(s) "
+                "— guidance to test, not evidence"
+            ),
+            "result": {"symptoms": symptoms, "known_issues": []},
+        }
     issues = [
         {
             "issue": entry.get("issue"),
@@ -2153,7 +2189,7 @@ def _knowledge_lookup_from_catalogs(settings: Settings, text: str) -> dict[str, 
             "actions": list(entry.get("actions") or [])[:3],
         }
         for entry in match_runai_known_issues(
-            load_runai_known_issues(settings.runai_known_issues_file), lowered
+            load_runai_known_issues(settings.runai_known_issues_file), text.lower()
         )[:_KNOWLEDGE_MATCH_CAP]
     ]
     if not symptoms and not issues:
@@ -2199,10 +2235,17 @@ def _knowledge_lookup_via_graph(client: Any, text: str) -> dict[str, Any]:
             "fixed_version": run(kg._KNOWLEDGE_FIXED_VERSION_QUERY),
         }
     knowledge = kg._project_knowledge(rows)
+    family_match = _normalize_knowledge_query(text)
+    if family_match not in knowledge:
+        family_match = ""
     matches: list[dict[str, Any]] = []
     for family, entries in knowledge.items():
+        if family_match and family != family_match:
+            continue
         for entry in entries:
-            hits, _negated = _keyword_hits(text, entry.get("keywords") or [])
+            hits = [f"family:{family}"] if family_match else _keyword_hits(
+                text.lower(), entry.get("keywords") or []
+            )[0]
             if not hits:
                 continue
             name = str(entry.get("symptom") or "")
@@ -2223,6 +2266,15 @@ def _knowledge_lookup_via_graph(client: Any, text: str) -> dict[str, Any]:
             matches.append(item)
     matches.sort(key=lambda item: -len(item["matched_keywords"]))
     matches = matches[:_KNOWLEDGE_MATCH_CAP]
+    if family_match:
+        return {
+            "source": "ontology",
+            "summary": (
+                f"family '{family_match}': {len(matches)} known symptom(s) "
+                "— guidance to test, not evidence"
+            ),
+            "result": {"symptoms": matches, "known_issues": []},
+        }
     if not matches:
         return {
             "source": "ontology",
@@ -2257,7 +2309,7 @@ async def _tool_knowledge_lookup(settings: Settings, target: AnalysisTarget, arg
         client = TypeDBClient(settings)
         try:
             return await asyncio.wait_for(
-                asyncio.to_thread(_knowledge_lookup_via_graph, client, text.lower()),
+                asyncio.to_thread(_knowledge_lookup_via_graph, client, text),
                 timeout=settings.typedb_timeout_seconds + 1,
             )
         except Exception:  # noqa: BLE001 - ontology lookup is best-effort
@@ -3018,13 +3070,14 @@ def _domain_tools(
     for agent_tools in registry.values():
         agent_tools["knowledge_lookup"] = {
             "description": (
-                "Look up what is ALREADY KNOWN about a symptom or hypothesis: matching "
+                "Look up what is ALREADY KNOWN by catalog family id or verbatim observed "
+                "error line: matching "
                 "catalog symptoms and operator-approved knowledge, each with its root-cause "
                 "family and confirmed remediation, plus matching Run:ai known issues. Consults "
                 "the live knowledge ontology in TypeDB first, falling back to the built-in "
                 "catalog. This is guidance to TEST with your own domain tools — it is never "
                 "evidence, and an entry marked matcher_only must not be reported as the root "
-                "cause. args: hypothesis (the text you want to look up)"
+                "cause. args: hypothesis (a catalog family id or verbatim observed error line)"
             ),
             "call": _tool_knowledge_lookup,
         }

@@ -378,18 +378,14 @@ async def test_kubernetes_fallback_requires_one_complete_positive_deficit(monkey
 
 
 @pytest.mark.asyncio
-async def test_flag_off_short_circuits_before_classifier(monkeypatch) -> None:
+async def test_flag_off_records_skip_receipt(monkeypatch) -> None:
     state = _state(enabled=False)
     original_target = state.target
     state.plan = None
 
-    def forbidden(*_args):
-        raise AssertionError("classifier called while rollout flag was off")
-
     async def plan(*_args):
         return InvestigationPlan()
 
-    monkeypatch.setattr(pipeline, "classify_scope_less_quantity_alert", forbidden)
     monkeypatch.setattr(pipeline, "plan_investigation", plan)
 
     await pipeline.plan_stage(state)
@@ -397,11 +393,15 @@ async def test_flag_off_short_circuits_before_classifier(monkeypatch) -> None:
     assert state.target == original_target
     assert state.plan is not None and state.plan.as_dict() == InvestigationPlan().as_dict()
     assert state.extra_warnings == []
-    assert state.scope_derivation is None
+    assert state.scope_derivation == {
+        "dimension": "node",
+        "value": "",
+        "skipped": "flag_disabled",
+    }
 
 
 @pytest.mark.asyncio
-async def test_timeout_leaves_response_relevant_state_unchanged(monkeypatch) -> None:
+async def test_timeout_records_skip_without_mutating_scope(monkeypatch) -> None:
     state = _state()
 
     async def blocked(*_args):
@@ -415,7 +415,6 @@ async def test_timeout_leaves_response_relevant_state_unchanged(monkeypatch) -> 
         list(state.warnings),
         list(state.extra_warnings),
         list(state.artifacts),
-        state.scope_derivation,
     )
 
     await pipeline._derive_quantity_alert_scope(state)
@@ -426,8 +425,101 @@ async def test_timeout_leaves_response_relevant_state_unchanged(monkeypatch) -> 
         state.warnings,
         state.extra_warnings,
         state.artifacts,
-        state.scope_derivation,
     ) == before
+    assert state.scope_derivation == {
+        "dimension": "node",
+        "value": "",
+        "skipped": "timeout",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reason", "configure"),
+    [
+        (
+            "flag_disabled",
+            lambda state: setattr(
+                state,
+                "settings",
+                replace(state.settings, enable_quantity_scope_derivation=False),
+            ),
+        ),
+        (
+            "no_runai_mcp_url",
+            lambda state: setattr(
+                state, "settings", replace(state.settings, runai_mcp_url="")
+            ),
+        ),
+        ("no_plan", lambda state: setattr(state, "plan", None)),
+        ("resolved_reanalysis", lambda state: setattr(state.request.alert, "status", "resolved")),
+    ],
+)
+async def test_scope_derivation_gate_skip_receipts(monkeypatch, reason, configure) -> None:
+    state = _state()
+    configure(state)
+
+    async def forbidden(*_args):
+        raise AssertionError("derivation round ran past a blocking gate")
+
+    monkeypatch.setattr(pipeline, "_quantity_scope_round", forbidden)
+    await pipeline._derive_quantity_alert_scope(state)
+
+    assert state.scope_derivation == {
+        "dimension": "node",
+        "value": "",
+        "skipped": reason,
+    }
+
+
+@pytest.mark.asyncio
+async def test_scope_derivation_deadline_exhausted_receipt(monkeypatch) -> None:
+    state = _state()
+    monkeypatch.setattr(pipeline, "_evidence_deadline_monotonic", lambda _state: 0.0)
+
+    await pipeline._derive_quantity_alert_scope(state)
+
+    assert state.scope_derivation == {
+        "dimension": "node",
+        "value": "",
+        "skipped": "deadline_exhausted",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["exception", "none"])
+async def test_scope_derivation_round_skip_receipts(monkeypatch, failure) -> None:
+    state = _state()
+
+    async def round_result(*_args):
+        if failure == "exception":
+            raise RuntimeError("boom")
+        return None
+
+    monkeypatch.setattr(pipeline, "_quantity_scope_round", round_result)
+    await pipeline._derive_quantity_alert_scope(state)
+
+    assert state.scope_derivation == {
+        "dimension": "node",
+        "value": "",
+        "skipped": "derivation_failed" if failure == "exception" else "no_unique_deficit",
+    }
+
+
+@pytest.mark.asyncio
+async def test_non_quantity_alert_has_no_scope_derivation_receipt(monkeypatch) -> None:
+    state = _state(enabled=False)
+    state.request.alert.labels = {"alertname": "Pod Down"}
+    state.request.alert.annotations = {}
+    state.target = resolve_target(state.request.alert.labels, state.request.alert.annotations)
+
+    async def forbidden(*_args):
+        raise AssertionError("non-quantity alert reached derivation I/O")
+
+    monkeypatch.setattr(pipeline, "_quantity_scope_round", forbidden)
+    await pipeline._derive_quantity_alert_scope(state)
+
+    assert state.scope_derivation is None
 
 
 @pytest.mark.asyncio
