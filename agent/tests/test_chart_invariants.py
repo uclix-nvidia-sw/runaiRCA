@@ -20,6 +20,13 @@ MCP_TEMPLATE = (
     Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "mcp-services.yaml"
 )
 AGENT_TEMPLATE = Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "agent.yaml"
+SYSTEM_AGENT_TEMPLATE = (
+    Path(__file__).parents[2]
+    / "charts"
+    / "runai-rca"
+    / "templates"
+    / "system-agent-daemonset.yaml"
+)
 # Images we build and publish to the org registry — the ONLY repositories allowed
 # to be short (unqualified), because global.imageRegistry is meant to prefix them.
 OWN_IMAGES = {
@@ -281,11 +288,20 @@ def test_agent_pod_exec_rbac_allows_websocket_get_and_post_create() -> None:
 
 
 def test_system_agent_supports_time_bounded_journal_reads() -> None:
-    text = (Path(__file__).parents[2] / "charts" / "runai-rca" / "templates" / "system-agent-daemonset.yaml").read_text(encoding="utf-8")
+    text = SYSTEM_AGENT_TEMPLATE.read_text(encoding="utf-8")
     assert '"--since", since' in text
     assert '"--until", until' in text
     assert '"--output=short-iso"' in text
     assert "def rfc3339(value):" in text
+
+
+def test_system_agent_slices_snapshots_from_head_and_logs_from_tail() -> None:
+    text = SYSTEM_AGENT_TEMPLATE.read_text(encoding="utf-8")
+    collect = text.split("    def collect(", 1)[1].split("    class Handler", 1)[0]
+
+    assert 'if source in ("nvidia-smi", "nvlink"):' in collect
+    assert "return output[:lines]" in collect
+    assert "return output[-lines:]" in collect
 
 
 def test_runai_crd_rbac_matches_the_k8s_read_allowlist_exactly() -> None:

@@ -510,9 +510,39 @@ def _promql_returns_range_vector(query: str) -> bool:
     return False
 
 
+def _normalize_promql(query: str) -> str:
+    """Drop JSON-style escaped slashes inside PromQL double-quoted strings."""
+    normalized: list[str] = []
+    in_string = False
+    index = 0
+    while index < len(query):
+        char = query[index]
+        if not in_string:
+            normalized.append(char)
+            in_string = char == '"'
+            index += 1
+            continue
+        if char == '"':
+            normalized.append(char)
+            in_string = False
+        elif char == "\\" and index + 1 < len(query):
+            # Slash-only: other invalid escapes may be regex intent and must fail loudly.
+            if query[index + 1] == "/":
+                normalized.append("/")
+            else:
+                normalized.extend(query[index : index + 2])
+            index += 2
+            continue
+        else:
+            normalized.append(char)
+        index += 1
+    return "".join(normalized)
+
+
 def _prometheus_query_path_and_params(
     query: str, time_range: dict[str, str] | None
 ) -> tuple[str, dict[str, str]]:
+    query = _normalize_promql(query)
     if not time_range:
         return "/api/v1/query", {"query": query}
     if _promql_returns_range_vector(query):
@@ -541,8 +571,11 @@ async def _collect_prometheus_direct(
             verify=mcp_tls_verify(),
         )
         status = _prometheus_status(response.data)
-        error = response.error or _prometheus_api_error(
-            response.data, status, require_success_status=True
+        error = _prometheus_api_error(
+            response.data,
+            status,
+            require_success_status=True,
+            http_error=response.error,
         )
         result_data = _prometheus_result(response.data)
         if error is None and not _prometheus_result_complete(response.data):
@@ -568,21 +601,32 @@ async def _collect_prometheus_direct(
 
 
 def _prometheus_api_error(
-    data: object, status: str, *, require_success_status: bool = False
+    data: object,
+    status: str,
+    *,
+    require_success_status: bool = False,
+    http_error: str | None = None,
 ) -> str | None:
-    """Return a native Prometheus API error hidden behind an HTTP 200 response.
+    """Return a bounded native Prometheus API or HTTP error.
 
     A malformed PromQL query can yield ``{status: error}`` without a transport
     error. It must not fall through as a zero-series result, which would turn a
     failed lookup into an RCA-safe absence verdict.
     """
-    if status == "success" or (status == "unknown" and not require_success_status):
+    if not http_error and (
+        status == "success" or (status == "unknown" and not require_success_status)
+    ):
         return None
+    detail = ""
     if isinstance(data, dict):
-        detail = str(data.get("error") or data.get("errorType") or "").strip()
-        if detail:
-            return f"Prometheus API status {status}: {detail}"
-    return f"Prometheus API status {status}"
+        details = [str(data.get(key) or "").strip() for key in ("errorType", "error")]
+        detail = ": ".join(dict.fromkeys(value for value in details if value))
+        if not detail:
+            detail = str(data.get("body") or "").strip()
+    message = http_error or f"Prometheus API status {status}"
+    if detail:
+        message = f"{message}: {' '.join(detail.split())}"
+    return message if len(message) <= 200 else f"{message[:199].rstrip()}…"
 
 
 async def _collect_prometheus_mcp(
@@ -690,6 +734,7 @@ def _prometheus_mcp_args(
     datasource_uid: str,
     time_range: dict[str, str] | None,
 ) -> dict[str, object]:
+    promql = _normalize_promql(promql)
     query_window = time_range or {"start": "now-15m", "end": "now"}
     if _promql_returns_range_vector(promql):
         return {
@@ -930,6 +975,7 @@ def _prometheus_query_artifact(
             "value_summary": item.get("value_summary") or {},
             "sample": item.get("sample") or [],
             "time_range": time_range,
+            "error": item.get("error"),
         },
     )
 
@@ -1536,7 +1582,12 @@ async def prom_query(
         verify=mcp_tls_verify(),
     )
     status = _prometheus_status(resp.data)
-    error = resp.error or _prometheus_api_error(resp.data, status, require_success_status=True)
+    error = _prometheus_api_error(
+        resp.data,
+        status,
+        require_success_status=True,
+        http_error=resp.error,
+    )
     result_data = _prometheus_result(resp.data)
     if error is None and not _prometheus_result_complete(resp.data):
         error = "Prometheus response missing data.result"

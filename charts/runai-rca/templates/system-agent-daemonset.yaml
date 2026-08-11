@@ -104,7 +104,10 @@ data:
             return ["system-agent error: %s" % exc]
         if source == "fabricmanager" and not res.stdout.strip():
             return read_fabricmanager(lines)
-        return res.stdout.splitlines()[-lines:]
+        output = res.stdout.splitlines()
+        if source in ("nvidia-smi", "nvlink"):
+            return output[:lines]
+        return output[-lines:]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
