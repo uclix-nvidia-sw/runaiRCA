@@ -157,6 +157,26 @@ def test_kubernetes_prompt_refuses_configuration_as_observed_preemption() -> Non
     assert "require an active condition or target-scoped Warning Event" in prompt
 
 
+def test_system_prompt_nudges_knowledge_lookup_on_new_hypothesis() -> None:
+    # P1-B: the model must be told to consult the knowledge tools when it
+    # forms/revises a hypothesis, not just react to ontology_guidance handed
+    # to it up front -- placed right after that bullet, batched with evidence
+    # queries, and framed as guidance to test, never evidence.
+    prompt = drilldown._system_prompt("kubernetes", {})
+
+    assert (
+        "When you form or revise a hypothesis, first check what is already known: "
+        "call knowledge_lookup (your hypothesis), case_lookup (a verbatim observed "
+        "error line), xid_lookup (an XID number you saw), component_checks (the "
+        "platform component you are investigating), or steps_lookup (a candidate "
+        "family)." in prompt
+    )
+    assert "never evidence and never something to re-report" in prompt
+    assert prompt.index("If ontology_guidance is supplied") < prompt.index(
+        "When you form or revise a hypothesis"
+    )
+
+
 def _target() -> AnalysisTarget:
     return AnalysisTarget(
         cluster="",

@@ -9,7 +9,7 @@ import re
 import textwrap
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, TypeVar
@@ -2864,6 +2864,36 @@ def _final_conclusion_line(final_family: str, settings: Settings) -> str:
     return f"- **Final conclusion** (supersedes the re-analysis note above): {final_family}"
 
 
+def _knowledge_consultation_rows(results: list[CollectorResult]) -> list[dict[str, Any]]:
+    """Drill-down knowledge receipts, agent-attributed and capped.
+
+    drilldown.py's _KNOWLEDGE_TOOLS branch writes a receipt into each
+    collector's ``result.details["knowledge_lookups"]`` (never an artifact --
+    see that module for why), but nothing downstream reads it: a mid-loop
+    knowledge consultation is otherwise invisible outside tests. Lifting it
+    into ``response.context["knowledge_consultations"]`` is what makes it
+    reach the operator (and, via store.go's allowlist, persisted metadata).
+
+    Order is chronological/first-seen (results, then each result's own
+    receipts in append order). Capped at 20 rows with a trailing summary
+    entry when more existed, rather than an unbounded transcript dump.
+    """
+    rows = [
+        {"agent": result.agent, **receipt}
+        for result in results
+        if isinstance(result.details, dict)
+        for receipt in result.details.get("knowledge_lookups") or []
+        if isinstance(receipt, dict)
+    ]
+    if len(rows) > 20:
+        omitted = len(rows) - 20
+        rows = rows[:20]
+        rows.append(
+            {"agent": "", "tool": "", "query": "", "source": "", "summary": f"+{omitted} more"}
+        )
+    return rows
+
+
 async def harness_stage(state: PipelineState) -> PipelineState:
     """Validate the already-synthesized RCA and make bounded safe repairs."""
     from app.services.harness import (
@@ -3037,6 +3067,9 @@ async def harness_stage(state: PipelineState) -> PipelineState:
     ]
     response.context["top_root_cause"] = top.as_dict() if top else None
     response.context["specific_cause"] = response.specific_cause
+    knowledge_rows = _knowledge_consultation_rows(state.results)
+    if knowledge_rows:
+        response.context["knowledge_consultations"] = knowledge_rows
     harness_payload = payload(verdict, status=status, repairs=repairs)
     response.context["harness"] = harness_payload
     response.context["confidence_diagnostics"] = _confidence_diagnostics(
@@ -4437,6 +4470,29 @@ def _detail_from(
         lines.append("- Agent role contract file was not loaded; fallback guidance was used.")
     lines.extend(_affected_pods_lines(request, knowledge.language))
     lines.extend(["", "### Troubleshooting Playbook", ""])
+    plan_component = getattr(plan, "component", "") if plan is not None else ""
+    # Leads for the insufficient_evidence hedge (_insufficient_evidence_playbook_
+    # lines): the alert target's own component-identity family first (a metric
+    # alert with no error text still resolves one via runai_architecture.yaml),
+    # then ranked candidate families in rank order. Built here, where both
+    # plan.component and root_cause_candidates are already in scope -- no need
+    # to re-derive settings.architecture_file, knowledge.components already IS
+    # load_architecture's output.
+    family_leads: list[str] = []
+    if plan_component:
+        comp_entry = (knowledge.components or {}).get(plan_component) or {}
+        comp_family = str(comp_entry.get("family") or "")
+        if comp_family:
+            family_leads.append(comp_family)
+    for candidate in root_cause_candidates or []:
+        if len(family_leads) >= 2:
+            break
+        if (
+            candidate.family
+            and candidate.family != "insufficient_evidence"
+            and candidate.family not in family_leads
+        ):
+            family_leads.append(candidate.family)
     lines.extend(
         # Same reasoning as _knowledge_base_lines above: a fuzzy hit here can
         # become the headline playbook entry (including the exclusive_actions
@@ -4446,9 +4502,10 @@ def _detail_from(
             observed_text,
             _alert_signature_text(request),
             knowledge=knowledge,
-            component=getattr(plan, "component", "") if plan is not None else "",
+            component=plan_component,
             allow_remediation=allow_cause_specific_actions,
             case_cards=list((kg_context or {}).get("case_cards") or []),
+            family_leads=family_leads,
         )
     )
     lines.extend(_similar_incident_lines(request))
@@ -7834,6 +7891,7 @@ def _playbook_lines(
     knowledge: ReportKnowledge,
     allow_remediation: bool = True,
     case_cards: list[dict] | None = None,
+    family_leads: Sequence[str] = (),
 ) -> list[str]:
     """Root-cause-relevant remediation, most specific first.
 
@@ -7915,7 +7973,11 @@ def _playbook_lines(
         # must not swallow the hedged reference block — an evidence-poor run
         # with a component identity is exactly where these references matter.
         hedged = _insufficient_evidence_playbook_lines(
-            symptom_matches, case_cards, knowledge=knowledge, masker=active_masker
+            symptom_matches,
+            case_cards,
+            knowledge=knowledge,
+            masker=active_masker,
+            family_leads=family_leads,
         )
         if lines:
             return [*lines, *hedged]
@@ -8004,6 +8066,7 @@ def _insufficient_evidence_playbook_lines(
     *,
     knowledge: ReportKnowledge,
     masker: Masker,
+    family_leads: Sequence[str] = (),
 ) -> list[str]:
     """Reference-only guidance for a run that never settled on a cause family.
 
@@ -8014,10 +8077,19 @@ def _insufficient_evidence_playbook_lines(
     reference material -- never as this run's cause -- so the section stops
     dead-ending at "no playbook matched" without pretending to know more than
     the evidence supports.
+
+    ``family_leads`` are families the run points to WITHOUT a keyword match --
+    typically the alert target's own component identity, then ranked
+    candidates -- so an evidence-poor run (a metric alert with no error text)
+    still gets a reference block instead of falling through to "nothing
+    matched" despite carrying a real lead. Also unconfirmed reference
+    material, same as a keyword hit.
     """
     ko = knowledge.language == "ko"
     body: list[str] = []
+    covered_families: set[str] = set()
     for family, symptom in symptom_matches[:2]:
+        covered_families.add(family)
         tag = "(지식 매칭 — 미확정)" if ko else "(knowledge match — unconfirmed)"
         symptom_name = _safe_line(
             _localized_failure_mode_name(symptom, knowledge.language), limit=180, masker=masker
@@ -8032,6 +8104,34 @@ def _insufficient_evidence_playbook_lines(
         )
         if reason:
             body.append(f"  - {reason}")
+    lead_tag = (
+        "(컴포넌트 정체성 기반 — 미확정)" if ko else "(component-identity lead — unconfirmed)"
+    )
+    rendered_leads = 0
+    for family in family_leads:
+        if rendered_leads >= 2:
+            break
+        if family in covered_families:
+            continue
+        lead_actions: list[str] = []
+        for symptom in knowledge.failure_modes.get(family) or []:
+            for action in _localized_failure_mode_actions(symptom, knowledge.language):
+                if action not in lead_actions:
+                    lead_actions.append(action)
+                if len(lead_actions) >= 3:
+                    break
+            if len(lead_actions) >= 3:
+                break
+        if not lead_actions:
+            # No knowledge for this family to reference -- skip it silently
+            # rather than render a bare, actionless header.
+            continue
+        covered_families.add(family)
+        rendered_leads += 1
+        body.append(f"- **{_family_label(family)}** {lead_tag}")
+        body.extend(
+            f"  - {_safe_line(action, limit=360, masker=masker)}" for action in lead_actions
+        )
     body.extend(_external_reference_case_lines(case_cards or [], ko, masker))
     if not body:
         # Nothing to reference: the caller renders its own fallback (or keeps

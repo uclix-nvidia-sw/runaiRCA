@@ -80,6 +80,39 @@ def test_oversized_response_preserves_report_and_fits_budget() -> None:
     assert response.artifacts[0].summary.startswith("Discovery parsing failed")
 
 
+def test_knowledge_consultations_is_protected_from_budget_trimming() -> None:
+    # P1-A: knowledge_consultations must survive the same transport shrink
+    # that already protects harness/top_root_cause -- otherwise a run with a
+    # big-enough report silently loses its knowledge-consultation receipts
+    # before they ever reach the backend's persisted-metadata allowlist.
+    response = _response("")
+    response.context["knowledge_consultations"] = [
+        {
+            "agent": "kubernetes",
+            "tool": "knowledge_lookup",
+            "query": "q",
+            "summary": "s",
+            "source": "catalog_fallback",
+        }
+    ]
+    response.context["fat_unprotected"] = "x" * 100_000
+    budget = 64 << 10
+
+    assert enforce_analysis_response_budget(response, budget, language="ko")
+
+    assert analysis_response_bytes(response) <= budget
+    assert response.context.get("knowledge_consultations") == [
+        {
+            "agent": "kubernetes",
+            "tool": "knowledge_lookup",
+            "query": "q",
+            "summary": "s",
+            "source": "catalog_fallback",
+        }
+    ]
+    assert "fat_unprotected" not in response.context
+
+
 def test_pathological_report_body_is_bounded_as_last_resort() -> None:
     response = _response("")
     response.analysis_detail = "원인과 조치 " * 50_000

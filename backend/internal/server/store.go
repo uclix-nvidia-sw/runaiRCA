@@ -1682,6 +1682,13 @@ func metadataFromAgentContext(context map[string]any) map[string]any {
 			out[key] = cloneAnyMap(value)
 		}
 	}
+	// knowledge_consultations is a JSON array (agent/app/services/pipeline.py
+	// builds it as a list of receipt dicts), not an object, so it decodes to
+	// []any here rather than the map[string]any the loop above expects -- a
+	// plain append to that allowlist would silently never match.
+	if rows, ok := context["knowledge_consultations"].([]any); ok {
+		out["knowledge_consultations"] = append([]any{}, rows...)
+	}
 	if hash, ok := context["analysis_hash"].(string); ok && hash != "" {
 		out["analysis_hash"] = hash
 	}

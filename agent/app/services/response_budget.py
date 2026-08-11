@@ -10,6 +10,7 @@ _PROTECTED_CONTEXT_KEYS = frozenset(
     {
         "analysis_hash",
         "harness",
+        "knowledge_consultations",
         "llm_usage",
         "response_budget",
         "root_cause_candidates",

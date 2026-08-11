@@ -12,7 +12,8 @@ import app.ontology.typedb_client as typedb_client_module
 import app.services.kg_enrichment as kg_enrichment
 from app.collectors.base import AnalysisTarget, CollectorResult
 from app.ontology.typedb_client import escape_typeql
-from app.services import drilldown
+from app.schemas import Alert, AlertAnalysisRequest, AlertAnalysisResponse
+from app.services import drilldown, pipeline
 from tests.test_orchestrator import make_settings
 
 
@@ -658,7 +659,14 @@ def test_xid_lookup_answer_never_becomes_evidence() -> None:
     assert result.artifacts == [], "xid_lookup answers must not be stored as artifacts"
     assert len(history) == 1
     lookups = result.details.get("knowledge_lookups")
-    assert lookups == [{"tool": "xid_lookup", "query": "79", "summary": lookups[0]["summary"]}]
+    assert lookups == [
+        {
+            "tool": "xid_lookup",
+            "query": "79",
+            "summary": lookups[0]["summary"],
+            "source": "catalog_fallback",
+        }
+    ]
     assert lookups[0]["summary"]
 
 
@@ -671,6 +679,7 @@ def test_component_checks_answer_never_becomes_evidence() -> None:
     lookups = result.details.get("knowledge_lookups")
     assert lookups and lookups[0]["tool"] == "component_checks"
     assert lookups[0]["query"] == "runai-agent"
+    assert lookups[0]["source"] == "catalog_fallback"
 
 
 def test_case_lookup_answer_never_becomes_evidence() -> None:
@@ -684,6 +693,9 @@ def test_case_lookup_answer_never_becomes_evidence() -> None:
     lookups = result.details.get("knowledge_lookups")
     assert lookups and lookups[0]["tool"] == "case_lookup"
     assert lookups[0]["query"] == "Xid 48 ECC error"
+    # case_lookup's answer carries no top-level "source" -- "" is the honest
+    # value, not a missing field.
+    assert lookups[0]["source"] == ""
 
 
 def test_steps_lookup_answer_never_becomes_evidence() -> None:
@@ -697,3 +709,173 @@ def test_steps_lookup_answer_never_becomes_evidence() -> None:
     lookups = result.details.get("knowledge_lookups")
     assert lookups and lookups[0]["tool"] == "steps_lookup"
     assert lookups[0]["query"] == "gpu_hardware_error"
+    assert lookups[0]["source"] == "unavailable"
+
+
+def test_receipt_bounds_query_summary_and_source() -> None:
+    # Drives the real _run_query (not a real tool) so the bounding logic in
+    # the _KNOWLEDGE_TOOLS receipt branch is exercised directly, independent
+    # of what any one catalog/graph tool happens to return.
+    async def _oversized_answer(settings, target, args):
+        return {"source": "x" * 50, "summary": "y" * 300}
+
+    result, history = _drive_run_query("xid_lookup", _oversized_answer, {"xid": "z" * 200})
+    assert len(history) == 1
+    lookups = result.details.get("knowledge_lookups")
+    assert lookups
+    receipt = lookups[0]
+    assert receipt["query"] == "z" * 120
+    assert receipt["summary"] == "y" * 160
+    assert receipt["source"] == "x" * 32
+
+
+# --- pipeline: lifting receipts into response.context["knowledge_consultations"] --
+
+
+def test_knowledge_consultation_rows_attributes_each_receipt_to_its_agent() -> None:
+    receipt_1 = {
+        "tool": "knowledge_lookup",
+        "query": "q1",
+        "summary": "s1",
+        "source": "catalog_fallback",
+    }
+    receipt_2 = {"tool": "xid_lookup", "query": "79", "summary": "s2", "source": "catalog_fallback"}
+    receipt_3 = {"tool": "case_lookup", "query": "q3", "summary": "s3", "source": ""}
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="",
+            details={"knowledge_lookups": [receipt_1, receipt_2]},
+        ),
+        CollectorResult(agent="loki", status="ok", summary="", details={}),
+        CollectorResult(
+            agent="prometheus", status="ok", summary="", details={"knowledge_lookups": [receipt_3]}
+        ),
+    ]
+
+    rows = pipeline._knowledge_consultation_rows(results)
+
+    # Chronological / first-seen: kubernetes's two receipts, in append order,
+    # then prometheus's; loki contributed none and is absent, not a blank row.
+    assert rows == [
+        {"agent": "kubernetes", **receipt_1},
+        {"agent": "kubernetes", **receipt_2},
+        {"agent": "prometheus", **receipt_3},
+    ]
+
+
+def test_knowledge_consultation_rows_empty_when_no_receipts_anywhere() -> None:
+    results = [
+        CollectorResult(agent="kubernetes", status="ok", summary=""),
+        CollectorResult(agent="loki", status="ok", summary="", details={"knowledge_lookups": []}),
+    ]
+    assert pipeline._knowledge_consultation_rows(results) == []
+
+
+def test_knowledge_consultation_rows_ignores_malformed_details_and_entries() -> None:
+    # Defensive filters from the spec: a non-dict details/entry must not crash
+    # or leak a garbage row, it is silently skipped.
+    results = [
+        CollectorResult(
+            agent="a", status="ok", summary="", details={"knowledge_lookups": "not-a-list"}
+        ),
+        CollectorResult(
+            agent="b", status="ok", summary="", details={"knowledge_lookups": ["not-a-dict"]}
+        ),
+        CollectorResult(
+            agent="c",
+            status="ok",
+            summary="",
+            details={
+                "knowledge_lookups": [
+                    {"tool": "knowledge_lookup", "query": "ok", "summary": "ok", "source": ""}
+                ]
+            },
+        ),
+    ]
+    rows = pipeline._knowledge_consultation_rows(results)
+    assert rows == [
+        {"agent": "c", "tool": "knowledge_lookup", "query": "ok", "summary": "ok", "source": ""}
+    ]
+
+
+def test_knowledge_consultation_rows_caps_at_20_with_trailing_summary_entry() -> None:
+    receipts = [
+        {
+            "tool": "knowledge_lookup",
+            "query": f"q{i}",
+            "summary": f"s{i}",
+            "source": "catalog_fallback",
+        }
+        for i in range(25)
+    ]
+    results = [
+        CollectorResult(
+            agent="kubernetes", status="ok", summary="", details={"knowledge_lookups": receipts}
+        )
+    ]
+
+    rows = pipeline._knowledge_consultation_rows(results)
+
+    assert len(rows) == 21
+    assert [row["query"] for row in rows[:20]] == [f"q{i}" for i in range(20)]
+    assert rows[20] == {"agent": "", "tool": "", "query": "", "source": "", "summary": "+5 more"}
+
+
+def _harness_state(results: list[CollectorResult]) -> pipeline.PipelineState:
+    settings = replace(make_settings(), enable_rca_output_harness=True)
+    request = AlertAnalysisRequest(
+        incident_id="INC-knowledge-context",
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "SomeAlert", "namespace": "runai"},
+            annotations={"summary": "test"},
+            startsAt="2026-08-11T00:00:00Z",
+        ),
+    )
+    state = pipeline.new_state(settings, request, collectors=[])
+    state.results = results
+    state.root_cause_candidates = []
+    state.response = AlertAnalysisResponse(
+        status="ok",
+        thread_ts="",
+        analysis="",
+        analysis_summary="",
+        analysis_detail="",
+        analysis_type="firing",
+        analysis_quality="medium",
+        root_cause_family="",
+        missing_data=[],
+        warnings=[],
+        capabilities={},
+        context={},
+        artifacts=[],
+    )
+    return state
+
+
+def test_harness_stage_lifts_knowledge_receipts_into_response_context() -> None:
+    receipt = {
+        "agent": "kubernetes",
+        "tool": "knowledge_lookup",
+        "query": "q1",
+        "summary": "s1",
+        "source": "catalog_fallback",
+    }
+    results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="",
+            details={"knowledge_lookups": [{k: v for k, v in receipt.items() if k != "agent"}]},
+        )
+    ]
+    state = asyncio.run(pipeline.harness_stage(_harness_state(results)))
+    assert state.response.context["knowledge_consultations"] == [receipt]
+
+
+def test_harness_stage_omits_knowledge_consultations_key_when_none_exist() -> None:
+    results = [CollectorResult(agent="kubernetes", status="ok", summary="")]
+    state = asyncio.run(pipeline.harness_stage(_harness_state(results)))
+    assert "knowledge_consultations" not in state.response.context

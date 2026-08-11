@@ -216,6 +216,50 @@ func TestAnalysisRunStoresUsageAndPreservesLastGoodMetadataOnReanalysis(t *testi
 	}
 }
 
+// TestAnalysisRunPersistsKnowledgeConsultations covers P1-A's backend half:
+// response.context["knowledge_consultations"] (agent/app/services/pipeline.py)
+// is a JSON ARRAY of receipt objects, not an object -- it decodes to []any,
+// not the map[string]any the rest of metadataFromAgentContext's allowlist
+// loop expects. This pins that the []any shape actually survives into
+// persisted run metadata (a plain string append to that loop's key list
+// would silently never match the type assertion).
+func TestAnalysisRunPersistsKnowledgeConsultations(t *testing.T) {
+	store := NewStore()
+	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "knowledge-consult"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "RunAIQueueBlocked", "severity": "warning"},
+		Annotations: map[string]string{"summary": "Queue blocked"},
+		Fingerprint: "fp-knowledge-consult",
+	})
+	run := store.CreateAnalysisRun("manual", "incident", incident.IncidentID, incident.IncidentID, alert.AlertID, "Manual", "")
+	rows := []any{
+		map[string]any{
+			"agent":   "kubernetes",
+			"tool":    "knowledge_lookup",
+			"query":   "OOMKilled",
+			"summary": "1 known symptom(s), 0 known issue(s) — guidance to test, not evidence",
+			"source":  "catalog_fallback",
+		},
+	}
+	completed, ok := store.CompleteAnalysisRun(run.RunID, AgentAnalysisResponse{
+		AnalysisSummary: "done",
+		Context: map[string]any{
+			"knowledge_consultations": rows,
+		},
+	})
+	if !ok {
+		t.Fatalf("complete failed")
+	}
+	got, ok := completed.Metadata["knowledge_consultations"].([]any)
+	if !ok || len(got) != 1 {
+		t.Fatalf("knowledge_consultations metadata missing or wrong shape: %+v", completed.Metadata)
+	}
+	row, ok := got[0].(map[string]any)
+	if !ok || row["tool"] != "knowledge_lookup" || row["source"] != "catalog_fallback" {
+		t.Fatalf("knowledge_consultations row did not round-trip: %+v", got[0])
+	}
+}
+
 func TestFailedReanalysisRestoresLastGoodMetadata(t *testing.T) {
 	store := NewStore()
 	incident, alert := store.UpsertAlert(AlertmanagerWebhook{GroupKey: "metadata-restore"}, Alert{
