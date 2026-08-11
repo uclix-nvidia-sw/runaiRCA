@@ -79,19 +79,58 @@ def test_lines_tolerates_shapes() -> None:
 
 
 @pytest.mark.parametrize(
-    ("line", "flagged"),
+    ("source", "line", "flagged"),
     [
-        ("Replay Error Counter: 12", False),
-        ("Recovery Error Counter: 3", False),
-        ("CRC Error Counter: 7", False),
-        ("Error Count: 3", True),
-        ("uncorrectable error", True),
+        ("nvlink", "Replay Error Counter: 12", False),
+        ("nvlink", "Recovery Error Counter: 3", False),
+        ("nvlink", "CRC Error Counter: 7", False),
+        (
+            "nvidia-smi",
+            "                SRAM Uncorrectable Parity                  : 0",
+            False,
+        ),
+        (
+            "nvidia-smi",
+            "                SRAM Uncorrectable SEC-DED                 : 0",
+            False,
+        ),
+        (
+            "nvidia-smi",
+            "                DRAM Uncorrectable                         : 0",
+            False,
+        ),
+        (
+            "nvidia-smi",
+            "            Inactive Correctable Error                     : 0",
+            False,
+        ),
+        ("nvidia-smi", "                DRAM Uncorrectable : 3", True),
+        ("nvlink", "\t Link 1: <inactive>", True),
+        ("nvidia-smi", "NVRM: Xid 79", True),
+        ("nvlink", "Error Count: 3", True),
+        ("nvlink", "uncorrectable error", True),
     ],
 )
 def test_snapshot_error_patterns_filter_benign_nvlink_counters(
-    line: str, flagged: bool
+    source: str, line: str, flagged: bool
 ) -> None:
-    assert bool(system_mod._matching_lines("nvlink", [line])) is flagged
+    assert bool(system_mod._matching_lines(source, [line])) is flagged
+
+
+def test_attached_gpu_count_parses_nvidia_smi_header() -> None:
+    lines = ["Attached GPUs                          : 8"]
+    assert system_mod._attached_gpu_count(lines) == 8
+
+
+def test_attached_gpu_count_returns_none_when_absent() -> None:
+    lines = ["Driver Version                        : 570.86"]
+    assert system_mod._attached_gpu_count(lines) is None
+
+
+def test_attached_gpu_count_warns_for_malformed_value(caplog: pytest.LogCaptureFixture) -> None:
+    lines = ["Attached GPUs                          : unknown"]
+    assert system_mod._attached_gpu_count(lines) is None
+    assert "Attached GPUs value was malformed" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -357,6 +396,79 @@ async def test_reachable_but_clean(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.status == "partial"
     assert result.confidence == "low"
     assert result.missing_data == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capacity", "attached", "expect_deficit"),
+    [(8, 4, True), (8, 8, False), (None, 4, False)],
+)
+async def test_gpu_inventory_deficit_reporting(
+    monkeypatch: pytest.MonkeyPatch,
+    capacity: int | None,
+    attached: int,
+    expect_deficit: bool,
+) -> None:
+    capacity_reads: list[str] = []
+
+    async def fake_get_json(*, params, **_kwargs):
+        lines = [f"Attached GPUs : {attached}"] if params["source"] == "nvidia-smi" else []
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": lines})
+
+    async def fake_capacity(_settings, node):
+        capacity_reads.append(node)
+        return capacity
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    monkeypatch.setattr(system_mod, "_node_gpu_capacity", fake_capacity)
+    target = replace(
+        _target(),
+        fired_at="2026-01-02T03:00:00Z",
+        resolved_at="2026-01-02T03:10:00Z",
+    )
+
+    result = await SystemCollector(_Settings()).collect(target)
+
+    node_logs = result.artifacts[0]
+    assert capacity_reads == ["gpu-node-1"]
+    assert (result.status, result.confidence) == ("partial", "low")
+    assert (node_logs.status, node_logs.confidence) == ("partial", "low")
+    assert "Kubernetes advertises" not in (node_logs.summary or "")
+    assert len(result.artifacts) == (2 if expect_deficit else 1)
+    if expect_deficit:
+        inventory = result.artifacts[1]
+        assert inventory.source == "system_agent"
+        assert (inventory.status, inventory.confidence) == ("ok", "high")
+        assert inventory.result["source_group"] == "node_gpu_inventory"
+        assert inventory.result["independence_group"] == "node_gpu_inventory"
+        assert inventory.result["observation_window"] == {
+            "start": "2026-01-02T02:55:00Z",
+            "end": "2026-01-02T03:15:00Z",
+        }
+        assert (
+            inventory.result["kubernetes_gpu_capacity"],
+            inventory.result["driver_attached_gpus"],
+            inventory.result["missing_gpus"],
+        ) == (8, 4, 4)
+
+
+@pytest.mark.asyncio
+async def test_unknown_driver_gpu_count_skips_capacity_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_get_json(**_kwargs):
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": []})
+
+    async def capacity_must_not_run(*_args, **_kwargs):
+        raise AssertionError("Kubernetes capacity must not be read without a driver count")
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+    monkeypatch.setattr(system_mod, "_node_gpu_capacity", capacity_must_not_run)
+
+    result = await SystemCollector(_Settings()).collect(_target())
+
+    assert len(result.artifacts) == 1
+    assert result.artifacts[0].type == "node_logs"
 
 
 @pytest.mark.asyncio

@@ -13,6 +13,7 @@ Degrades gracefully exactly like loki.py: unconfigured -> status='unavailable'.
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -33,6 +34,8 @@ from app.collectors.http_json import compact, get_json
 from app.config import Settings
 from app.llm import complete, llm_configured
 from app.masking import build_masker
+
+_log = logging.getLogger(__name__)
 
 # Host/kernel/GPU/hardware error signatures worth surfacing to RCA. Case-insensitive.
 # ponytail: flat regex list, not a rule engine — add patterns here as they show up.
@@ -56,6 +59,9 @@ _SNAPSHOT_ERROR_PATTERNS = re.compile(
     r"(?i)(\bxid\b|nvrm|fell off the bus|uncorrectable|fatal|critical|"
     r"\b(?:down|inactive|failed)\b|(?:(?<!replay\s)(?<!recovery\s)(?<!crc\s)error(?: count| counter)?\s*[:=]\s*[1-9]\d*))"
 )
+_SNAPSHOT_FIELD = re.compile(r"^\s*[^:]+?\s*:\s*(.*?)\s*$")
+_HEALTHY_SNAPSHOT_VALUES = {"", "n/a", "none", "disabled", "not active"}
+_ATTACHED_GPUS = re.compile(r"^\s*Attached\s+GPUs\s*:\s*(.*?)\s*$", re.IGNORECASE)
 
 # Sources the DaemonSet endpoint understands. Only journalctl-backed sources
 # can be verified against a historical incident window; the rest are snapshots.
@@ -74,7 +80,28 @@ _SYSTEM_LOG_SOURCE_GROUP = "node_system"
 
 def _matching_lines(source: str, lines: list[str]) -> list[str]:
     patterns = _SNAPSHOT_ERROR_PATTERNS if source in {"nvidia-smi", "nvlink"} else _ERROR_PATTERNS
-    return [line for line in lines if patterns.search(line)]
+    matching = []
+    for line in lines:
+        field = _SNAPSHOT_FIELD.match(line) if source in {"nvidia-smi", "nvlink"} else None
+        value = field.group(1).strip().casefold() if field else None
+        if field and (value in _HEALTHY_SNAPSHOT_VALUES or re.fullmatch(r"0+(?:\.0+)?", value)):
+            continue
+        if patterns.search(line):
+            matching.append(line)
+    return matching
+
+
+def _attached_gpu_count(lines: list[str]) -> int | None:
+    for line in lines:
+        match = _ATTACHED_GPUS.match(line)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        if value.isdecimal():
+            return int(value)
+        _log.warning("nvidia-smi Attached GPUs value was malformed: %r", value)
+        return None
+    return None
 
 
 async def system_log_query(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
@@ -458,7 +485,7 @@ async def _scan_source(
     matching_timestamps = _journal_matching_timestamps(
         matches, causal_time_range if historical_window_verified else None
     )
-    return {
+    result = {
         "source": source,
         "url": response.url,
         "status_code": response.status_code,
@@ -472,7 +499,12 @@ async def _scan_source(
         "historical_scope": bool(source in _TIME_WINDOWABLE_SOURCES and time_range),
         "historical_window_verified": historical_window_verified,
         "matching_timestamps": matching_timestamps,
-    }, matches
+    }
+    if source == "nvidia-smi":
+        attached_gpus = _attached_gpu_count(lines)
+        if attached_gpus is not None:
+            result["driver_attached_gpus"] = attached_gpus
+    return result, matches
 
 
 @dataclass
@@ -981,6 +1013,26 @@ class SystemCollector:
                 "its log lines are context only."
             )
 
+        driver_attached_gpus = next(
+            (
+                int(item["driver_attached_gpus"])
+                for item in source_results
+                if item.get("source") == "nvidia-smi"
+                and isinstance(item.get("driver_attached_gpus"), int)
+            ),
+            None,
+        )
+        kubernetes_gpu_capacity = None
+        if driver_attached_gpus is not None:
+            kubernetes_gpu_capacity = await _node_gpu_capacity(self._settings, node)
+        gpu_deficit = (
+            kubernetes_gpu_capacity - driver_attached_gpus
+            if kubernetes_gpu_capacity is not None
+            and driver_attached_gpus is not None
+            and kubernetes_gpu_capacity > driver_attached_gpus
+            else None
+        )
+
         scan = _NodeScan(
             node=node,
             time_range=time_range,
@@ -1007,6 +1059,16 @@ class SystemCollector:
             if insight:
                 summary = insight
 
+        gpu_summary = ""
+        if gpu_deficit is not None:
+            gpu_summary = ko_en(
+                self._settings,
+                f"노드 {node}: Kubernetes는 GPU {kubernetes_gpu_capacity}개를 광고하지만 "
+                f"드라이버는 {driver_attached_gpus}개만 열거합니다 — {gpu_deficit}개 누락.",
+                f"Node {node}: Kubernetes advertises {kubernetes_gpu_capacity} GPUs but the "
+                f"driver enumerates {driver_attached_gpus} — {gpu_deficit} missing.",
+            )
+
         result = {
             "node": node,
             "node_address": address,
@@ -1016,6 +1078,10 @@ class SystemCollector:
             "resolved_pod": resolved_pod,
             "sources": source_results,
         }
+        if kubernetes_gpu_capacity is not None:
+            result["kubernetes_gpu_capacity"] = kubernetes_gpu_capacity
+        if driver_attached_gpus is not None:
+            result["driver_attached_gpus"] = driver_attached_gpus
         sources_scanned = [
             {
                 "source": item["source"],
@@ -1057,6 +1123,61 @@ class SystemCollector:
         missing_data = [] if successful else ["system_agent.query"]
         if time_range and not incident_successful:
             missing_data.append("system_agent.journal_time_window")
+        artifacts = [
+            artifact(
+                agent=self.name,
+                source="system_agent",
+                type="node_logs",
+                status=status,
+                confidence=confidence,
+                query=query,
+                summary=summary,
+                result={
+                    **result,
+                    "observation": observation,
+                    "sources_scanned": sources_scanned,
+                    "sources_skipped": sources_skipped,
+                },
+            )
+        ]
+        if gpu_deficit is not None:
+            # A cordoned/NotReady node keeps its last-reported capacity; that
+            # stale-but-higher baseline is what makes physical GPU removal visible.
+            gpu_observation = {
+                "kind": "node_gpu_inventory_deficit",
+                "predicate": "node_gpu_inventory_deficit",
+                "source_group": "node_gpu_inventory",
+                "independence_group": "node_gpu_inventory",
+                "scope": {"node": node},
+                "observed_entity": {"kind": "node", "name": node},
+                "polarity": "present",
+                "coverage": "scoped",
+                "observation_window": time_range or {},
+                "target_identity_verified": True,
+                "kubernetes_gpu_capacity": kubernetes_gpu_capacity,
+                "driver_attached_gpus": driver_attached_gpus,
+                "missing_gpus": gpu_deficit,
+                "provenance": {
+                    "kubernetes_gpu_capacity": 'Node status.capacity["nvidia.com/gpu"]',
+                    "driver_attached_gpus": "nvidia-smi -q: Attached GPUs",
+                },
+            }
+            artifacts.append(
+                artifact(
+                    agent=self.name,
+                    source="system_agent",
+                    type="node_gpu_inventory",
+                    status="ok",
+                    confidence="high",
+                    query=(
+                        f"kubectl get node {node} -o "
+                        "jsonpath='{.status.capacity.nvidia\\.com/gpu}'; "
+                        "nvidia-smi -q (Attached GPUs)"
+                    ),
+                    summary=gpu_summary,
+                    result={**gpu_observation, "observation": gpu_observation},
+                )
+            )
         return CollectorResult(
             agent=self.name,
             status=status,
@@ -1065,23 +1186,7 @@ class SystemCollector:
             details=result,
             missing_data=missing_data,
             warnings=warnings,
-            artifacts=[
-                artifact(
-                    agent=self.name,
-                    source="system_agent",
-                    type="node_logs",
-                    status=status,
-                    confidence=confidence,
-                    query=query,
-                    summary=summary,
-                    result={
-                        **result,
-                        "observation": observation,
-                        "sources_scanned": sources_scanned,
-                        "sources_skipped": sources_skipped,
-                    },
-                )
-            ],
+            artifacts=artifacts,
         )
 
 
@@ -1321,6 +1426,33 @@ async def _node_internal_ip(settings: Settings, node: str) -> str:
     except Exception:  # noqa: BLE001 - lookup is best-effort; caller falls back
         return ""
     return ""
+
+
+async def _node_gpu_capacity(settings: Settings, node: str) -> int | None:
+    """Kubernetes' last-reported physical GPU capacity for one exact Node."""
+    try:
+        from app.collectors.kubernetes import _node_gpu_value, k8s_read
+
+        response = await k8s_read(settings, "nodes", name=node, full_object=True)
+        data = response.get("data") if isinstance(response, dict) else None
+        metadata = data.get("metadata") if isinstance(data, dict) else None
+        if response.get("error") or not isinstance(metadata, dict):
+            return None
+        if str(metadata.get("name") or "") != node:
+            return None
+        capacity, valid = _node_gpu_value(data, "capacity")
+        if not valid:
+            _log.warning("Kubernetes GPU capacity for node %s was malformed", node)
+            return None
+        if capacity is None:
+            return None
+        integral = capacity.to_integral_value()
+        if capacity != integral:
+            _log.warning("Kubernetes GPU capacity for node %s was not an integer", node)
+            return None
+        return int(integral)
+    except Exception:  # noqa: BLE001 - Kubernetes evidence is optional here
+        return None
 
 
 def _base_url_for_node(url_template: str, node: str) -> str:
