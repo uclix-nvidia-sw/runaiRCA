@@ -80,6 +80,15 @@ def test_helm_defaults_run_analysis_through_nat() -> None:
     assert env["natConfigFile"] == "/app/configs/runai_rca_engine.yml"
 
 
+def test_quantity_scope_derivation_is_wired_default_off() -> None:
+    env = _values()["agent"]["env"]
+    template = AGENT_TEMPLATE.read_text(encoding="utf-8")
+
+    assert env["enableQuantityScopeDerivation"] is False
+    assert "ENABLE_QUANTITY_SCOPE_DERIVATION" in template
+    assert ".Values.agent.env.enableQuantityScopeDerivation" in template
+
+
 def test_collector_insight_budget_supports_reasoning_models() -> None:
     env = _values()["agent"]["env"]
     template = AGENT_TEMPLATE.read_text(encoding="utf-8")

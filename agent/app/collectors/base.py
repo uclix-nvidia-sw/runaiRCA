@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -743,6 +745,86 @@ def resolve_target(
             "k8s_pod_uid",
         ),
     )
+
+
+_GRAFANA_VALUE_RE = re.compile(r"\bvalue\s*=\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
+
+
+def classify_scope_less_quantity_alert(
+    labels: dict[str, str],
+    annotations: dict[str, str],
+    target: AnalysisTarget,
+) -> str:
+    """Classify strict, dimensionless Grafana GPU quantity alerts."""
+    if target.node or target.pod or target.namespace:
+        return ""
+    values_found = False
+    for metadata in (labels, annotations):
+        if "__value_string__" in metadata:
+            raw = str(metadata["__value_string__"] or "")
+            label_fields = re.findall(r"\blabels\s*=\s*\{([^{}]*)\}", raw)
+            if len(label_fields) != len(re.findall(r"\blabels\s*=", raw)) or any(
+                field.strip() for field in label_fields
+            ):
+                return ""
+            matches = _GRAFANA_VALUE_RE.findall(raw)
+            if len(matches) != len(re.findall(r"\bvalue\s*=", raw)):
+                return ""
+            try:
+                finite = matches and all(math.isfinite(float(value)) for value in matches)
+            except ValueError:
+                return ""
+            if not finite:
+                return ""
+            values_found = True
+        if "__values__" in metadata:
+            try:
+                payload = json.loads(str(metadata["__values__"]))
+            except (TypeError, json.JSONDecodeError):
+                return ""
+            found, valid = _grafana_json_values(payload)
+            if not found or not valid:
+                return ""
+            values_found = True
+    discriminator = " ".join(
+        value_from(labels, annotations, key)
+        for key in ("alertname", "alert_name", "title", "summary")
+    )
+    return "gpu" if values_found and re.search(r"(?i)\bgpus?\b", discriminator) else ""
+
+
+def _grafana_json_values(payload: object) -> tuple[bool, bool]:
+    found = False
+    if isinstance(payload, dict):
+        for key in ("Labels", "labels"):
+            if key in payload and (not isinstance(payload[key], dict) or payload[key]):
+                return False, False
+        for value in payload.values():
+            # Grafana emits BOTH shapes: rich ({"A": {"Labels": {}, "Value": 8}})
+            # and flat refId-to-number ({"A": 8, "C": 1}) — the live Ready GPUs
+            # alert uses the flat one, so a numeric leaf counts under ANY key.
+            if isinstance(value, bool):
+                return False, False
+            if isinstance(value, (int, float)):
+                try:
+                    finite = math.isfinite(value)
+                except OverflowError:
+                    finite = False
+                if not finite:
+                    return False, False
+                found = True
+                continue
+            nested_found, valid = _grafana_json_values(value)
+            if not valid:
+                return False, False
+            found = found or nested_found
+    elif isinstance(payload, list):
+        for value in payload:
+            nested_found, valid = _grafana_json_values(value)
+            if not valid:
+                return False, False
+            found = found or nested_found
+    return found, True
 
 
 def artifact(

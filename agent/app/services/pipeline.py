@@ -20,6 +20,7 @@ from app.collectors.base import (
     AnalysisTarget,
     CollectorResult,
     causal_evidence_time_range,
+    classify_scope_less_quantity_alert,
     parse_incident_time,
     resolve_target,
 )
@@ -89,6 +90,7 @@ _log = logging.getLogger(__name__)
 TModel = TypeVar("TModel", bound=BaseModel)
 Stage = Callable[["PipelineState"], Awaitable["PipelineState"]]
 _SYNTHESIS_ARTIFACT_RESULT_CHARS = 1200
+_QUANTITY_SCOPE_DERIVATION_TIMEOUT_SECONDS = 10.0
 
 # Raw Kubernetes objects contain failure vocabulary even when the observed
 # value is healthy or merely declarative configuration.  Those fields remain
@@ -148,6 +150,8 @@ class PipelineState:
     # the effective post-plan scope for live analysis; keeping this baseline is
     # what lets historical pinning remain stable across repeated evidence runs.
     declared_target: AnalysisTarget | None = None
+    # Provenance only: never materialized as an artifact or blackboard fact.
+    scope_derivation: dict[str, object] | None = None
     runtime_label: str = "fallback"
     agent_souls: str = ""
     kg_context: Any = None
@@ -434,6 +438,108 @@ async def _resolve_free_text_target(state: PipelineState) -> None:
     )
 
 
+async def _quantity_scope_round(
+    state: PipelineState,
+) -> tuple[str, str, str, str, int] | None:
+    from app.collectors.kubernetes import resolve_unique_gpu_deficit_node
+    from app.collectors.runai_mcp import (
+        fetch_quantity_scope_inputs,
+        runai_health_gpu_node,
+        runai_inventory_gpu_deficit,
+    )
+
+    inventory, health, health_failed = await fetch_quantity_scope_inputs(
+        state.settings, state.target
+    )
+    deficit = runai_inventory_gpu_deficit(inventory)
+    if deficit is None:
+        _log.warning("quantity scope inventory payload was malformed")
+        return None
+    if deficit <= 0:
+        return None
+
+    if not health_failed:
+        nomination = runai_health_gpu_node(health, deficit)
+        if nomination is None:
+            _log.warning("quantity scope health payload was malformed")
+            return None
+        node, health_empty = nomination
+        if node:
+            return (
+                node,
+                "runai_cluster_physical_inventory+runai_cluster_infrastructure_health",
+                "aggregate_deficit_single_matching_unhealthy_gpu_node",
+                "MCP get_cluster_physical_inventory + get_cluster_infrastructure_health",
+                deficit,
+            )
+        if not health_empty:
+            return None
+
+    node, kubernetes_deficit = await resolve_unique_gpu_deficit_node(state.settings)
+    if not node or kubernetes_deficit != Decimal(deficit):
+        return None
+    return (
+        node,
+        "runai_cluster_physical_inventory+kubernetes_nodes",
+        "aggregate_deficit_unique_kubernetes_node_deficit",
+        "MCP get_cluster_physical_inventory + Kubernetes Nodes list",
+        deficit,
+    )
+
+
+async def _derive_quantity_alert_scope(state: PipelineState) -> None:
+    if (
+        not getattr(state.settings, "enable_quantity_scope_derivation", False)
+        or not state.settings.runai_mcp_url
+        or state.plan is None
+        or _is_resolved_reanalysis(state.request)
+    ):
+        return
+    if (
+        classify_scope_less_quantity_alert(
+            state.request.alert.labels,
+            state.request.alert.annotations,
+            state.target,
+        )
+        != "gpu"
+    ):
+        return
+
+    deadline = _evidence_deadline_monotonic(state)
+    remaining = deadline - time.monotonic() if deadline is not None else 10.0
+    timeout = min(_QUANTITY_SCOPE_DERIVATION_TIMEOUT_SECONDS, remaining)
+    if timeout <= 0:
+        return
+    try:
+        result = await asyncio.wait_for(_quantity_scope_round(state), timeout=timeout)
+    except TimeoutError:
+        return
+    except Exception as exc:  # noqa: BLE001 - optional scope must fail closed
+        _log.warning("quantity scope derivation call failed: %s", exc)
+        return
+    if result is None:
+        return
+
+    node, source, method, query, deficit = result
+    if state.declared_target is None:
+        state.declared_target = state.target
+    state.plan.node = node
+    state.target = replace(
+        state.target,
+        node=node,
+        node_source="derived_from_inventory_deficit",
+    )
+    state.scope_derivation = {
+        "dimension": "node",
+        "value": node,
+        "source": source,
+        "method": method,
+        "evidence_role": "scope_seed_not_causal_evidence",
+        "query": query,
+        "deficit": deficit,
+    }
+
+
 def _apply_effective_target(state: PipelineState) -> AnalysisTarget:
     """Persist the one target identity used after planning.
 
@@ -450,6 +556,12 @@ def _apply_effective_target(state: PipelineState) -> AnalysisTarget:
     if state.declared_target is None:
         state.declared_target = state.target
     scoped = _scope_target(state.declared_target, state.plan)
+    if (
+        state.target.node_source == "derived_from_inventory_deficit"
+        and state.target.node
+        and state.target.node == scoped.node
+    ):
+        scoped = replace(scoped, node_source=state.target.node_source)
     # ``plan.namespaces`` is an investigation SCOPE and may lead with a platform
     # component's home namespace (the planner puts it first so the component is
     # read). An alert that declares its own namespace has already stated the
@@ -883,6 +995,7 @@ async def plan_stage(state: PipelineState) -> PipelineState:
     # itself. Read the subject out of the operator's own sentence and verify it
     # against the live cluster before adopting it.
     await _resolve_free_text_target(state)
+    await _derive_quantity_alert_scope(state)
     seed_pod = state.plan.pod or state.target.pod
     if state.target.namespace and seed_pod and not _is_resolved_reanalysis(state.request):
         from app.collectors.kubernetes import resolve_live_pod_node
@@ -2647,6 +2760,8 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             language=getattr(settings, "language", "en"),
             masker=state.masker,
         ),
+        effective_target=state.target,
+        scope_derivation=state.scope_derivation,
         eligible_support_ids=eligible_support_ids,
         self_check_next=state.self_check_next,
         runtime_knowledge_hints=state.runtime_knowledge_hints,
@@ -2777,6 +2892,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         affected_pods=affected_pods,
         context={
             "target": state.target.__dict__,
+            **({"scope_derivation": state.scope_derivation} if state.scope_derivation else {}),
             "nemo_runtime": "enabled" if state.runtime_label == "enabled" else "fallback",
             "synthesis": {
                 "status": state.synthesis_status,
@@ -4291,6 +4407,8 @@ def _detail_from(
     runtime_knowledge_hints: list[tuple[str, dict[str, Any]]] | None = None,
     xid_codes: list[int] | None = None,
     *,
+    effective_target: AnalysisTarget | None = None,
+    scope_derivation: dict[str, object] | None = None,
     knowledge: ReportKnowledge,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
@@ -4316,6 +4434,17 @@ def _detail_from(
     # --- 1. Problem -----------------------------------------------------------
     lines.extend([h["problem"], ""])
     lines.append(f"- {h['what']}: {_root_cause_statement(request, language=knowledge.language)}")
+    if (
+        scope_derivation
+        and effective_target is not None
+        and effective_target.node
+        and not target.node
+    ):
+        lines.append(
+            f"- Investigation scope candidate: `node/{effective_target.node}` — derived "
+            "from a unique physical-versus-allocatable GPU deficit; the alert did not "
+            "declare a node."
+        )
     if where:
         lines.append(f"- {h['where']}: {where}")
     if request.occurrence_count > 1:

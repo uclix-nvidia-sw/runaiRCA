@@ -107,6 +107,8 @@ spec:
               value: {{ .Values.agent.env.maxReanalysisSteps | quote }}
             - name: ENABLE_AGENT_DRILLDOWN
               value: {{ .Values.agent.env.enableAgentDrilldown | quote }}
+            - name: ENABLE_QUANTITY_SCOPE_DERIVATION
+              value: {{ .Values.agent.env.enableQuantityScopeDerivation | quote }}
             - name: ANALYSIS_DEADLINE_SECONDS
               value: {{ .Values.agent.env.analysisDeadlineSeconds | quote }}
             - name: ANALYSIS_RESPONSE_MAX_BYTES

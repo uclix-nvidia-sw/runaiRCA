@@ -1677,7 +1677,7 @@ func metadataFromAgentContext(context map[string]any) map[string]any {
 			out["llm_usage"] = usage
 		}
 	}
-	for _, key := range []string{"harness", "confidence_diagnostics", "ontology_reasoning", "reasoning_trace_v2", "reasoning_trace_v3", "trace_v3", "synthesis"} {
+	for _, key := range []string{"harness", "confidence_diagnostics", "ontology_reasoning", "reasoning_trace_v2", "reasoning_trace_v3", "trace_v3", "synthesis", "scope_derivation"} {
 		if value, ok := context[key].(map[string]any); ok {
 			out[key] = cloneAnyMap(value)
 		}

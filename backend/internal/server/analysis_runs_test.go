@@ -245,6 +245,13 @@ func TestAnalysisRunPersistsKnowledgeConsultations(t *testing.T) {
 		AnalysisSummary: "done",
 		Context: map[string]any{
 			"knowledge_consultations": rows,
+			// P2-E's derivation receipt is map-shaped, so the allowlist loop
+			// handles it — pin that the key is actually in the list.
+			"scope_derivation": map[string]any{
+				"dimension":     "node",
+				"value":         "dgx02",
+				"evidence_role": "scope_seed_not_causal_evidence",
+			},
 		},
 	})
 	if !ok {
@@ -253,6 +260,10 @@ func TestAnalysisRunPersistsKnowledgeConsultations(t *testing.T) {
 	got, ok := completed.Metadata["knowledge_consultations"].([]any)
 	if !ok || len(got) != 1 {
 		t.Fatalf("knowledge_consultations metadata missing or wrong shape: %+v", completed.Metadata)
+	}
+	derivation, ok := completed.Metadata["scope_derivation"].(map[string]any)
+	if !ok || derivation["value"] != "dgx02" {
+		t.Fatalf("scope_derivation metadata missing or wrong shape: %+v", completed.Metadata)
 	}
 	row, ok := got[0].(map[string]any)
 	if !ok || row["tool"] != "knowledge_lookup" || row["source"] != "catalog_fallback" {
