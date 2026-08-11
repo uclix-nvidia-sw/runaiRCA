@@ -102,12 +102,11 @@ from app.services.query_memory import QueryMemory, domain_query_key
 _log = logging.getLogger(__name__)
 
 _RESULT_CHARS = 1500  # per-query result excerpt fed back into the loop
-# Knowledge this agent may CONSULT, never evidence it observed. Its answers are
-# deliberately kept out of result.artifacts (see _run_query): curated wording in
-# the evidence text would be re-matched by the signature matchers as if the
-# cluster had reported it, which is how query strings once produced a
-# control-plane misdiagnosis on a run that observed nothing.
-_KNOWLEDGE_TOOL = "knowledge_lookup"
+# Knowledge these tools may CONSULT, never evidence the agent observed. Their
+# answers are deliberately kept out of result.artifacts (see _run_query):
+# curated wording in the evidence text would be re-matched by the signature
+# matchers as if the cluster had reported it, which is how query strings once
+# produced a control-plane misdiagnosis on a run that observed nothing.
 _KNOWLEDGE_TOOLS = frozenset(
     {"knowledge_lookup", "case_lookup", "xid_lookup", "component_checks", "steps_lookup"}
 )
@@ -2999,12 +2998,13 @@ def _domain_tools(
                 "call": _tool_sql_select,
             }
         }
-    # Every domain gets it: knowledge is not a domain, and the plan is written
-    # before the evidence exists — an agent that forms a new hypothesis mid-loop
-    # must be able to ask what is already known about it. It reads catalogs
-    # in-process, so it crosses no domain boundary and makes no cluster call.
+    # Every domain gets these: knowledge is not a domain, and the plan is
+    # written before the evidence exists — an agent that forms a new hypothesis
+    # mid-loop must be able to ask what is already known about it. They consult
+    # the knowledge ontology (local TypeDB, catalog fallback) and never a
+    # cluster or tenant API, so the per-domain scoping boundary is untouched.
     for agent_tools in registry.values():
-        agent_tools[_KNOWLEDGE_TOOL] = {
+        agent_tools["knowledge_lookup"] = {
             "description": (
                 "Look up what is ALREADY KNOWN about a symptom or hypothesis: matching "
                 "catalog symptoms and operator-approved knowledge, each with its root-cause "

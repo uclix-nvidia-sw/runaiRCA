@@ -28,7 +28,7 @@ def test_every_domain_agent_can_reach_the_knowledge_tool():
     registry = drilldown._domain_tools(load_settings())
     assert registry, "expected at least one domain registry"
     for agent, tools in registry.items():
-        assert drilldown._KNOWLEDGE_TOOL in tools, f"{agent} cannot consult knowledge"
+        assert "knowledge_lookup" in tools, f"{agent} cannot consult knowledge"
 
 
 def test_lookup_returns_curated_knowledge_with_its_source():
@@ -94,7 +94,7 @@ def test_lookup_answer_never_becomes_evidence():
     """Its wording must not reach _observed_text, or the matcher re-reads our own catalog."""
     result = CollectorResult(agent="kubernetes", status="ok", summary="")
     tools = {
-        drilldown._KNOWLEDGE_TOOL: {
+        "knowledge_lookup": {
             "description": "d",
             "call": drilldown._tool_knowledge_lookup,
         }
@@ -115,7 +115,7 @@ def test_lookup_answer_never_becomes_evidence():
             tools,
             _target(),
             None,
-            {"tool": drilldown._KNOWLEDGE_TOOL, "args": {"hypothesis": "OOMKilled"}},
+            {"tool": "knowledge_lookup", "args": {"hypothesis": "OOMKilled"}},
             history,
             _NullMasker(),
         )
