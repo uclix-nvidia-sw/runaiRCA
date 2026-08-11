@@ -489,13 +489,6 @@ async def _quantity_scope_round(
 
 async def _derive_quantity_alert_scope(state: PipelineState) -> None:
     if (
-        not getattr(state.settings, "enable_quantity_scope_derivation", False)
-        or not state.settings.runai_mcp_url
-        or state.plan is None
-        or _is_resolved_reanalysis(state.request)
-    ):
-        return
-    if (
         classify_scope_less_quantity_alert(
             state.request.alert.labels,
             state.request.alert.annotations,
@@ -505,19 +498,39 @@ async def _derive_quantity_alert_scope(state: PipelineState) -> None:
     ):
         return
 
+    def skip(reason: str) -> None:
+        state.scope_derivation = {"dimension": "node", "value": "", "skipped": reason}
+
+    if not getattr(state.settings, "enable_quantity_scope_derivation", False):
+        skip("flag_disabled")
+        return
+    if not state.settings.runai_mcp_url:
+        skip("no_runai_mcp_url")
+        return
+    if state.plan is None:
+        skip("no_plan")
+        return
+    if _is_resolved_reanalysis(state.request):
+        skip("resolved_reanalysis")
+        return
+
     deadline = _evidence_deadline_monotonic(state)
     remaining = deadline - time.monotonic() if deadline is not None else 10.0
     timeout = min(_QUANTITY_SCOPE_DERIVATION_TIMEOUT_SECONDS, remaining)
     if timeout <= 0:
+        skip("deadline_exhausted")
         return
     try:
         result = await asyncio.wait_for(_quantity_scope_round(state), timeout=timeout)
     except TimeoutError:
+        skip("timeout")
         return
     except Exception as exc:  # noqa: BLE001 - optional scope must fail closed
         _log.warning("quantity scope derivation call failed: %s", exc)
+        skip("derivation_failed")
         return
     if result is None:
+        skip("no_unique_deficit")
         return
 
     node, source, method, query, deficit = result
@@ -1182,6 +1195,8 @@ async def evidence_stage(state: PipelineState) -> PipelineState:
         evidence_deadline = _evidence_deadline_monotonic(state)
         if _accepts_keyword(run_drilldowns, "deadline_monotonic"):
             drilldown_kwargs["deadline_monotonic"] = evidence_deadline
+        if _accepts_keyword(run_drilldowns, "reporter"):
+            drilldown_kwargs["reporter"] = state.progress
         if not evidence_sufficient and _accepts_keyword(
             run_drilldowns, "external_case_hints"
         ):

@@ -201,6 +201,11 @@ def _k8s_result() -> CollectorResult:
 
 def test_disabled_flag_means_no_llm_calls(monkeypatch) -> None:
     calls: list[str] = []
+    progress: list[tuple[str, str, dict]] = []
+
+    class Reporter:
+        def emit(self, phase, message, **fields):
+            progress.append((phase, message, fields))
 
     async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
         calls.append(system)
@@ -209,9 +214,51 @@ def test_disabled_flag_means_no_llm_calls(monkeypatch) -> None:
     monkeypatch.setattr(drilldown, "complete_json", fake_complete_json)
     settings = replace(drill_settings(), enable_agent_drilldown=False)
     result = _k8s_result()
-    asyncio.run(run_drilldowns(settings, [result], _target(), None))
+    asyncio.run(run_drilldowns(settings, [result], _target(), None, reporter=Reporter()))
     assert calls == []
+    assert progress == []
     assert result.artifacts == []
+
+
+def test_drilldown_reports_one_progress_entry_per_reasoning_step(monkeypatch) -> None:
+    decisions = iter(
+        [
+            {
+                "action": "query",
+                "queries": [{"tool": "k8s_read", "args": {"kind": "pods"}}],
+            },
+            {"action": "done"},
+        ]
+    )
+    progress: list[tuple[str, str, dict]] = []
+
+    class Reporter:
+        def emit(self, phase, message, **fields):
+            progress.append((phase, message, fields))
+
+    async def decide(*_args, **_kwargs):
+        return next(decisions)
+
+    async def read(*_args, **_kwargs):
+        return {"status_code": 200, "error": None, "items": []}
+
+    monkeypatch.setattr(drilldown, "complete_json", decide)
+    monkeypatch.setattr(drilldown, "k8s_read", read)
+
+    asyncio.run(
+        run_drilldowns(
+            replace(drill_settings(), max_investigation_steps=2),
+            [_k8s_result()],
+            _target(),
+            None,
+            reporter=Reporter(),
+        )
+    )
+
+    assert progress == [
+        ("investigation", "kubernetes drill-down step 1", {"step": 1}),
+        ("investigation", "kubernetes drill-down step 2", {"step": 2}),
+    ]
 
 
 def test_single_scoped_positive_does_not_skip_optional_discriminator(monkeypatch) -> None:

@@ -106,6 +106,67 @@ def test_knowledge_lookup_fallback_source_tag() -> None:
     assert out["result"]["symptoms"]
 
 
+def test_knowledge_lookup_fallback_accepts_normalized_family_ids() -> None:
+    for query in ("gpu_hardware_error", "gpu hardware error", "GPU_Hardware_Error"):
+        out = asyncio.run(
+            drilldown._tool_knowledge_lookup(
+                make_settings(), _target(), {"hypothesis": query}
+            )
+        )
+        assert out["summary"].startswith("family 'gpu_hardware_error':")
+        assert out["result"]["symptoms"]
+        assert all(
+            item["matched_keywords"] == ["family:gpu_hardware_error"]
+            for item in out["result"]["symptoms"]
+        )
+
+
+def test_knowledge_lookup_unknown_slug_uses_keyword_matching() -> None:
+    out = asyncio.run(
+        drilldown._tool_knowledge_lookup(
+            make_settings(), _target(), {"hypothesis": "unknown_slug OOMKilled"}
+        )
+    )
+    assert out["result"]["symptoms"]
+    assert "family:" not in " ".join(out["result"]["symptoms"][0]["matched_keywords"])
+
+
+def test_knowledge_lookup_graph_accepts_family_id() -> None:
+    def fake_run(query: str) -> list[dict]:
+        if query == kg_enrichment._KNOWLEDGE_QUERY:
+            return [
+                {
+                    "fam": "gpu_hardware_error",
+                    "sn": "GPU Fallen Off The Bus",
+                    "kw": "fallen off the bus",
+                    "st": "drain and reboot the node",
+                },
+                {
+                    "fam": "gpu_hardware_error",
+                    "sn": "ext:vendor-case-1",
+                    "kw": "ecc double bit",
+                    "st": "reseat the gpu",
+                },
+            ]
+        return []
+
+    out = drilldown._knowledge_lookup_via_graph(
+        _DirectClient(fake_run), "GPU-Hardware Error"
+    )
+
+    assert out["summary"] == (
+        "family 'gpu_hardware_error': 2 known symptom(s) — guidance to test, not evidence"
+    )
+    assert {item["source"] for item in out["result"]["symptoms"]} == {
+        "ontology",
+        "external_case",
+    }
+    assert all(
+        item["matched_keywords"] == ["family:gpu_hardware_error"]
+        for item in out["result"]["symptoms"]
+    )
+
+
 def test_knowledge_lookup_graph_mode_surfaces_external_case(monkeypatch) -> None:
     """Proves external cases (symptom name `ext:...`) are now reachable
     through knowledge_lookup, unified with curated/known-issue symptoms."""

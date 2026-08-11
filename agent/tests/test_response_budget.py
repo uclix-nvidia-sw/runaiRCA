@@ -113,6 +113,18 @@ def test_knowledge_consultations_is_protected_from_budget_trimming() -> None:
     assert "fat_unprotected" not in response.context
 
 
+def test_scope_derivation_is_protected_from_budget_trimming() -> None:
+    response = _response("")
+    receipt = {"dimension": "node", "value": "", "skipped": "flag_disabled"}
+    response.context["scope_derivation"] = receipt
+    response.context["fat_unprotected"] = "x" * 100_000
+
+    assert enforce_analysis_response_budget(response, 64 << 10, language="ko")
+
+    assert response.context.get("scope_derivation") == receipt
+    assert "fat_unprotected" not in response.context
+
+
 def test_pathological_report_body_is_bounded_as_last_resort() -> None:
     response = _response("")
     response.analysis_detail = "원인과 조치 " * 50_000
