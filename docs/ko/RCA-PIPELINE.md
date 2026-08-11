@@ -179,7 +179,7 @@ PromQL을 끌어옵니다. 이는 LLM이 없을 때에도 수집을 반복적으
 | kubernetes | `k8s_read` | 18종 허용 목록, GET/LIST 전용(시크릿 없음) |
 | prometheus | `promql_query` | query 엔드포인트 전용 |
 | loki | `logql_query` | range query 전용 |
-| runai | `runai_api_search` + `runai_api_get` | GET 전용, 경로는 `/api/`로 시작해야 함(메서드 하드코딩) |
+| runai | 고정 `runai_*` view 15종(`runai_workload_summary`, `runai_workload_status`, …) | [공식 Run:ai MCP 서버](#run-ai-mcp-service)에 대한 읽기 전용 래퍼. 자유 인자 없음 — 모든 호출이 알림 자신의 workload/project/node로 사전 스코프됨 |
 | postgres | `sql_select` | 단일 `SELECT`/`WITH`, READ ONLY 트랜잭션, 자동 `LIMIT 50` |
 | *모든* 에이전트 | `knowledge_lookup`, `case_lookup`, `xid_lookup`, `component_checks`, `steps_lookup` | 온톨로지 우선 / 카탈로그 폴백 조회. 클러스터 호출 없음, 도메인 경계 넘지 않음, 답변은 결코 증거가 되지 않음 |
 
@@ -396,7 +396,7 @@ self-check 전후 confidence, 그리고 harness 점수·hard gate·수정 횟수
 
 - **`title`** — 사람이 읽는 카드 이름(`파드 조회`, `메트릭 조회 (PromQL)`, `DB 조회 (SQL)`).
 - **`query`** — 재실행할 *실제* 명령: `kubectl get pods t-0 -n runai`, 원시 PromQL/LogQL/SQL,
-  `GET /api/v1/workloads?name=…` — 결코 내부 파라미터 덤프가 아닙니다.
+  `MCP get_workload_status {…}` — 결코 내부 파라미터 덤프가 아닙니다.
 - **`highlights`** — 결과에서 추출한 문제 신호(`salient_markers`: `CrashLoopBackOff`, `Xid 79`,
   `no space left`, … — 문자열 리프만 스캔하며, 결코 JSON 키가 아님). Frontend는 이를 빨간색으로
   표시하여 상용구보다 발견 사항이 먼저 읽히도록 합니다.
@@ -408,8 +408,9 @@ self-check 전후 confidence, 그리고 harness 점수·hard gate·수정 횟수
 
 - **구조적으로 읽기 전용**: 수집기와 드릴다운 도구는 읽기만 합니다. Kubernetes 읽기는 종별 허용
   목록, pod-exec는 거부 목록(denylist)으로 게이트되어 상태를 바꾸는 명령, shell/인터프리터,
-  shell 메타문자를 차단하고 shell 없이 단일 argv만 실행합니다. Run:ai는 `/api/` 아래 GET 전용, SQL은 READ ONLY
-  트랜잭션의 `SELECT`.
+  shell 메타문자를 차단하고 shell 없이 단일 argv만 실행합니다. Run:ai 드릴다운은 알림 범위로
+  사전 스코프된 공식 MCP 읽기 view 고정 세트를 거치고(수집기의 직접 REST 읽기는 GET 전용),
+  SQL은 READ ONLY 트랜잭션의 `SELECT`.
 - **프롬프트 인젝션 가드**(`agent/app/llm.py`): 수집된 텍스트(로그, 이벤트, 알림 어노테이션)는
   클러스터 쓰기가 가능하므로, 임베디드 명령을 데이터로 선언하는 가드가 **모든** LLM 시스템
   프롬프트에 덧붙여집니다. `operator_prompt`가 유일하게 의도된 명령 채널입니다.

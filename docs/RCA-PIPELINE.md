@@ -195,7 +195,7 @@ vice versa:
 | kubernetes | `k8s_read` | 18-kind allowlist, GET/LIST only (no secrets) |
 | prometheus | `promql_query` | query endpoint only |
 | loki | `logql_query` | range query only |
-| runai | `runai_api_search` + `runai_api_get` | GET-only, path must start `/api/` (method hardcoded) |
+| runai | 15 fixed `runai_*` views (`runai_workload_summary`, `runai_workload_status`, …) | read-only wrappers over the [official Run:ai MCP server](#run-ai-mcp-service); no free-form arguments — every call is pre-scoped to the alert's own workload/project/node |
 | postgres | `sql_select` | single `SELECT`/`WITH`, READ ONLY transaction, auto `LIMIT 50` |
 | *every* agent | `knowledge_lookup`, `case_lookup`, `xid_lookup`, `component_checks`, `steps_lookup` | ontology-first / catalog-fallback read, no cluster call and no domain boundary crossed; answers never become evidence |
 
@@ -458,7 +458,7 @@ Every artifact is built for an operator to read at a glance:
 
 - **`title`** — a human card name (`파드 조회`, `메트릭 조회 (PromQL)`, `DB 조회 (SQL)`).
 - **`query`** — the *real* command to replay: `kubectl get pods t-0 -n runai`,
-  raw PromQL/LogQL/SQL, `GET /api/v1/workloads?name=…` — never an internal param dump.
+  raw PromQL/LogQL/SQL, `MCP get_workload_status {…}` — never an internal param dump.
 - **`highlights`** — problem signals extracted from the result
   (`salient_markers`: `CrashLoopBackOff`, `Xid 79`, `no space left`, … — scanning
   string leaves only, never JSON keys). The frontend marks these in red so the
@@ -472,8 +472,9 @@ drill-down query — are hidden from the evidence trail.
 - **Read-only by construction**: collectors and drill-down tools only read;
   Kubernetes reads are a kind allowlist; pod-exec is denylist-gated, blocking
   mutating commands, shells/interpreters, and shell metacharacters, with one argv
-  and no shell; Run:ai is GET-only under `/api/`; SQL is `SELECT` in a READ ONLY
-  transaction.
+  and no shell; Run:ai drill-down is a fixed set of official MCP read views
+  pre-scoped to the alert (the collector's direct REST reads are GET-only); SQL
+  is `SELECT` in a READ ONLY transaction.
 - **Prompt-injection guard** (`agent/app/llm.py`): collected text (logs, events,
   alert annotations) is cluster-writable, so a guard is appended to **every** LLM
   system prompt declaring embedded instructions as data. `operator_prompt` is the
