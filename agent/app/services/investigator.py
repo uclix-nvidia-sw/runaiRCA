@@ -180,6 +180,10 @@ def _fallback_probe(
 # as a static table instead of importing drilldown's registry to avoid coupling
 # this file to that module's internals.
 _PROBE_COLLECTOR_ALIASES = {
+    "k8s_api": "kubernetes",
+    "gpu_metrics": "prometheus",
+    "node_health_check": "kubernetes",
+    "node_hardware": "system",
     "k8s_read": "kubernetes",
     "k8s_describe": "kubernetes",
     "k8s_logs": "kubernetes",
@@ -194,7 +198,7 @@ _PROBE_COLLECTOR_ALIASES = {
 
 def _resolve_probe_collector(raw: object, all_names: set[str]) -> str:
     """Canonical collector name for a probe, accepting a known tool-name alias."""
-    name = str(raw or "").strip()
+    name = str(raw or "").lower().strip()
     if name in all_names:
         return name
     alias = _PROBE_COLLECTOR_ALIASES.get(name, "")

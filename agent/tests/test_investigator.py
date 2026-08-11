@@ -20,6 +20,7 @@ from app.services.investigator import (
     _ledger_summary,
     _merge_collector_results,
     _prioritize_probes,
+    _resolve_probe,
     _run_adhoc_kubernetes_query,
     _valid_adhoc_kubernetes_query,
     investigate,
@@ -58,6 +59,50 @@ class LokiCollector:
 
 def _collectors() -> list[object]:
     return [RunaiCollector(), KubernetesCollector(), LokiCollector()]
+
+
+@pytest.mark.parametrize(
+    ("alias", "collector"),
+    [
+        ("k8s_api", "kubernetes"),
+        ("gpu_metrics", "prometheus"),
+        ("node_health_check", "kubernetes"),
+        ("node_hardware", "system"),
+    ],
+)
+def test_probe_collector_aliases_route_to_allowed_collector(alias: str, collector: str) -> None:
+    probe = {"collector": f" {alias.upper()} ", "scope": {"node": "gpu-01"}}
+
+    resolved = _resolve_probe(
+        probe,
+        {"kubernetes", "prometheus", "system"},
+        query_feedback=[],
+        reporter=None,
+    )
+
+    assert resolved == {"collector": collector, "scope": {"node": "gpu-01"}}
+
+
+def test_probe_collector_keeps_allowed_name_and_drops_unknown(caplog) -> None:
+    feedback = []
+
+    allowed = _resolve_probe(
+        {"collector": "prometheus", "scope": {}},
+        {"prometheus"},
+        query_feedback=feedback,
+        reporter=None,
+    )
+    unknown = _resolve_probe(
+        {"collector": "prometheusish", "scope": {}},
+        {"prometheus"},
+        query_feedback=feedback,
+        reporter=None,
+    )
+
+    assert allowed == {"collector": "prometheus", "scope": {}}
+    assert unknown is None
+    assert feedback[-1]["failure"]["category"] == "unknown_collector"
+    assert "dropped probe naming unknown collector 'prometheusish'" in caplog.text
 
 
 def test_typed_target_verified_artifact_is_attached_to_matching_hypothesis() -> None:
