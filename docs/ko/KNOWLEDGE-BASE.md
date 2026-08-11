@@ -113,6 +113,14 @@ platform-architecture 컨텍스트 **양쪽**에 전달됩니다. 그래서 조�
 별도 namespace의 `gpu-reservation-<hash>` Pod이 점유하므로, 워크로드 자신의 namespace만 보는
 Agent는 원인을 볼 수 없습니다.
 
+검색은 plan이 미리 가져온 것에 갇히지 않습니다. 모든 증거 Agent는 분석 도중에도 5개의
+읽기 전용 tool(`knowledge_lookup`, `case_lookup`, `xid_lookup`, `component_checks`,
+`steps_lookup`)로 같은 지식을 그때그때 끌어올 수 있으며, 이 tool들은 live 온톨로지를
+먼저 조회하고 카탈로그 미러가 있는 tool은 바로 이 카탈로그들로 폴백합니다 — [RCA
+Pipeline](RCA-PIPELINE.md#4-per-collector-autonomous-drill-down) 참고. 이 답변들은
+참고 자료일 뿐입니다. evidence trail 밖에 머무르며 클러스터가 보고한 것으로 취급되지
+않습니다.
+
 ### 큐레이션 조치의 placeholder 토큰
 
 큐레이션 조치는 family 수준의 지식이므로 placeholder로 작성합니다. 리포트는 해당 런이 실제로

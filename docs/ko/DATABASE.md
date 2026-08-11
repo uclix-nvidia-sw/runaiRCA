@@ -190,6 +190,8 @@ GPU 용량은 여기서 모델링하지 않습니다. 이를 위한 속성 두 �
   `supported_by` (claim←proof), `contradicted_by` (claim←proof)
 - **지식**: `indicates` (symptom→cause), `resolved_by` (symptom→remedy),
   `runbook_contains` (runbook→step), `runbook_entry` (runbook→step),
+  `runbook_for` (runbook→incident — 케이스의 playbook을 그 incident와 연결해
+  cross-case `steps_for_family` 검색을 가능하게 함; 케이스 범위 playbook만 보유),
   `diagnostic_transition` (prior→next), `diagnostic_outcome` (step→cause),
   `diagnostic_recommendation` (step→remedy), `probe_template_for` (step→template),
   `package_has_template` (package→template+binding), `applies_to` (fault→model),
@@ -216,7 +218,16 @@ GPU 용량은 여기서 모델링하지 않습니다. 이를 위한 속성 두 �
 | Schema + functions | `load_schema` / `load_functions` | `schema.tql` / `functions.tql` | Helm post-install/upgrade 훅 (`typedb-schema-job.yaml`) |
 | Curated knowledge | `load_knowledge`, `load_troubleshooting`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | `knowledge/` 카탈로그들 | 버전 관리되는 파일, 스키마 잡에서 실행 |
 | Topology + incidents | `ontology/ingest.py` (CronJob) | Postgres `incidents`/`alerts` | Dashboard 승인(`user_approved_at`) 후 resolved 상태로 `resolvedGraceHours` 이상 경과. `requireReview`는 deprecated |
+| External support cases | `ontology/load_external_cases.py` (스키마 잡 + ingest CronJob) | `knowledge/external_cases/`의 큐레이션 번들 | `typedb.externalCases.enabled`로 게이트; 운영자가 지정한 `typedb.externalCases.approvedBy`가 모든 케이스에 기록됨 |
 | ~~Knowledge promotion~~ | `ingest.py --promote-knowledge` | 운영자가 확인한 RCA | 폐기·기본 비활성 — 그래프 지식은 검토를 거친 지식 패키지에서만 |
+
+최근 로더 견고화: 스키마 잡은 TCP 연결뿐 아니라 TypeDB가 실제 트랜잭션을 받아들일
+때까지 폴링한 뒤에 스키마를 적용하므로, cold start가 Helm 훅의 재시도 예산을
+소진시키는 대신 스스로 회복합니다. 진단 트리 로더의 `probe_template_for` insert가
+수정되어 step-to-probe 링크가 0건 매치로 조용히 비어 있던 문제 없이 실제로
+기록됩니다. 그리고 ingest는 UTC가 아닌 승인 타임스탬프를 버리는 대신 UTC로
+정규화합니다(형식이 잘못됐거나 timezone이 없는 타임스탬프는 여전히 경고와 함께
+버려집니다).
 
 **오케스트레이터**는 분석 중에 TypeDB를 참조합니다
 (`agent/app/services/kg_enrichment.py`): 노드 blast radius(영향 범위), 동일 알림의 이전

@@ -194,6 +194,8 @@ the [Knowledge Base](KNOWLEDGE-BASE.md) doc.
   `supported_by` (claim←proof), `contradicted_by` (claim←proof)
 - **Knowledge**: `indicates` (symptom→cause), `resolved_by` (symptom→remedy),
   `runbook_contains` (runbook→step), `runbook_entry` (runbook→step),
+  `runbook_for` (runbook→incident — links a case's playbook to its incident for
+  cross-case `steps_for_family` retrieval; only case-scoped playbooks carry it),
   `diagnostic_transition` (prior→next), `diagnostic_outcome` (step→cause),
   `diagnostic_recommendation` (step→remedy), `probe_template_for` (step→template),
   `package_has_template` (package→template+binding), `applies_to` (fault→model),
@@ -220,7 +222,16 @@ the [Knowledge Base](KNOWLEDGE-BASE.md) doc.
 | Schema + functions | `load_schema` / `load_functions` | `schema.tql` / `functions.tql` | Helm post-install/upgrade hook (`typedb-schema-job.yaml`) |
 | Curated knowledge | `load_knowledge`, `load_troubleshooting`, `load_xids`, `load_alerts`, `load_known_issues`, `load_architecture` | the `knowledge/` catalogs | Version-controlled files, run in the schema job |
 | Topology + incidents | `ontology/ingest.py` (CronJob) | Postgres `incidents`/`alerts` | Dashboard-approved (`user_approved_at`) and resolved ≥ `resolvedGraceHours` ago; `requireReview` is deprecated |
+| External support cases | `ontology/load_external_cases.py` (schema job + ingest CronJob) | curated bundles in `knowledge/external_cases/` | Gated by `typedb.externalCases.enabled`; the operator-set `typedb.externalCases.approvedBy` is recorded on every case |
 | ~~Knowledge promotion~~ | `ingest.py --promote-knowledge` | operator-confirmed RCAs | Deprecated, off by default — graph knowledge comes from reviewed knowledge packages |
+
+Recent loader hardening: the schema job polls until TypeDB accepts a real
+transaction (not just a TCP connect) before applying schema, so a cold start
+self-heals instead of failing the Helm hook's retry budget; the diagnostic
+tree loader's `probe_template_for` insert is fixed so a step-to-probe link is
+actually written instead of silently matching zero rows; and ingestion
+normalizes a non-UTC approval timestamp to UTC instead of dropping it (a
+malformed or naive one is still dropped, with a warning).
 
 The **orchestrator** consults TypeDB during analysis
 (`agent/app/services/kg_enrichment.py`): node blast radius, prior same-alert

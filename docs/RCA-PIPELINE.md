@@ -197,23 +197,49 @@ vice versa:
 | loki | `logql_query` | range query only |
 | runai | `runai_api_search` + `runai_api_get` | GET-only, path must start `/api/` (method hardcoded) |
 | postgres | `sql_select` | single `SELECT`/`WITH`, READ ONLY transaction, auto `LIMIT 50` |
-| *every* agent | `knowledge_lookup` | in-process catalog read, no cluster call and no domain boundary crossed |
+| *every* agent | `knowledge_lookup`, `case_lookup`, `xid_lookup`, `component_checks`, `steps_lookup` | ontology-first / catalog-fallback read, no cluster call and no domain boundary crossed; answers never become evidence |
 
 Each loop also receives the plan's `operator_already_attempted` list, with the
 instruction to verify the fix actually took effect and to prefer queries that
 explain why the problem survived it — never to propose it as the next step.
 
-`knowledge_lookup` answers "what is already known about this?" mid-loop, so an
-agent that forms a hypothesis three queries in is not stuck with the knowledge
-the plan stage happened to fetch. It reads the same merged map the ranker uses —
-the version-controlled catalog plus operator-approved runtime knowledge — so
+**Every agent gets five read-only knowledge tools, not just one** — an agent
+that forms a hypothesis three queries in is not stuck with whatever the plan
+stage happened to fetch:
+
+| Tool | Answers | args |
+|---|---|---|
+| `knowledge_lookup` | "What is already known about this symptom/hypothesis?" — matching catalog symptoms + operator-approved knowledge (family, confirmed remediation), plus Run:ai known issues | `hypothesis` |
+| `case_lookup` | "Has an external vendor-support case seen this error before?" — family, mechanism, what was tried (incl. what did **not** work) | `text` (verbatim observed error/log text) |
+| `xid_lookup` | "What does this NVIDIA XID mean?" — identity, severity, resolution guidance, the `leads_to` escalation chain in both directions | `xid` |
+| `component_checks` | "What does this platform component do, and how do I check it?" — purpose, failure effect, ready-to-run checks, direct dependencies | `component` |
+| `steps_lookup` | "How did other cases in this family get diagnosed?" — cross-case support-thread steps, in thread order | `family` (closed catalog), optional `text` filter |
+
+`knowledge_lookup`, `xid_lookup`, and `component_checks` query the live TypeDB
+ontology first and fall back to the version-controlled YAML catalog on any
+failure or when TypeDB is disabled. `steps_lookup` is graph-only — per-case
+playbook steps (`agent/ontology/load_external_cases.py`) are never mirrored to
+YAML, so there is no fallback to degrade to. A resolved lookup's `source` field
+says where the answer came from: `ontology` (live graph), `catalog_fallback`
+(baked-in YAML), `unavailable` (no ontology and no fallback exists —
+`steps_lookup` when TypeDB is off/unreachable), or `unresolved`
+(`component_checks` when local name resolution fails before any knowledge
+source was even consulted). `case_lookup`'s external-case retrieval is
+TypeDB-only and carries no separate `source` field; it degrades silently to an
+empty "no external support case matches that text" result when TypeDB is
+off, unreachable, or times out.
+
+`knowledge_lookup` reads the same merged map the ranker uses — the
+version-controlled catalog plus operator-approved runtime knowledge — so
 knowledge approved after the plan was written is still reachable. Every entry
 names its source (`curated` / `learned` / `novel`) and carries `matcher_only`,
-because a novel family is guidance to test, not a root cause to report. Its
-answers deliberately produce **no artifact**: the agent sees them in its loop and
-the run keeps a receipt in `details.knowledge_lookups`, but curated wording must
-never reach the observed-evidence text, where the signature matchers would read
-our own catalog back as something the cluster reported.
+because a novel family is guidance to test, not a root cause to report.
+
+All five tools' answers deliberately produce **no artifact**: the agent sees
+the answer in its own reasoning loop and the run keeps a receipt in
+`details.knowledge_lookups`, but curated wording must never reach the
+observed-evidence text, where the signature matchers would read our own
+catalog back as something the cluster reported.
 
 The postgres agent queries the **Run:ai control-plane database itself** when
 `RUNAI_DB_DSN` is set (workloads/audit/authorization/… schemas) — not just the
@@ -396,6 +422,18 @@ The **Troubleshooting Playbook** section appends, for any implicated platform
 component, its failure effect, its BFS **dependency check order** (e.g.
 `cluster-sync → status-updater → runai-backend-traefik`), and its ready-to-run
 `kubectl` checks — from the [architecture topology](KNOWLEDGE-BASE.md).
+
+**When the run never settles on a family** (`insufficient_evidence`), the
+Troubleshooting Playbook and the "### Knowledge Base (Ontology)" appendix both
+switch to an explicitly hedged form instead of staying silent or overclaiming:
+up to two cross-family symptom matches the ranker did not act on, each tagged
+`(knowledge match — unconfirmed)`, plus the single best-matched external
+support case — "Action that helped then" / "Actions that did not help then"
+from its recorded outcomes, or a note that its diagnostic steps may be worth
+reviewing when it has no recorded fix. A header states plainly that these are
+reference actions grounded in accumulated knowledge and past cases, not a
+confirmed diagnosis. Ranking itself is untouched — this only changes what the
+playbook renders for a family that never became a headline cause.
 
 ## 9. Runtime harness
 

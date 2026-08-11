@@ -123,6 +123,15 @@ evidence sits somewhere non-obvious: a fractional-GPU workload's slice is held
 by a `gpu-reservation-<hash>` Pod in a separate namespace, so an agent looking
 only at the workload's own namespace cannot see the blocker.
 
+Retrieval is not limited to what the plan fetched up front. Every evidence
+agent can also pull the same knowledge on demand mid-analysis, through five
+read-only tools (`knowledge_lookup`, `case_lookup`, `xid_lookup`,
+`component_checks`, `steps_lookup`) that query the live ontology first and,
+where a catalog mirror exists, fall back to these same catalogs — see
+[RCA Pipeline](RCA-PIPELINE.md#4-per-collector-autonomous-drill-down). Their
+answers are reference material only: kept out of the evidence trail, never
+treated as something the cluster reported.
+
 ### Placeholder tokens in curated actions
 
 Curated actions are family-level knowledge, so they are written with

@@ -178,20 +178,45 @@ reference cases, never proof**:
   coarsens timestamps to dates. Only the de-identified copies are committed —
   the same publish-the-lesson-not-the-record practice as the known-issues
   catalog. The sanitizer refuses to emit a file that still contains the number.
+  A signature the sanitizer masked in place (`nfs: server <address> not
+  responding, still trying`) would otherwise never substring-match a real log
+  line; the loader salvages the longest literal fragment around the placeholder
+  instead of dropping the keyword outright.
 - **Approval is explicit.** The Helm schema-load job runs the loader only with an
   operator-set approver (`typedb.externalCases.approvedBy`), recorded on every
   case — the same approval gate as section 1.
-- **Never knowledge-layer authority.** They enter TypeDB as labelled case
-  snapshots with a case-local symptom, but the loader structurally never writes
-  the `indicates`/`resolved_by` edges the knowledge layer requires, so they can
-  never become a catalog rule that names a cause.
+- **Trusted, but only for what the thread actually confirmed.** A case enters
+  the *same* `indicates`/`resolved_by` chain curated knowledge uses — reachable
+  by `knowledge_lookup`, the plan-time symptom lead, and guidance/actions — but
+  only when its support thread *confirmed* the mechanism (not merely observed
+  it) and its family is one of the closed catalog's. An unconfirmed case stays
+  retrieval-only and never gets those edges. Even a chained case's `resolved_by`
+  is written only for actions the thread confirmed actually resolved or
+  mitigated the incident; a diagnostic or preventive step that was merely tried
+  is never treated as a fix claim — it becomes a playbook step instead (below).
+- **Diagnostic/preventive steps become a per-case playbook, chained or not.**
+  Every ingested case's support-thread diagnostic and preventive actions are
+  mirrored one-by-one as a `diagnostic_step` mini-runbook (`<incident>:playbook`),
+  each stamped with its `outcome` (`diagnostic` or `preventive`) and an
+  `interpretation` — up to two masked evidence summaries the thread cited at
+  that step, resolved through the case card's own bounded `evidence_refs`
+  projection. A `runbook_for` edge links the playbook to its incident, so the
+  `steps_for_family` graph function can pull every case's diagnostic steps for
+  one root-cause family across the whole casebook — not only the one case a
+  live investigation happens to match — exposed mid-analysis through the
+  `steps_lookup` tool. The case-scoped runbook name never collides with the
+  bundled executable tree, so the live diagnostic walk can never wander into it.
 - **Retrieved by error signature.** A future analysis surfaces one only when an
   error signature (e.g. `ibv_modify_qp failed with 19 No such device`) actually
   appears in that run's observed evidence. It then appears as historical context,
   labelled with its use-class (`evaluation_only`, `mitigated_context`,
   `unresolved_context`). Actions it tried — including the ones that did **not**
   work — are shown as "attempted in a past external case," never as a verified
-  fix for the current incident.
+  fix for the current incident. A drill-down agent's mid-analysis hint carries
+  the same thread narrative: its 1-based `order` among that case's
+  diagnostic/preventive steps, its `outcome`, and up to two `observed` evidence
+  summaries — so a lead reads as "step 2, a preventive check, which found X"
+  instead of a bare imperative.
 
 For the de-identification contract and how to add a case, see
 `agent/knowledge/external_cases/README.md`.
