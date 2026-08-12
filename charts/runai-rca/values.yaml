@@ -509,11 +509,6 @@ agent:
     runaiWorkloadsPath: /api/v1/workloads
     runaiProjectsPath: /api/v1/projects
     runaiQueuesPath: /api/v1/queues
-    # Endpoint used to learn the Run:ai version — enables version-aware
-    # suppression of known issues already fixed on this cluster. The REST API
-    # has no dedicated version endpoint; each cluster object from
-    # GET /api/v1/clusters carries a nullable `version` field. Best-effort.
-    runaiVersionPath: /api/v1/clusters
     runaiTimeoutSeconds: 120
     runaiLogNamespaces: runai,runai-backend
     collectors: runai,kubernetes,postgres,prometheus,loki,system,change
