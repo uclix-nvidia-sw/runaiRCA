@@ -580,6 +580,9 @@ func (s *Store) upsertMemoryLocked(incident *Incident, alert *AlertRecord) {
 	if run == nil {
 		return
 	}
+	if run.Metadata["answer_mode"] == "knowledge_only" {
+		return
+	}
 	// Incident-scoped, not alert-scoped: key by incident so a changed representative
 	// alert across re-approvals updates the one row instead of accumulating dupes.
 	// AlertID stays empty -> map key = IncidentID, DB unique (incident_id, '') = 1/incident.
