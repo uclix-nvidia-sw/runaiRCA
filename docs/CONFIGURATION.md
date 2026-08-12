@@ -77,8 +77,8 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `LOKI_TIMEOUT_SECONDS` | Loki query timeout |
 | `LOKI_QUERY_LIMIT` | Maximum log lines requested per Loki query group, default `20` |
 | `LOKI_MCP_URL` | Grafana MCP URL for Loki tools. Helm sets this to the same managed `grafanaMcp` ClusterIP service when enabled; fallback uses `LOKI_URL` |
-| `ENABLE_SYSTEM_AGENT` | Enable the node-infra System collector (dmesg/journalctl/syslog via a per-node DaemonSet), default `true`; degrades to `unavailable` when `SYSTEM_AGENT_URL` is unset |
-| `SYSTEM_AGENT_URL` | Per-node System-agent DaemonSet endpoint (`GET /logs?source=dmesg\|journal\|syslog`). Historical incident collection passes its exact RFC3339 time window to `journal`; dmesg/syslog remain current-state tails. |
+| `ENABLE_SYSTEM_AGENT` | Enable the node-infra System collector (dmesg/journalctl/syslog/fabricmanager/nvidia-smi/nvlink/ibstat via a per-node DaemonSet), default `true`; degrades to `unavailable` when `SYSTEM_AGENT_URL` is unset |
+| `SYSTEM_AGENT_URL` | Per-node System-agent DaemonSet endpoint (`GET /logs?source=dmesg\|journal\|syslog\|fabricmanager\|nvidia-smi\|nvlink\|ibstat`). `journal` and `fabricmanager` are journalctl-backed, so historical incident collection can pass them an exact RFC3339 time window; `dmesg`, `syslog`, `nvidia-smi`, `nvlink`, and `ibstat` are current-state snapshots only. |
 | `SYSTEM_AGENT_TOKEN` | Optional bearer token for the System-agent endpoint |
 | `SYSTEM_AGENT_TIMEOUT_SECONDS` | System-agent request timeout, default `120` |
 | `ENABLE_POD_EXEC` | Allow the Kubernetes collector's denylist-gated read-only pod-exec: it blocks mutating commands, shells/interpreters, and shell metacharacters, and runs a single argv with no shell. Default `true` |

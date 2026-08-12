@@ -220,7 +220,7 @@ export function ChatDashboard({
 
       <section className={`full-chat-main ${activeMessages.length === 0 ? 'is-empty' : 'has-messages'}`}>
         <div className="chat-usage-notice">
-          New question? Press the RCA button — it runs a full analysis and creates an incident. Send replies within the selected incident.
+          새로운 질문은 RCA 버튼으로 — 전체 분석을 실행하고 인시던트를 생성합니다. Send는 선택한 인시던트 안에서 대화합니다.
         </div>
         <div className="full-chat-messages" ref={listRef}>
           {activeMessages.length === 0 ? (
