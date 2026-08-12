@@ -310,7 +310,6 @@ func (s *Server) agentRuntimeContext() map[string]any {
 		"agent_url":                       s.agentURL,
 		"agent_request_timeout_seconds":   int(s.agentRequestTimeout.Seconds()),
 		"database":                        s.store.databaseHealth(),
-		"chat_mode":                       "deterministic_context",
 		"chat_llm_runtime":                "not_directly_used",
 		"analysis_runtime_failure_source": "analysis_runs.capabilities.agent and warnings",
 	}

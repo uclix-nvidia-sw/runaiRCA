@@ -938,6 +938,13 @@ func TestExcerptDoesNotSplitUTF8(t *testing.T) {
 	}
 }
 
+func TestAgentRuntimeContextLeavesChatModeToAgent(t *testing.T) {
+	runtime := NewServer().agentRuntimeContext()
+	if _, ok := runtime["chat_mode"]; ok {
+		t.Fatalf("backend must leave chat mode reporting to the agent service, got %+v", runtime)
+	}
+}
+
 func TestChatRouteProxiesContextualRCARequestToAgent(t *testing.T) {
 	server := NewServer()
 	agentReqCh := make(chan ChatRequest, 1)

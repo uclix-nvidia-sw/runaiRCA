@@ -613,6 +613,19 @@ func (s *Store) upsertAlertResultLocked(
 	alertStatus := status(alert.Status)
 	now := time.Now().UTC()
 	alertFiredAt := firstTime(alert.StartsAt, now)
+	if alert.StartsAt == "" {
+		// A zero-StartsAt resend (chat-adhoc alerts carry no Alertmanager
+		// timestamp) reuses the live episode's firing time so it cannot count
+		// as a re-fire — but only while that episode's incident is still
+		// alive. A deleted incident's alert must not lend its timestamp:
+		// reusing it would hand the resend to the episode tombstone and drop
+		// it, when a post-deletion resend is a fresh episode by design.
+		existing := s.alerts[s.alertByFinger[fingerprint]]
+		if existing != nil && existing.Status == "firing" &&
+			!incidentDeleted(s.incidents[existing.IncidentID]) {
+			alertFiredAt = existing.FiredAt
+		}
+	}
 	if s.episodeTombstoneDropsLocked(fingerprint, alertStatus, alertFiredAt) {
 		return AlertUpsertResult{CorrelationKey: key, Dropped: true}, nil, nil
 	}
