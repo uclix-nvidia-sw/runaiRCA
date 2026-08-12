@@ -32,10 +32,10 @@ metadata:
     app.kubernetes.io/component: system-agent
 data:
   # Tiny read-only log endpoint. stdlib only, no deps.
-  # GET /logs?source=dmesg|journal|syslog|fabricmanager|nvidia-smi|nvlink&lines=N&grep=REGEX&since=RFC3339&until=RFC3339
+  # GET /logs?source=dmesg|journal|syslog|fabricmanager|nvidia-smi|nvlink|ibstat&lines=N&grep=REGEX&since=RFC3339&until=RFC3339
   # -> {"lines": [...]}. since/until are applied only to journalctl sources; dmesg,
-  # syslog, nvidia-smi, and nvlink are current-state snapshots and must not be
-  # presented as past-time evidence.
+  # syslog, nvidia-smi, nvlink, and ibstat are current-state snapshots and must not
+  # be presented as past-time evidence.
   # ponytail: stdlib http.server is enough for a per-node read endpoint; no framework.
   server.py: |
     import os, re, subprocess
@@ -61,6 +61,11 @@ data:
         # NVIDIA status commands are current-state snapshots, not past-time evidence.
         "nvidia-smi": NSENTER + ["nvidia-smi", "-q"],
         "nvlink": NSENTER + ["nvidia-smi", "nvlink", "--status", "--errorcounters"],
+        # InfiniBand HCA/port state snapshot. When the node has no `ibstat`
+        # binary (no IB tooling/hardware), nsenter exits nonzero with empty
+        # stdout -- same "no crash, empty output" degradation as any other
+        # source, no special-casing needed here.
+        "ibstat": NSENTER + ["ibstat"],
     }
 
     def read_syslog(lines):
@@ -105,7 +110,7 @@ data:
         if source == "fabricmanager" and not res.stdout.strip():
             return read_fabricmanager(lines)
         output = res.stdout.splitlines()
-        if source in ("nvidia-smi", "nvlink"):
+        if source in ("nvidia-smi", "nvlink", "ibstat"):
             return output[:lines]
         return output[-lines:]
 
