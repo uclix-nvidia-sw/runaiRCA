@@ -64,7 +64,7 @@ from app.prompts import load_agent_souls
 from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse, SimilarIncidentContext
 from app.services.decision_tree import resolve_tree, walk_tree
 from app.services.evidence_projection import EXECUTION_METADATA_KEYS
-from app.services.general_guidance import general_guidance_lines
+from app.services.general_guidance import _external_case_lines, general_guidance_lines
 from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
 from app.services.planner import plan_investigation
 from app.services.query_memory import QueryMemory
@@ -624,6 +624,14 @@ _ALERT_NON_EVIDENCE_FIELD_RE = re.compile(
     r"query|expression|command|template|example|sample)",
     re.IGNORECASE,
 )
+# chat.go's synthetic ad-hoc alert (see _is_chat_adhoc) carries nothing in
+# ``summary`` but an excerpt of the operator's own question -- unlike a REAL
+# alert's summary, which is Alertmanager's own observation and must stay
+# eligible for signature promotion. Used ONLY for _is_chat_adhoc(request)
+# runs, by _asserted_alert_texts/_alert_signature_text below.
+_CHAT_ADHOC_NON_EVIDENCE_FIELD_RE = re.compile(
+    _ALERT_NON_EVIDENCE_FIELD_RE.pattern + r"|summary", re.IGNORECASE
+)
 _ALERT_NON_ASSERTIVE_PREFIX_RE = re.compile(
     r"(?:\b(?:check|verify|inspect|grep|search|test|rule\s+out|look\s+for)\b[^.!?\n]{0,96}"
     r"|\b(?:possible|possibly|potential|maybe|hypothesis|candidate|runbook|"
@@ -657,14 +665,56 @@ def _alert_signal_field(key: object) -> bool:
     )
 
 
+def _is_chat_adhoc(request: AlertAnalysisRequest) -> bool:
+    """True only for the synthetic ad-hoc alert chat.go mints when an operator
+    asks a general knowledge question with no matching alert -- a
+    ``chat-adhoc-`` fingerprint, alertname ``OperatorRequestedAnalysis``, and
+    ``source: chat`` on both the request and the alert's own label. All four
+    markers must agree; a real alert re-run via chat, or a manual re-analysis
+    that merely carries an ``operator_prompt``, satisfies at most one or two
+    of them and stays a normal alert -- its own text remains full evidence.
+    """
+    alert = request.alert
+    labels = alert.labels or {}
+    annotations = alert.annotations or {}
+    is_chat_source = (
+        request.analysis_type == "chat" or annotations.get("analysis_request_source") == "chat"
+    )
+    return (
+        is_chat_source
+        and labels.get("alertname") == "OperatorRequestedAnalysis"
+        and labels.get("source") == "chat"
+        and str(alert.fingerprint or "").startswith("chat-adhoc-")
+    )
+
+
+def _operator_question_text(request: AlertAnalysisRequest) -> str:
+    """The operator's own question for a chat-adhoc run (see
+    ``_is_chat_adhoc``): the backend's full ``operator_prompt`` when set, else
+    the synthetic alert's own 160-char ``summary`` annotation chat.go seeded
+    it with. Feeds the deterministic knowledge-answer ladder only -- never a
+    signature/evidence haystack (that stays ``_alert_signature_text`` below)."""
+    annotations = request.alert.annotations or {}
+    return str(annotations.get("operator_prompt") or annotations.get("summary") or "").strip()
+
+
 def _asserted_alert_texts(request: AlertAnalysisRequest) -> list[str]:
     """Return alert values that can make an auditable positive assertion.
 
     Condition/status pairs are evaluated structurally in both labels and
     annotations, so sender insertion order cannot turn ``False OOMKilled`` into
     a positive fact.  Runbook/operator/query fields remain hypothesis guidance,
-    never incident evidence.
+    never incident evidence. For a chat-adhoc run (``_is_chat_adhoc``) the
+    synthetic ``summary`` annotation is ALSO excluded -- it is the operator's
+    own question, not an Alertmanager observation, and must never mint a
+    signature (see ``_CHAT_ADHOC_NON_EVIDENCE_FIELD_RE``). A real alert's
+    summary is untouched.
     """
+    non_evidence_re = (
+        _CHAT_ADHOC_NON_EVIDENCE_FIELD_RE
+        if _is_chat_adhoc(request)
+        else _ALERT_NON_EVIDENCE_FIELD_RE
+    )
     texts: list[str] = []
     for metadata in (request.alert.labels or {}, request.alert.annotations or {}):
         entries = [
@@ -688,7 +738,7 @@ def _asserted_alert_texts(request: AlertAnalysisRequest) -> list[str]:
         for key, value in entries:
             if key.casefold() in _ALERT_STATE_FIELDS:
                 continue
-            if _ALERT_NON_EVIDENCE_FIELD_RE.search(key):
+            if non_evidence_re.search(key):
                 continue
             if value not in texts:
                 texts.append(value)
@@ -2808,6 +2858,25 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
             )
             state.detail = _append_general_guidance(state.detail, block)
 
+    # Chat-adhoc operator questions ("XID48 에러가 발생했는데...") that found no
+    # cluster evidence get a deterministic, clearly-bannered knowledge answer
+    # too -- see _build_chat_adhoc_knowledge_block. Same "nothing eligible"
+    # signal as the guide above (not the broader _needs_general_guidance,
+    # which also fires on a merely-unsettled top family); inserted before the
+    # appendix like Self-Check/Operator Questions below, ahead of the guide's
+    # own always-last block. Never fabricates a cause, never touches
+    # root_cause_family -- harness_stage carries it across an abstain exactly
+    # like the guide.
+    if _is_chat_adhoc(request) and eligible_support_ids == set():
+        try:
+            knowledge_block = await _build_chat_adhoc_knowledge_block(
+                state, getattr(settings, "language", "en")
+            )
+        except Exception:  # noqa: BLE001 - a missing knowledge answer is not a failed RCA
+            _log.warning("chat-adhoc knowledge answer failed", exc_info=True)
+        else:
+            state.detail = _insert_before_appendix(state.detail, knowledge_block)
+
     # Self-check caveat (optional hook) + re-analysis note — inserted BEFORE the
     # appendix so the document reads problem -> cause -> actions -> checks -> appendix.
     self_check_lines = [text for text in (state.self_check_caveat, state.reanalysis_note) if text]
@@ -3054,6 +3123,10 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             candidate_before_harness=candidate_before_harness,
         )
         response.context["analysis_hash"] = analysis_hash(response)
+        if _is_chat_adhoc(state.request) and response.root_cause_family == "insufficient_evidence":
+            knowledge_language = getattr(state.settings, "language", "en")
+            if _extract_chat_adhoc_knowledge_block(response.analysis_detail, knowledge_language):
+                response.context["answer_mode"] = "knowledge_only"
         return state
 
     repairs = 0
@@ -3096,6 +3169,14 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         # explicitly not a conclusion, so a failed gate is no reason to drop it.
         language = getattr(state.settings, "language", "en")
         carried_guidance = _general_guidance_block(response.analysis_detail, language)
+        # Same carry for the chat-adhoc knowledge answer: it is inserted
+        # before the appendix (_insert_before_appendix), not appended last
+        # like the guide above, so its own extractor bounds itself at the
+        # next ## heading instead of end-of-string -- see
+        # _extract_chat_adhoc_knowledge_block.
+        carried_knowledge_answer = _extract_chat_adhoc_knowledge_block(
+            response.analysis_detail, language
+        )
         abstain(
             response,
             state.root_cause_candidates,
@@ -3111,6 +3192,14 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             # the bare stub leaves the operator with less help than a
             # zero-evidence run (live case: INC-1785128597…, a 318-char report).
             carried_guidance = _abstain_guidance_block(state, language)
+        if carried_knowledge_answer:
+            # Ahead of the general guide, matching its position in the
+            # pre-abstain document (before the appendix, general guidance
+            # always last).
+            response.analysis_detail = (
+                f"{response.analysis_detail.rstrip()}\n\n{carried_knowledge_answer}"
+            )
+            response.analysis = response.analysis_detail
         if carried_guidance:
             response.analysis_detail = _append_general_guidance(
                 response.analysis_detail, carried_guidance
@@ -3159,6 +3248,14 @@ async def harness_stage(state: PipelineState) -> PipelineState:
     # short summary after that decision so a demotion cannot leave a confident
     # mechanism sentence beside ``insufficient_evidence``.
     final_family = response.root_cause_family
+    if _is_chat_adhoc(state.request) and final_family == "insufficient_evidence":
+        # Never on root_cause_family/verdict -- this only flags that the
+        # chat-adhoc knowledge-answer section rendered (content or an
+        # explicit no-match), for the frontend to badge the answer instead
+        # of presenting it as a diagnosis.
+        knowledge_language = getattr(state.settings, "language", "en")
+        if _extract_chat_adhoc_knowledge_block(response.analysis_detail, knowledge_language):
+            response.context["answer_mode"] = "knowledge_only"
     if final_family == "insufficient_evidence":
         _warn_on_discarded_support(state, response)
         _warn_on_starved_evidence(state, response)
@@ -4778,6 +4875,286 @@ def _general_guidance_block(detail: str, language: str) -> str:
         index = (detail or "").find(heading)
         if index >= 0:
             return detail[index:].rstrip()
+    return ""
+
+
+# --- Chat-adhoc knowledge answer (P1) ---------------------------------------
+#
+# A chat-adhoc question ("XID48 에러가 발생했는데...") whose cluster sweep finds
+# nothing still deserves more than a bare abstain: a deterministic answer
+# assembled from the same catalogs/ontology every other report section already
+# draws from (never an LLM call), clearly bannered as knowledge, not a
+# diagnosis. Gated on ``_is_chat_adhoc`` everywhere -- a real alert's guidance
+# is untouched.
+
+
+def _chat_adhoc_knowledge_heading(language: str) -> str:
+    return (
+        "## 지식 기반 답변 (클러스터 직접 증거 없음)"
+        if language == "ko"
+        else "## Knowledge-Based Answer (No Direct Cluster Evidence)"
+    )
+
+
+def _chat_adhoc_knowledge_banner(language: str) -> str:
+    if language == "ko":
+        return (
+            "⚠️ 클러스터에서 이 질문과 관련된 직접 증거를 찾지 못했습니다. 아래는 지식 "
+            "베이스(온톨로지)에 축적된 지식으로 구성한 참고 답변이며, 현재 클러스터 상태에 "
+            "대한 진단이 아닙니다."
+        )
+    return (
+        "⚠️ No direct evidence for this question was found in the cluster. The "
+        "answer below is assembled from the knowledge base (ontology) and is NOT "
+        "a diagnosis of the current cluster state."
+    )
+
+
+def _chat_adhoc_knowledge_no_match_lines(ko: bool) -> list[str]:
+    if ko:
+        return [
+            "질문과 관련된 지식을 지식 베이스에서 찾지 못했습니다.",
+            "",
+            "- 정확한 오류 메시지나 로그 문구가 있다면 알려주세요.",
+            "- 영향받은 pod, node, 워크로드 이름을 알려주세요.",
+            "- 관련된 알림(alert) 이름이 있다면 함께 알려주세요.",
+        ]
+    return [
+        "No matching knowledge was found in the knowledge base for this question.",
+        "",
+        "- Share the exact error text or log message, if you have it.",
+        "- Share the affected pod, node, or workload name.",
+        "- Share the alert name, if this relates to a specific alert.",
+    ]
+
+
+def _xid_knowledge_lines(result: dict[str, Any], ko: bool, masker: Masker) -> list[str]:
+    """One XID catalog/ontology entry. ``fixes`` is the stable key across both
+    the TypeDB and YAML-catalog shapes _tool_xid_lookup can return."""
+    label = "**[XID 카탈로그]**" if ko else "**[XID Catalog]**"
+    identity = str(result.get("description") or result.get("mnemonic") or "").strip()
+    severity = str(result.get("severity") or "").strip()
+    header = f"XID {result.get('code')}"
+    if identity:
+        header += f" — {_safe_line(identity, limit=160, masker=masker)}"
+    if severity:
+        header += f" ({severity})"
+    lines = [f"- {label} {header}"]
+    fixes = [str(fix) for fix in (result.get("fixes") or []) if str(fix).strip()]
+    lines.extend(f"  - {_safe_line(fix, limit=360, masker=masker)}" for fix in fixes[:3])
+    return lines
+
+
+def _known_issue_knowledge_lines(issue: dict[str, Any], ko: bool, masker: Masker) -> list[str]:
+    label = "**[알려진 이슈]**" if ko else "**[Known Issue]**"
+    name = _safe_line(issue.get("issue"), limit=180, masker=masker)
+    lines = [f"- {label} {name}"]
+    reason = _safe_line(issue.get("reason"), limit=360, masker=masker)
+    if reason:
+        lines.append(f"  - {reason}")
+    lines.extend(
+        f"  - {_safe_line(action, limit=360, masker=masker)}"
+        for action in issue.get("actions", [])[:3]
+    )
+    return lines
+
+
+def _symptom_knowledge_lines(
+    family: str,
+    symptom: dict[str, Any],
+    language: str,
+    masker: Masker,
+    *,
+    nearest: bool = False,
+) -> list[str]:
+    """A curated-symptom hit, exact (c) or qualified-BM25 (e). Korean prefers
+    the curated symptom_ko/reason_ko/actions_ko fields directly -- already
+    Hangul, so the later translation pass leaves them alone untouched."""
+    ko = language == "ko"
+    if nearest:
+        label = (
+            "**[가장 근접한 지식 — 정확히 일치하지 않음]**"
+            if ko
+            else "**[Nearest Knowledge — Not an Exact Match]**"
+        )
+    else:
+        label = "**[지식베이스 증상]**" if ko else "**[Curated Symptom]**"
+    name = _safe_line(_localized_failure_mode_name(symptom, language), limit=180, masker=masker)
+    lines = [f"- {label} {name} ({_family_label(family)})"]
+    reason = _safe_line(symptom.get("reason_ko" if ko else "reason"), limit=360, masker=masker)
+    if reason:
+        lines.append(f"  - {reason}")
+    lines.extend(
+        f"  - {_safe_line(action, limit=360, masker=masker)}"
+        for action in _localized_failure_mode_actions(symptom, language)[:3]
+    )
+    return lines
+
+
+def _family_lead_knowledge_lines(
+    family: str, symptoms: list[dict[str, Any]], language: str, masker: Masker
+) -> list[str]:
+    """Planner-family supplementary lead (f): the LLM read the question and
+    named a closed-catalog family, so its representative symptoms are shown
+    as an interpretation, never as a match on the question's own words."""
+    ko = language == "ko"
+    family_name = _safe_line(_family_label(family), limit=160, masker=masker)
+    label = (
+        f"**[다음으로 해석됨: {family_name}]**" if ko else f"**[Interpreted As: {family_name}]**"
+    )
+    lines = [f"- {label}"]
+    for symptom in symptoms[:2]:
+        name = _safe_line(_localized_failure_mode_name(symptom, language), limit=180, masker=masker)
+        action = _safe_line(
+            _localized_failure_mode_actions(symptom, language)[0], limit=300, masker=masker
+        )
+        lines.append(f"  - **{name}**: {action}")
+    return lines
+
+
+async def _chat_adhoc_knowledge_ladder_lines(state: PipelineState, question: str) -> list[str]:
+    """Deterministic knowledge-only ladder for a chat-adhoc question with no
+    cluster evidence: XID catalog -> known issue -> curated symptom ->
+    external case -> (only when ALL of those are empty) qualified BM25
+    nearest symptoms -> planner families as a supplementary lead. Every
+    lookup is a catalog/ontology read; no LLM call anywhere in this ladder.
+    """
+    if not question:
+        return []
+    settings = state.settings
+    language = getattr(settings, "language", "en")
+    ko = language == "ko"
+    masker = state.masker or build_masker(())
+    lines: list[str] = []
+    found = False
+
+    # a. XID codes named in the question -- ontology-first (owner directive:
+    # TypeDB is the runtime source of truth, YAML is catalog_fallback only),
+    # via drilldown's own tool. Capped at 3 distinct codes to bound the
+    # TypeDB round trips a single question can trigger.
+    codes = list(dict.fromkeys(int(m.group(1)) for m in _XID_PATTERN.finditer(question)))[:3]
+    if codes:
+        try:
+            from app.services.drilldown import _tool_xid_lookup
+        except ImportError:
+            _log.warning("chat-adhoc knowledge answer: drilldown XID tool unavailable")
+        else:
+            for code in codes:
+                try:
+                    entry = await _tool_xid_lookup(settings, state.target, {"xid": code})
+                except Exception:  # noqa: BLE001 - a missing XID lookup is not a failed answer
+                    _log.warning("chat-adhoc XID %s lookup failed", code, exc_info=True)
+                    continue
+                result = entry.get("result") if isinstance(entry, dict) else None
+                if not result:
+                    continue
+                found = True
+                lines.extend(_xid_knowledge_lines(result, ko, masker))
+
+    # b. Exact known-issue keyword match on the question itself.
+    for issue in match_runai_known_issues(state.known_issues, question)[:2]:
+        found = True
+        lines.extend(_known_issue_knowledge_lines(issue, ko, masker))
+
+    # c. Exact curated symptom match, across every family.
+    for family, symptom in match_failure_mode_symptoms(state.failure_modes, question)[:2]:
+        found = True
+        lines.extend(_symptom_knowledge_lines(family, symptom, language, masker))
+
+    # d. External-case exact signature hits already retrieved for this run
+    # (state.kg_context.case_cards) -- labelled as historical support cases,
+    # reusing general_guidance's own renderer (foreign-language marking,
+    # what-helped/what-didn't) instead of a second implementation of it.
+    case_cards = list(getattr(state.kg_context, "case_cards", None) or [])
+    external_cards = [card for card in case_cards if card.get("kind") == "external"]
+    if external_cards:
+        rendered = _external_case_lines(external_cards, language, masker)
+        if rendered:
+            found = True
+            lines.append("**[과거 지원 사례]**" if ko else "**[Past Support Case]**")
+            lines.extend(rendered)
+
+    # e. Only when a-d found nothing at all: qualified BM25 nearest symptoms
+    # (bm25.py's own qualification gate -- 2+ rare-token hits or one
+    # signature-grade hit), max 3, explicitly labelled as an approximate
+    # match. Never runs alongside an exact hit above.
+    if not found:
+        fuzzy_matches = match_failure_mode_symptoms(
+            state.failure_modes, question, fuzzy_query=question
+        )
+        nearest = [
+            (family, symptom)
+            for family, symptom in fuzzy_matches
+            if symptom.get("matched_via") == "bm25"
+        ][:3]
+        for family, symptom in nearest:
+            found = True
+            lines.extend(_symptom_knowledge_lines(family, symptom, language, masker, nearest=True))
+
+    # f. Planner families (the LLM already read the question, closed catalog
+    # only -- see _plan_families) as a supplementary "interpreted as" lead.
+    # Always shown when available; never gated on a-e.
+    for family in _plan_families(state.plan)[:2]:
+        symptoms = [
+            symptom
+            for symptom in (state.failure_modes.get(family) or [])
+            if _localized_failure_mode_actions(symptom, language)
+        ]
+        if not symptoms:
+            continue
+        found = True
+        lines.extend(_family_lead_knowledge_lines(family, symptoms, language, masker))
+
+    return lines
+
+
+async def _build_chat_adhoc_knowledge_block(state: PipelineState, language: str) -> str:
+    """The full chat-adhoc knowledge-answer section: bilingual heading, the
+    non-diagnostic banner, then the ladder's results or an explicit no-match
+    statement. Built deterministically (no LLM) so it is safe to run before
+    the Korean translation pass -- Korean subsections already use the
+    curated _ko fields directly, so the translator's Hangul-skip leaves them
+    untouched; only the English fallbacks (known issues, XID catalog text)
+    get swept into that later pass, same as everywhere else they render.
+    """
+    question = _operator_question_text(state.request)
+    ko = language == "ko"
+    try:
+        ladder_lines = await _chat_adhoc_knowledge_ladder_lines(state, question)
+    except Exception:  # noqa: BLE001 - a missing knowledge answer is not a failed RCA
+        _log.warning("chat-adhoc knowledge ladder failed", exc_info=True)
+        ladder_lines = []
+    body = ladder_lines if ladder_lines else _chat_adhoc_knowledge_no_match_lines(ko)
+    return "\n".join(
+        [
+            _chat_adhoc_knowledge_heading(language),
+            "",
+            _chat_adhoc_knowledge_banner(language),
+            "",
+            *body,
+        ]
+    )
+
+
+def _extract_chat_adhoc_knowledge_block(detail: str, language: str) -> str:
+    """The chat-adhoc knowledge-answer section of a report, heading included,
+    or "" when absent. Unlike ``_general_guidance_block`` (always the last
+    thing in the document), this section is inserted before the appendix
+    (``_insert_before_appendix``), so later ``##`` sections (Self-Check,
+    Operator Questions, Appendix) can follow it -- bound the extraction at
+    the next ``##`` heading instead of end-of-string.
+    """
+    for heading in (
+        _chat_adhoc_knowledge_heading(language),
+        _chat_adhoc_knowledge_heading("en"),
+        _chat_adhoc_knowledge_heading("ko"),
+    ):
+        index = (detail or "").find(heading)
+        if index < 0:
+            continue
+        rest = detail[index:]
+        next_heading = rest.find("\n## ", len(heading))
+        return (rest[:next_heading] if next_heading >= 0 else rest).rstrip()
     return ""
 
 
@@ -7738,21 +8115,30 @@ def _alert_signature_text(request: AlertAnalysisRequest) -> str:
     fields (runbook/operator_prompt/query/..., see
     ``_ALERT_NON_EVIDENCE_FIELD_RE``) are excluded entirely: operator guidance
     may steer investigation order (``_alert_text``) but must never promote a
-    cause. Feeds ``_observed_text``'s alert branch (state.observed, XID
-    extraction, self-check's declared-alert, and the actions/playbook/
-    knowledge-base fuzzy recall that can render a matched symptom's actions
-    into the report) — every consumer that can turn a match into rendered
-    output, as opposed to a conditional suggestion."""
+    cause. For a chat-adhoc run (``_is_chat_adhoc``) the synthetic ``summary``
+    annotation -- an excerpt of the operator's own question -- is ALSO
+    excluded, for the same reason: a question containing "XID48" must not
+    mint an alert_signature/gpu_hardware_error promotion on its own word. A
+    real alert's summary is untouched. Feeds ``_observed_text``'s alert branch
+    (state.observed, XID extraction, self-check's declared-alert, and the
+    actions/playbook/knowledge-base fuzzy recall that can render a matched
+    symptom's actions into the report) — every consumer that can turn a match
+    into rendered output, as opposed to a conditional suggestion."""
+    non_evidence_re = (
+        _CHAT_ADHOC_NON_EVIDENCE_FIELD_RE
+        if _is_chat_adhoc(request)
+        else _ALERT_NON_EVIDENCE_FIELD_RE
+    )
     alert = request.alert
     labels = {
         key: value
         for key, value in (alert.labels or {}).items()
-        if not _ALERT_NON_EVIDENCE_FIELD_RE.search(str(key))
+        if not non_evidence_re.search(str(key))
     }
     annotations = {
         key: value
         for key, value in (alert.annotations or {}).items()
-        if not _ALERT_NON_EVIDENCE_FIELD_RE.search(str(key))
+        if not non_evidence_re.search(str(key))
     }
     return _compose_alert_text(labels, annotations)
 
