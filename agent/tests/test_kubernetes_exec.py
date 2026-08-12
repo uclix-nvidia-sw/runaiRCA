@@ -45,7 +45,6 @@ def test_mutating_command_rejected() -> None:
     assert exec_command_allowed(["/bin/rm", "x"]) is False  # basename is matched
     # Cluster/container control can delete pods or kill containers.
     assert exec_command_allowed(["kubectl", "delete", "pod", "trainer-0"]) is False
-    # Empty argv.
     assert exec_command_allowed([]) is False
     # Shells / interpreters / wrappers smuggle arbitrary code past the denylist.
     assert exec_command_allowed(["sh", "-c", "nvidia-smi"]) is False
