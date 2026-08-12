@@ -76,6 +76,11 @@ _IBSTAT_FIELD = re.compile(r"^\s*(State|Physical state|Rate|Link layer)\s*:\s*(.
 _IB_HEALTHY_STATE = "active"
 _IB_HEALTHY_PHYSICAL_STATE = "linkup"
 
+# Peer-comparison baseline (see _ib_peer_ca_counts): bounded like the
+# cluster-wide node scan itself (system_agent_max_nodes), and each peer
+# request reuses the same per-node timeout as every other system-agent call.
+_IB_PEER_MAX_NODES = 5
+
 # Sources the DaemonSet endpoint understands. Only journalctl-backed sources
 # can be verified against a historical incident window; the rest are snapshots.
 _SOURCES = ("dmesg", "journal", "syslog", "fabricmanager", "nvidia-smi", "nvlink", "ibstat")
@@ -249,6 +254,145 @@ def _ib_artifacts(
             )
         )
     return artifacts
+
+
+def _ib_peer_deficit_artifact(
+    settings: Settings,
+    *,
+    agent: str,
+    node: str,
+    target_count: int,
+    peer_counts: dict[str, int],
+    time_range: dict[str, str] | None,
+    historical_node_scope_verified: bool,
+) -> object | None:
+    """A CA-count deficit against the peer-node consensus, fail-closed.
+
+    A physically-removed HCA just disappears from ``ibstat`` -- there is no
+    state to check -- and RDMA k8s resources are not a reliable capacity
+    baseline (see the module docstring). Other GPU nodes' own ibstat CA
+    counts are the baseline instead, but ONLY when every reporting peer
+    agrees: peers that disagree with each other are as uninformative as no
+    peers at all, so this claims nothing rather than pick a side.
+    """
+    if not peer_counts:
+        return None
+    distinct_counts = {*peer_counts.values()}
+    if len(distinct_counts) != 1:
+        return None
+    peer_consensus_count = next(iter(distinct_counts))
+    if target_count >= peer_consensus_count:
+        return None
+    peers = sorted(peer_counts)
+    scoped = historical_node_scope_verified
+    observation = {
+        "kind": "node_ib_inventory",
+        "predicate": "ib_inventory_peer_deficit",
+        "source_group": "node_ib_inventory",
+        "independence_group": "node_ib_inventory",
+        "scope": {"node": node},
+        "observed_entity": {"kind": "node", "name": node},
+        "polarity": "present",
+        "coverage": "scoped" if scoped else "partial",
+        "observation_window": time_range or {},
+        "target_identity_verified": scoped,
+        "target_count": target_count,
+        "peer_consensus_count": peer_consensus_count,
+        "peer_nodes": peers,
+        "provenance": (
+            "Baseline is peer-node ibstat consensus, not a declared capacity: "
+            f"{len(peers)} peer GPU node(s) all reported {peer_consensus_count} "
+            "InfiniBand CA(s)."
+        ),
+    }
+    return artifact(
+        agent=agent,
+        source="system_agent",
+        type="node_ib_inventory",
+        status="ok" if scoped else "partial",
+        confidence="medium" if scoped else "low",
+        query="ibstat (peer GPU nodes: " + ", ".join(peers) + ")",
+        summary=ko_en(
+            settings,
+            f"노드 {node}: ibstat CA {target_count}개는 피어 GPU 노드({', '.join(peers)}) "
+            f"합의치 {peer_consensus_count}개보다 적습니다.",
+            f"Node {node}: ibstat reports {target_count} InfiniBand CA(s), fewer than the "
+            f"{peer_consensus_count}-CA consensus among peer GPU node(s) "
+            f"({', '.join(peers)}).",
+        ),
+        result={**observation, "observation": observation},
+    )
+
+
+async def _ib_peer_candidates(settings: Settings, node: str) -> list[str]:
+    """Up to ``_IB_PEER_MAX_NODES`` other GPU node names, same-model preferred.
+
+    Reuses the same node listing the cluster-wide scan uses to find GPU
+    nodes (``_list_cluster_nodes``) rather than a new transport. When the GFD
+    product label makes model matching free (it is already in that same node
+    list), same-model peers are preferred; otherwise any GPU node qualifies.
+    """
+    all_nodes = await _list_cluster_nodes(settings)
+    target_product = next((product for name, _gpu, product in all_nodes if name == node), "")
+    gpu_peers = [name for name, gpu, _product in all_nodes if gpu and name and name != node]
+    if target_product:
+        same_model = [
+            name
+            for name, gpu, product in all_nodes
+            if gpu and name != node and product == target_product
+        ]
+        if same_model:
+            gpu_peers = same_model
+    return sorted(gpu_peers)[:_IB_PEER_MAX_NODES]
+
+
+async def _ib_peer_ca_counts(
+    settings: Settings, *, node: str, headers: dict[str, str] | None
+) -> tuple[dict[str, int], list[str]]:
+    """ibstat CA counts from up to ``_IB_PEER_MAX_NODES`` peer GPU nodes.
+
+    Each peer is queried the same way ``_scan_node`` queries the target's own
+    ibstat (same addressing, same per-request timeout), so a single
+    unreachable peer just shrinks the comparison set. A peer reporting zero
+    CAs is not a comparison peer (it says nothing about IB capacity). Only a
+    total wipeout -- every peer fetch failed -- is worth a warning, since
+    that leaves no baseline at all.
+    """
+    candidates = await _ib_peer_candidates(settings, node)
+    if not candidates:
+        return {}, []
+
+    async def fetch(peer: str) -> tuple[str, int | None]:
+        address = peer
+        if "{node}" in settings.system_agent_url:
+            internal_ip = await _node_internal_ip(settings, peer)
+            if internal_ip:
+                address = internal_ip
+        base_url = _base_url_for_node(settings.system_agent_url, address)
+        row, _matches = await _scan_source(
+            settings,
+            "ibstat",
+            node=peer,
+            base_url=base_url,
+            headers=headers,
+            time_range=None,
+            causal_time_range=None,
+        )
+        if row.get("error") or not isinstance(row.get("ib_cas"), list):
+            return peer, None
+        return peer, len(row["ib_cas"])
+
+    results = await asyncio.gather(*(fetch(peer) for peer in candidates))
+    counts = {peer: count for peer, count in results if count is not None and count > 0}
+    warnings = (
+        [
+            f"System agent: all {len(candidates)} peer ibstat fetch(es) failed; "
+            f"no InfiniBand peer baseline for {node}."
+        ]
+        if not counts
+        else []
+    )
+    return counts, warnings
 
 
 async def system_log_query(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
@@ -841,6 +985,53 @@ def _scan_verdict(
     return status, confidence, deterministic
 
 
+async def _list_cluster_nodes(settings: Settings) -> list[tuple[str, bool, str]]:
+    """Every Node's name, GPU-node flag, and (if labeled) GPU product.
+
+    Shared by the cluster-wide log scan (which nodes are GPU nodes; see
+    ``SystemCollector._scan_all_nodes``) and the ibstat peer-comparison
+    baseline (which nodes are eligible peers; see ``_ib_peer_candidates``).
+    Best-effort, like every other node lookup in this collector: an
+    unreachable/misconfigured Kubernetes API yields ``[]``, never raises.
+    """
+    try:
+        from app.collectors.kubernetes import _GPU_PRODUCT_LABEL, k8s_read
+
+        node_list = await k8s_read(settings, "nodes", full_object=True)
+        data = (
+            node_list.get("data")
+            if isinstance(node_list, dict) and not node_list.get("error")
+            else None
+        )
+        items = data.get("items") if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            return []
+        nodes: list[tuple[str, bool, str]] = []
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("metadata"), dict):
+                continue
+            metadata = item["metadata"]
+            status = item.get("status") if isinstance(item.get("status"), dict) else {}
+            capacity = status.get("capacity")
+            labels = metadata.get("labels") if isinstance(metadata.get("labels"), dict) else {}
+            if isinstance(capacity, dict) and "nvidia.com/gpu" in capacity:
+                gpu_node = str(capacity.get("nvidia.com/gpu") or "").strip() not in {
+                    "",
+                    "0",
+                    "0.0",
+                }
+            else:
+                gpu_node = (
+                    labels.get("nvidia.com/gpu.present") == "true"
+                    or labels.get("feature.node.kubernetes.io/pci-10de.present") == "true"
+                )
+            gpu_product = str(labels.get(_GPU_PRODUCT_LABEL) or "").strip()
+            nodes.append((str(metadata.get("name") or "").strip(), gpu_node, gpu_product))
+        return nodes
+    except Exception:  # noqa: BLE001 - node listing is best-effort
+        return []
+
+
 class SystemCollector:
     name = "system"
 
@@ -911,45 +1102,8 @@ class SystemCollector:
         )
 
     async def _scan_all_nodes(self, target: AnalysisTarget, plan) -> CollectorResult:
-        try:
-            from app.collectors.kubernetes import k8s_read
-
-            node_list = await k8s_read(self._settings, "nodes", full_object=True)
-            data = (
-                node_list.get("data")
-                if isinstance(node_list, dict) and not node_list.get("error")
-                else None
-            )
-            items = data.get("items") if isinstance(data, dict) else data
-            if isinstance(items, list):
-                nodes = []
-                for item in items:
-                    if not isinstance(item, dict) or not isinstance(item.get("metadata"), dict):
-                        continue
-                    metadata = item["metadata"]
-                    status = item.get("status") if isinstance(item.get("status"), dict) else {}
-                    capacity = status.get("capacity")
-                    if isinstance(capacity, dict) and "nvidia.com/gpu" in capacity:
-                        gpu_node = str(capacity.get("nvidia.com/gpu") or "").strip() not in {
-                            "",
-                            "0",
-                            "0.0",
-                        }
-                    else:
-                        labels = (
-                            metadata.get("labels")
-                            if isinstance(metadata.get("labels"), dict)
-                            else {}
-                        )
-                        gpu_node = (
-                            labels.get("nvidia.com/gpu.present") == "true"
-                            or labels.get("feature.node.kubernetes.io/pci-10de.present") == "true"
-                        )
-                    nodes.append((str(metadata.get("name") or "").strip(), gpu_node))
-            else:
-                nodes = []
-        except Exception:  # noqa: BLE001 - keep system evidence optional
-            nodes = []
+        all_nodes = await _list_cluster_nodes(self._settings)
+        nodes = [(name, gpu_node) for name, gpu_node, _product in all_nodes]
         if not nodes:
             summary = f"{NO_EVIDENCE} " + ko_en(
                 self._settings,
@@ -1345,6 +1499,28 @@ class SystemCollector:
                 historical_node_scope_verified=historical_node_scope_verified,
             )
         )
+        # Peer-comparison deficit baseline: only for a single named node (a
+        # cluster-wide scan reaches this method once per node, with no other
+        # node in the same run to compare against -- see _scan_all_nodes),
+        # and only when there is something worth comparing. A node with no
+        # CAs and no nvidia-smi GPUs at all is a plain non-IB node; it has no
+        # baseline to need.
+        if node_origin != "cluster_scan" and (ib_cas or driver_attached_gpus):
+            peer_counts, peer_warnings = await _ib_peer_ca_counts(
+                self._settings, node=node, headers=headers
+            )
+            warnings.extend(peer_warnings)
+            deficit_artifact = _ib_peer_deficit_artifact(
+                self._settings,
+                agent=self.name,
+                node=node,
+                target_count=len(ib_cas),
+                peer_counts=peer_counts,
+                time_range=time_range,
+                historical_node_scope_verified=historical_node_scope_verified,
+            )
+            if deficit_artifact is not None:
+                artifacts.append(deficit_artifact)
         return CollectorResult(
             agent=self.name,
             status=status,

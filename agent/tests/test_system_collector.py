@@ -1237,3 +1237,155 @@ def test_same_instant_tolerates_timestamp_reformatting() -> None:
     assert _same_instant("2026-07-14T01:00:00+00:00", "2026-07-14T01:00:00Z")
     assert not _same_instant("2026-07-14T01:00:00Z", "2026-07-14T02:00:00Z")
     assert not _same_instant("", "2026-07-14T01:00:00Z")
+
+
+def _ibstat_n(count: int) -> list[str]:
+    """Minimal ibstat lines yielding ``count`` CAs; ports do not affect the
+    peer-comparison count, so they are omitted."""
+    return [f"CA 'mlx5_{index}'" for index in range(count)]
+
+
+def _peer_target() -> AnalysisTarget:
+    """A node-scoped target with a bounded incident window, so the peer
+    deficit artifact's scope-verified branch (status ok/confidence medium) is
+    exercised, matching test_gpu_inventory_deficit_reporting's convention."""
+    return replace(
+        _target(),
+        fired_at="2026-01-02T03:00:00Z",
+        resolved_at="2026-01-02T03:10:00Z",
+    )
+
+
+def _peer_deficit_artifact(result):
+    return next(
+        (a for a in result.artifacts if a.result.get("predicate") == "ib_inventory_peer_deficit"),
+        None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ib_peer_deficit_when_all_peers_agree_above_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dgx02 case: two peer GPU nodes both report 8 CAs, the target only
+    4 -- a deficit against the peer consensus, listing the peers used."""
+
+    async def fake_list_cluster_nodes(_settings):
+        return [("gpu-node-1", True, ""), ("peer-a", True, ""), ("peer-b", True, "")]
+
+    async def fake_get_json(*, base_url, params, **_kwargs):
+        if params["source"] != "ibstat":
+            return JsonResponse(url=base_url, status_code=200, data={"lines": []})
+        lines = _ibstat_n(8) if "peer-a" in base_url or "peer-b" in base_url else _ibstat_n(4)
+        return JsonResponse(url=base_url, status_code=200, data={"lines": lines})
+
+    monkeypatch.setattr(system_mod, "_list_cluster_nodes", fake_list_cluster_nodes)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_peer_target())
+
+    deficit = _peer_deficit_artifact(result)
+    assert deficit is not None
+    assert deficit.type == "node_ib_inventory"
+    assert (deficit.status, deficit.confidence) == ("ok", "medium")
+    assert deficit.result["polarity"] == "present"
+    assert deficit.result["target_count"] == 4
+    assert deficit.result["peer_consensus_count"] == 8
+    assert deficit.result["peer_nodes"] == ["peer-a", "peer-b"]
+
+
+@pytest.mark.asyncio
+async def test_ib_peer_deficit_absent_when_peers_disagree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Peers that disagree with each other are as uninformative as none at
+    all: claim nothing rather than pick a side."""
+
+    async def fake_list_cluster_nodes(_settings):
+        return [("gpu-node-1", True, ""), ("peer-a", True, ""), ("peer-b", True, "")]
+
+    async def fake_get_json(*, base_url, params, **_kwargs):
+        if params["source"] != "ibstat":
+            return JsonResponse(url=base_url, status_code=200, data={"lines": []})
+        if "peer-a" in base_url:
+            lines = _ibstat_n(8)
+        elif "peer-b" in base_url:
+            lines = _ibstat_n(4)
+        else:
+            lines = _ibstat_n(4)
+        return JsonResponse(url=base_url, status_code=200, data={"lines": lines})
+
+    monkeypatch.setattr(system_mod, "_list_cluster_nodes", fake_list_cluster_nodes)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_peer_target())
+
+    assert _peer_deficit_artifact(result) is None
+
+
+@pytest.mark.asyncio
+async def test_ib_peer_fetch_all_failing_emits_one_warning_and_no_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every peer fetch failing leaves no baseline: no artifact, and at most
+    one warning -- not one per failed peer."""
+
+    async def fake_list_cluster_nodes(_settings):
+        return [("gpu-node-1", True, ""), ("peer-a", True, ""), ("peer-b", True, "")]
+
+    async def fake_get_json(*, base_url, params, **_kwargs):
+        if params["source"] == "ibstat" and ("peer-a" in base_url or "peer-b" in base_url):
+            return JsonResponse(url=base_url, status_code=502, error="unreachable")
+        lines = _ibstat_n(4) if params["source"] == "ibstat" else []
+        return JsonResponse(url=base_url, status_code=200, data={"lines": lines})
+
+    monkeypatch.setattr(system_mod, "_list_cluster_nodes", fake_list_cluster_nodes)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_peer_target())
+
+    assert _peer_deficit_artifact(result) is None
+    peer_warnings = [w for w in result.warnings if "peer ibstat fetch" in w]
+    assert len(peer_warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_ib_peer_deficit_absent_when_target_meets_consensus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """target_count >= the peer consensus is not a deficit -- claim nothing."""
+
+    async def fake_list_cluster_nodes(_settings):
+        return [("gpu-node-1", True, ""), ("peer-a", True, ""), ("peer-b", True, "")]
+
+    async def fake_get_json(*, base_url, params, **_kwargs):
+        lines = _ibstat_n(8) if params["source"] == "ibstat" else []
+        return JsonResponse(url=base_url, status_code=200, data={"lines": lines})
+
+    monkeypatch.setattr(system_mod, "_list_cluster_nodes", fake_list_cluster_nodes)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_peer_target())
+
+    assert _peer_deficit_artifact(result) is None
+
+
+@pytest.mark.asyncio
+async def test_ib_peer_fetch_skipped_for_non_ib_non_gpu_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A node with zero CAs and no nvidia-smi GPUs is a plain non-IB node --
+    there is no baseline to need, so peer discovery must not even run."""
+
+    async def list_nodes_must_not_run(*_args, **_kwargs):
+        raise AssertionError("peer node listing must not run for a non-IB, non-GPU node")
+
+    async def fake_get_json(**_kwargs):
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": []})
+
+    monkeypatch.setattr(system_mod, "_list_cluster_nodes", list_nodes_must_not_run)
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_peer_target())
+
+    assert _peer_deficit_artifact(result) is None
