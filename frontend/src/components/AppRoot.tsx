@@ -989,6 +989,11 @@ function UnifiedWorkspace({
         {incident && correction.open && (
           <RcaCorrectionPanel correction={correction} busyAction={busyAction} />
         )}
+        {analysisRun?.metadata?.answer_mode === 'knowledge_only' && (
+          <div className="error-banner">
+            Knowledge-based answer — no direct cluster evidence was found for this question. This is reference guidance from the knowledge base, not a diagnosis of the current cluster.
+          </div>
+        )}
         <section className="rca-summary">
           <div className="rca-summary-heading">
             <h3>RCA Summary</h3>

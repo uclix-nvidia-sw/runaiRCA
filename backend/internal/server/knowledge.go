@@ -566,6 +566,9 @@ func knowledgePromotionGates(
 	snapshot *CaseSnapshot, trace map[string]any, operatorConfirmed bool,
 ) (promotionEvidence, string) {
 	metadata, _ := snapshot.Snapshot["metadata"].(map[string]any)
+	if metadata["answer_mode"] == "knowledge_only" {
+		return promotionEvidence{}, "knowledge-only answers cannot be promoted"
+	}
 	harness, _ := metadata["harness"].(map[string]any)
 	if harness == nil {
 		return promotionEvidence{}, "missing validation harness"

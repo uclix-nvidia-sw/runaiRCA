@@ -1692,6 +1692,9 @@ func metadataFromAgentContext(context map[string]any) map[string]any {
 	if hash, ok := context["analysis_hash"].(string); ok && hash != "" {
 		out["analysis_hash"] = hash
 	}
+	if mode, ok := context["answer_mode"].(string); ok && mode != "" && len(mode) <= 64 {
+		out["answer_mode"] = mode
+	}
 	if len(out) == 0 {
 		return nil
 	}

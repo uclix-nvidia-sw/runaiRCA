@@ -133,8 +133,6 @@ spec:
               value: {{ .Values.agent.env.runaiProjectsPath | quote }}
             - name: RUNAI_QUEUES_PATH
               value: {{ .Values.agent.env.runaiQueuesPath | quote }}
-            - name: RUNAI_VERSION_PATH
-              value: {{ .Values.agent.env.runaiVersionPath | quote }}
             - name: RUNAI_MCP_URL
               value: {{ if .Values.runaiMcp.enabled }}{{ printf "http://%s:%v/mcp" (include "runai-rca.runaiMcp.fullname" .) .Values.runaiMcp.port | quote }}{{ else }}""{{ end }}
             {{- if .Values.runaiTls.caBundleSecretName }}
