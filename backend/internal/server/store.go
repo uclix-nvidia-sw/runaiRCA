@@ -2263,7 +2263,11 @@ func (s *Store) completeAnalysisRun(runID string, response AgentAnalysisResponse
 	run.Metadata = mergeAnalysisMetadata(run.Metadata, metadataFromAgentContext(response.Context))
 	run.UpdatedAt = time.Now().UTC()
 	if run.FirstCompletedAt == nil {
-		run.FirstCompletedAt = &run.UpdatedAt
+		// Own copy, never &run.UpdatedAt: aliasing into the record makes every
+		// later UpdatedAt write mutate what FirstCompletedAt points at — and
+		// races with any clone/marshal that captured the shared pointer.
+		firstCompleted := run.UpdatedAt
+		run.FirstCompletedAt = &firstCompleted
 	}
 	var delivery SlackAnalysisDelivery
 	if slackIncidentID != "" {
