@@ -947,6 +947,7 @@ def _aggregate_evidence(state: PipelineState) -> None:
     artifact_positions: dict[
         tuple[str, str, str, str, str, str], tuple[list[Any], int]
     ] = {}
+    old_ids_by_key: dict[tuple[str, str, str, str, str, str], list[str]] = {}
     for result in state.results:
         retained = []
         for item in result.artifacts:
@@ -964,6 +965,9 @@ def _aggregate_evidence(state: PipelineState) -> None:
                 # unrelated Pods/facts.
                 "" if query or title else _json_fingerprint(getattr(item, "result", None)),
             )
+            old_id = str(getattr(item, "evidence_id", "") or "")
+            if old_id:
+                old_ids_by_key.setdefault(key, []).append(old_id)
             previous = artifact_positions.get(key)
             if previous is not None:
                 previous_artifacts, position = previous
@@ -978,12 +982,94 @@ def _aggregate_evidence(state: PipelineState) -> None:
     from app.services.harness import assign_evidence_ids
 
     state.artifacts = assign_evidence_ids(state.results)
+    evidence_id_map = {
+        old_id: str(getattr(artifacts[position], "evidence_id", "") or "")
+        for key, (artifacts, position) in artifact_positions.items()
+        for old_id in old_ids_by_key.get(key, [])
+    }
+    _remap_state_evidence_ids(state, evidence_id_map)
     state.missing = sorted({item for result in state.results for item in result.missing_data})
     state.warnings = sorted(
         {item for result in state.results for item in result.warnings}
         | set(state.extra_warnings)
         | set(kg_warnings)
     )
+
+
+_EVIDENCE_REFERENCE_FIELDS = frozenset(
+    {
+        "contradicting_evidence",
+        "contradicting_evidence_ids",
+        "contradiction_evidence_ids",
+        "evidence_against",
+        "evidence_for",
+        "evidence_id",
+        "evidence_ids",
+        "evidence_links",
+        "support_evidence_ids",
+        "supporting_evidence",
+        "supporting_evidence_ids",
+    }
+)
+
+
+def _remap_state_evidence_ids(state: PipelineState, evidence_id_map: Mapping[str, str]) -> None:
+    if not evidence_id_map:
+        return
+    seen_candidates: set[int] = set()
+    seen_fields: set[int] = set()
+    candidates = [
+        *state.root_cause_candidates,
+        *state.open_world_candidates,
+        *(
+            [state.ranking_candidate_before_self_check]
+            if state.ranking_candidate_before_self_check is not None
+            else []
+        ),
+    ]
+    for candidate in candidates:
+        if id(candidate) in seen_candidates:
+            continue
+        seen_candidates.add(id(candidate))
+        candidate.support_evidence_ids = _remap_evidence_id_list(
+            candidate.support_evidence_ids, evidence_id_map
+        )
+        candidate.contradiction_evidence_ids = _remap_evidence_id_list(
+            candidate.contradiction_evidence_ids, evidence_id_map
+        )
+        _remap_evidence_fields(candidate.score_breakdown, evidence_id_map, seen_fields)
+
+    _remap_evidence_fields(state.investigation_context, evidence_id_map, seen_fields)
+    for result in state.results:
+        _remap_evidence_fields(result.details, evidence_id_map, seen_fields)
+
+
+def _remap_evidence_id_list(values: list[str], evidence_id_map: Mapping[str, str]) -> list[str]:
+    return list(dict.fromkeys(evidence_id_map.get(str(value), str(value)) for value in values))
+
+
+def _remap_evidence_fields(
+    value: object, evidence_id_map: Mapping[str, str], seen: set[int]
+) -> object:
+    if isinstance(value, str):
+        return evidence_id_map.get(value, value)
+    if isinstance(value, list):
+        if id(value) in seen:
+            return value
+        seen.add(id(value))
+        for index, item in enumerate(value):
+            value[index] = _remap_evidence_fields(item, evidence_id_map, seen)
+        return value
+    if isinstance(value, dict):
+        if id(value) in seen:
+            return value
+        seen.add(id(value))
+        for key, item in value.items():
+            if key in _EVIDENCE_REFERENCE_FIELDS:
+                value[key] = _remap_evidence_fields(item, evidence_id_map, seen)
+            elif isinstance(item, (dict, list)):
+                _remap_evidence_fields(item, evidence_id_map, seen)
+    return value
 
 
 def _artifact_observation_scope(item: object) -> str:

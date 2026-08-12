@@ -15,9 +15,10 @@ import pytest
 
 from app.collectors.base import AnalysisTarget, CollectorResult, artifact
 from app.plan import InvestigationPlan
-from app.schemas import Alert, AlertAnalysisRequest
+from app.schemas import Alert, AlertAnalysisRequest, AlertAnalysisResponse
 from app.services import pipeline
 from app.services.evidence_blackboard import EvidenceEligibility
+from app.services.harness import assign_evidence_ids, evaluate
 from app.services.orchestrator import AnalysisOrchestrator
 from app.services.pipeline import _collector_name
 from app.services.root_cause_ranking import RankedCause
@@ -515,6 +516,224 @@ def test_aggregate_evidence_keeps_latest_semantic_round_artifact() -> None:
 
     assert state.results[0].artifacts == [repeated]
     assert pipeline._evidence_signature(state.results) == first_signature
+
+
+def test_aggregate_evidence_remaps_ranked_support_before_harness_validation() -> None:
+    state = pipeline.new_state(make_settings(), _request(), collectors=[])
+    duplicate_query = "kubectl get nodes dgx01 -o json"
+    cards = [
+        artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="node_snapshot",
+            status="ok",
+            confidence="high",
+            query=duplicate_query,
+            summary="first node snapshot",
+        ),
+        artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="node_snapshot",
+            status="ok",
+            confidence="high",
+            query=duplicate_query,
+            summary="newer duplicate node snapshot",
+        ),
+        artifact(
+            agent="kubernetes",
+            source="kubernetes",
+            type="node_lifecycle",
+            status="ok",
+            confidence="high",
+            query="kubectl get node dgx01 -o yaml",
+            summary="node dgx01 was cordoned for a platform upgrade",
+            result={
+                "observation": {
+                    "predicate": "node_cordon",
+                    "polarity": "present",
+                    "coverage": "scoped",
+                    "observed_entity": {"kind": "node", "name": "dgx01"},
+                }
+            },
+        ),
+        artifact(
+            agent="prometheus",
+            source="prometheus",
+            type="promql_signal",
+            status="ok",
+            confidence="high",
+            query="sum(kube_pod_status_phase{phase='Pending'})",
+            summary="healthy pending-pods metric is zero",
+            result={
+                "observation": {
+                    "predicate": "pending_pods",
+                    "polarity": "present",
+                    "coverage": "scoped",
+                    "observed_entity": {"kind": "node", "name": "dgx01"},
+                }
+            },
+        ),
+    ]
+    shared_hypothesis = {
+        "id": "H1",
+        "family": "platform_lifecycle_change",
+        "evidence_for": ["E03"],
+        "evidence_against": ["E04"],
+        "support_evidence_ids": ["E03"],
+        "contradiction_evidence_ids": ["E04"],
+    }
+    state.results = [
+        CollectorResult(
+            agent="kubernetes",
+            status="ok",
+            summary="",
+            artifacts=cards,
+            details={"ontology_probe_assessments": [{"evidence_ids": ["E03"]}]},
+        )
+    ]
+    assign_evidence_ids(state.results)
+    candidate = RankedCause(
+        "platform_lifecycle_change",
+        "medium",
+        7.0,
+        rationale=["matched curated symptom: node cordon"],
+        evidence_agents=["kubernetes", "signature"],
+        support_evidence_ids=["E03"],
+        score_breakdown=[
+            {
+                "stage": "signature",
+                "kind": "curated_symptom",
+                "evidence_ids": ["E03"],
+                "matched_keywords": ["cordon"],
+            }
+        ],
+    )
+    state.root_cause_candidates = [candidate]
+    state.ranking_candidate_before_self_check = replace(candidate)
+    state.open_world_candidates = [replace(candidate)]
+    state.investigation_context = {
+        "hypothesis_ledger": [shared_hypothesis],
+        "reasoning_trace_v2": {
+            "hypotheses": [shared_hypothesis],
+            "referenced_facts": [{"evidence_id": "E03"}],
+            "probe_assessments": [{"evidence_id": "E03", "evidence_ids": ["E03"]}],
+            "selected_hypothesis": {
+                "supporting_evidence_ids": ["E03"],
+                "contradicting_evidence_ids": ["E04"],
+            },
+        },
+    }
+
+    pipeline._aggregate_evidence(state)
+    cordon = next(item for item in state.artifacts if "cordoned" in item.summary)
+    response = AlertAnalysisResponse(
+        status="ok",
+        thread_ts="",
+        analysis=f"## Root Cause\n\nPlatform lifecycle change [{cordon.evidence_id}].",
+        analysis_summary="Platform lifecycle change.",
+        analysis_detail=f"## Root Cause\n\nPlatform lifecycle change [{cordon.evidence_id}].",
+        analysis_type="firing",
+        analysis_quality="medium",
+        root_cause_family="platform_lifecycle_change",
+        missing_data=[],
+        warnings=[],
+        capabilities={},
+        context={},
+        artifacts=[],
+    )
+    verdict = evaluate(response, state.results, state.root_cause_candidates)
+
+    assert cordon.evidence_id == "E02"
+    assert candidate.support_evidence_ids == [cordon.evidence_id]
+    assert candidate.score_breakdown[0]["evidence_ids"] == [cordon.evidence_id]
+    assert state.ranking_candidate_before_self_check.support_evidence_ids == ["E02"]
+    assert state.open_world_candidates[0].support_evidence_ids == ["E02"]
+    assert shared_hypothesis["evidence_for"] == ["E02"]
+    assert shared_hypothesis["evidence_against"] == ["E03"]
+    assert state.investigation_context["reasoning_trace_v2"]["referenced_facts"] == [
+        {"evidence_id": "E02"}
+    ]
+    assert state.results[0].details["ontology_probe_assessments"][0]["evidence_ids"] == [
+        "E02"
+    ]
+    assert verdict.gates["invalid_evidence_links"] is False
+
+
+def test_harness_still_rejects_genuinely_invalid_remapped_support() -> None:
+    state = pipeline.new_state(make_settings(), _request(), collectors=[])
+    cordon = artifact(
+        agent="kubernetes",
+        source="kubernetes",
+        type="node_lifecycle",
+        status="ok",
+        confidence="high",
+        summary="node dgx01 was cordoned for a platform upgrade",
+        result={
+            "observation": {
+                "predicate": "node_cordon",
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "node", "name": "dgx01"},
+            }
+        },
+    )
+    benign = artifact(
+        agent="prometheus",
+        source="prometheus",
+        type="promql_signal",
+        status="ok",
+        confidence="high",
+        summary="healthy pending-pods metric is zero",
+        result={
+            "observation": {
+                "predicate": "pending_pods",
+                "polarity": "present",
+                "coverage": "scoped",
+                "observed_entity": {"kind": "node", "name": "dgx01"},
+            }
+        },
+    )
+    state.results = [
+        CollectorResult(agent="kubernetes", status="ok", summary="", artifacts=[cordon, benign])
+    ]
+    assign_evidence_ids(state.results)
+    candidate = RankedCause(
+        "platform_lifecycle_change",
+        "medium",
+        7.0,
+        rationale=["matched curated symptom: node cordon"],
+        evidence_agents=["kubernetes", "signature"],
+        support_evidence_ids=[str(benign.evidence_id)],
+        score_breakdown=[
+            {
+                "kind": "curated_symptom",
+                "evidence_ids": [str(benign.evidence_id)],
+                "matched_keywords": ["cordon"],
+            }
+        ],
+    )
+    state.root_cause_candidates = [candidate]
+    pipeline._aggregate_evidence(state)
+    response = AlertAnalysisResponse(
+        status="ok",
+        thread_ts="",
+        analysis="## Root Cause\n\nPlatform lifecycle change [E02].",
+        analysis_summary="Platform lifecycle change.",
+        analysis_detail="## Root Cause\n\nPlatform lifecycle change [E02].",
+        analysis_type="firing",
+        analysis_quality="medium",
+        root_cause_family="platform_lifecycle_change",
+        missing_data=[],
+        warnings=[],
+        capabilities={},
+        context={},
+        artifacts=[],
+    )
+
+    verdict = evaluate(response, state.results, state.root_cause_candidates)
+
+    assert verdict.gates["invalid_evidence_links"] is True
 
 
 def test_aggregate_evidence_keeps_distinct_node_conditions_from_one_query() -> None:
