@@ -1135,6 +1135,7 @@ function UnifiedWorkspace({
               runID={incident?.analysis_run_id}
               analysisHash={incident?.analysis_hash}
               harness={incident?.harness}
+              knowledgeOnly={analysisRun?.metadata?.answer_mode === 'knowledge_only'}
               onSaved={onRefresh}
             />
           </>

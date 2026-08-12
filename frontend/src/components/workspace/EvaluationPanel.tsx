@@ -158,11 +158,13 @@ export function EvaluationPanel({
   runID,
   analysisHash,
   harness,
+  knowledgeOnly,
   onSaved,
 }: {
   runID?: string;
   analysisHash?: string;
   harness?: Record<string, unknown>;
+  knowledgeOnly?: boolean;
   onSaved: () => Promise<void> | void;
 }) {
   const [state, dispatch] = useReducer(
@@ -260,6 +262,11 @@ export function EvaluationPanel({
   return (
     <section className="feedback-panel evaluation-panel" id="rca-evaluation">
       <div className="section-title"><ClipboardCheck size={18} /> RCA Evaluation</div>
+      {knowledgeOnly && (
+        <p className="evaluation-knowledge-only-note">
+          지식 기반 답변은 학습·유사도 매칭 대상이 아닙니다 — 평가는 제품 피드백으로만 기록됩니다.
+        </p>
+      )}
       <div className="evaluation-summary" aria-label="Evaluation summary">
         {harness && (
           <p>
