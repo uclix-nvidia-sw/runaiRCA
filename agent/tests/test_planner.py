@@ -407,6 +407,37 @@ async def test_llm_refinement_kept_on_success(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_llm_empty_hypotheses_is_not_marked_as_refined(monkeypatch) -> None:
+    # Valid JSON whose hypotheses coerce to nothing usable (missing "family") must
+    # NOT be presented downstream as an LLM interpretation of the request -- the
+    # deterministic hypotheses are kept, but llm_refined stays False.
+    settings = replace(
+        make_settings(),
+        llm_base_url="https://llm.example/v1",
+        llm_model="m",
+        llm_api_key="k",
+    )
+
+    async def fake_complete_json(settings, *, system, user, temperature=0.1, model=None):
+        return {
+            "focus": "refined focus",
+            "strategy": "targeted",
+            "hypotheses": [{"reason": "no family key here"}],
+            "narrative": "refined narrative",
+        }
+
+    monkeypatch.setattr("app.services.planner.complete_json", fake_complete_json)
+    target = _target(alert_name="NodeDiskPressure", namespace="monitoring")
+    deterministic = await plan_investigation(make_settings(), target, None, {}, [])
+    plan = await plan_investigation(settings, target, None, {}, [])
+
+    assert plan.llm_refined is False
+    assert plan.hypotheses == deterministic.hypotheses
+    # focus/narrative/strategy still refine independently of the hypotheses flag
+    assert plan.focus == "refined focus"
+
+
+@pytest.mark.asyncio
 async def test_llm_component_adopts_a_catalog_component_when_deterministic_resolution_misses(
     monkeypatch,
 ) -> None:

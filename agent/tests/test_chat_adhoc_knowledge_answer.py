@@ -322,6 +322,82 @@ def test_structured_ladder_preserves_exact_rung_content_and_provenance() -> None
     assert "Past Support Case" in "\n".join(case.supplementary_lines)
 
 
+QUESTION_MATCH_CASE_CARD = {
+    "kind": "external",
+    "case_id": "enterprise_support:question-match-1",
+    "context_class": "mitigated_context",
+    "analysis_summary": "LADDER-QCASE NVLink error signature matched from the question wording.",
+    "successful_actions": [
+        {"statement": "LADDER-QCASE-ACTION replace the NVLink cable.", "outcome": "mitigated"}
+    ],
+}
+
+
+def test_question_keyed_external_case_surfaces_with_empty_kg_case_cards(monkeypatch) -> None:
+    # The evidence-keyed rung-d retrieval matches OBSERVED evidence text; a
+    # question that names a case's own error signature purely by its wording
+    # must still surface it, even with an empty state.kg_context.case_cards
+    # (no cluster evidence was ever collected for a chat-adhoc question).
+    async def fake_external_case_cards(settings, observed_text, *, limit=2):
+        assert "NVLink error" in observed_text  # the question text, not evidence
+        return [QUESTION_MATCH_CASE_CARD], []
+
+    monkeypatch.setattr(pipeline, "external_case_cards", fake_external_case_cards)
+
+    question = "NVLink error가 뜨는데 뭘 확인해야 하나요?"
+    case = asyncio.run(
+        pipeline._chat_adhoc_knowledge_ladder_lines(
+            _make_state(_chat_adhoc_request(question), kg_context=KGContext(case_cards=[])),
+            question,
+        )
+    )
+    assert case.match_status == "exact"
+    assert case.provenance_tags == ("external_case",)
+    assert "LADDER-QCASE" in "\n".join(case.cause_lines)
+
+
+def test_question_keyed_lookup_leaves_rung_d_unchanged_when_no_match(monkeypatch) -> None:
+    async def fake_external_case_cards(settings, observed_text, *, limit=2):
+        return [], []
+
+    monkeypatch.setattr(pipeline, "external_case_cards", fake_external_case_cards)
+
+    question = "아무 상관 없는 질문입니다"
+    result = asyncio.run(
+        pipeline._chat_adhoc_knowledge_ladder_lines(
+            _make_state(_chat_adhoc_request(question), kg_context=KGContext(case_cards=[])),
+            question,
+        )
+    )
+    assert "external_case" not in result.provenance_tags
+    assert result.match_status != "exact"
+
+
+def test_question_keyed_lookup_dedups_against_existing_kg_case_cards(monkeypatch) -> None:
+    calls: list[int] = []
+
+    async def fake_external_case_cards(settings, observed_text, *, limit=2):
+        calls.append(1)
+        # Same case_id as the card already found via the evidence-keyed match.
+        return [THANOS_CASE_CARD], []
+
+    monkeypatch.setattr(pipeline, "external_case_cards", fake_external_case_cards)
+
+    question = "아무 상관 없는 질문입니다"
+    case = asyncio.run(
+        pipeline._chat_adhoc_knowledge_ladder_lines(
+            _make_state(
+                _chat_adhoc_request(question),
+                kg_context=KGContext(case_cards=[THANOS_CASE_CARD]),
+            ),
+            question,
+        )
+    )
+    assert calls == [1]  # still queried (room for a 2nd card) -- but deduped on merge
+    assert case.provenance_tags == ("external_case",)
+    assert "\n".join(case.problem_lines).count(THANOS_CASE_CARD["case_id"]) == 1
+
+
 def test_bm25_is_nearest_only_and_is_suppressed_by_an_exact_match() -> None:
     modes = load_failure_modes(FAILURE_MODES_PATH)
     question = "작업이 선점됐어요"

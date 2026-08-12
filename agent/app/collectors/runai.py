@@ -32,6 +32,8 @@ _log = logging.getLogger(__name__)
 
 _VERSION_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
 _RUNAI_VERSION_PATH = "/api/v1/clusters/minimal"
+# Best-effort read; not worth burning the full collector timeout budget on.
+_RUNAI_VERSION_TIMEOUT_SECONDS = 10
 _RUNAI_TOKEN_CACHE_TTL_SECONDS = 30.0
 _RUNAI_TOKEN_CACHE: dict[tuple[str, str, str, str], tuple[str, float]] = {}
 _RUNAI_TOKEN_INFLIGHT: dict[
@@ -76,7 +78,7 @@ async def _fetch_runai_version(settings: Settings, headers: dict[str, str]) -> s
     resp = await get_json(
         base_url=settings.runai_base_url,
         path=_RUNAI_VERSION_PATH,
-        timeout_seconds=settings.runai_timeout_seconds,
+        timeout_seconds=_RUNAI_VERSION_TIMEOUT_SECONDS,
         headers=headers,
         verify=mcp_tls_verify(),
     )

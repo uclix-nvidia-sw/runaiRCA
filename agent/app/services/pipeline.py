@@ -65,7 +65,12 @@ from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse, SimilarInci
 from app.services.decision_tree import resolve_tree, walk_tree
 from app.services.evidence_projection import EXECUTION_METADATA_KEYS
 from app.services.general_guidance import _external_case_lines, general_guidance_lines
-from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
+from app.services.kg_enrichment import (
+    GraphRemediation,
+    enrich,
+    external_case_cards,
+    graph_remediation,
+)
 from app.services.planner import plan_investigation
 from app.services.query_memory import QueryMemory
 from app.services.remediation import (
@@ -5269,8 +5274,22 @@ async def _chat_adhoc_knowledge_ladder_lines(
     # (state.kg_context.case_cards) -- labelled as historical support cases,
     # reusing general_guidance's own renderer (foreign-language marking,
     # what-helped/what-didn't) instead of a second implementation of it.
+    # That retrieval matches OBSERVED EVIDENCE + component identity, so a
+    # question that names a case's own error signature in its wording (no
+    # cluster evidence to match against) would otherwise surface nothing --
+    # also run the SAME exact signature matcher against the question text
+    # itself and union the hits (deduped by case_id, capped at 2 total).
     case_cards = list(getattr(state.kg_context, "case_cards", None) or [])
     external_cards = [card for card in case_cards if card.get("kind") == "external"]
+    if len(external_cards) < 2:
+        question_cards, _warnings = await external_case_cards(settings, question, limit=2)
+        seen_ids = {cid for card in external_cards if (cid := card.get("case_id"))}
+        for card in question_cards:
+            cid = card.get("case_id")
+            if card.get("kind") == "external" and cid and cid not in seen_ids:
+                external_cards.append(card)
+                seen_ids.add(cid)
+        external_cards = external_cards[:2]
     if external_cards:
         rendered = _external_case_lines(external_cards, language, masker)
         if rendered:
