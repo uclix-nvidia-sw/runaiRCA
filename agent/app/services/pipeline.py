@@ -138,6 +138,16 @@ _DISPOSITIVE_TYPED_REASONS: dict[str, frozenset[str]] = {
 }
 
 
+@dataclass(frozen=True)
+class ChatAdhocKnowledge:
+    problem_lines: tuple[str, ...] = ()
+    cause_lines: tuple[str, ...] = ()
+    action_lines: tuple[str, ...] = ()
+    supplementary_lines: tuple[str, ...] = ()
+    match_status: str = "none"
+    provenance_tags: tuple[str, ...] = ()
+
+
 @dataclass
 class PipelineState:
     settings: Settings
@@ -172,6 +182,7 @@ class PipelineState:
     failure_modes: dict[str, list[dict]] = field(default_factory=dict)
     runtime_knowledge_hints: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     known_issues: list[dict] = field(default_factory=list)
+    chat_adhoc_knowledge: ChatAdhocKnowledge | None = None
     root_cause_candidates: list[RankedCause] = field(default_factory=list)
     # Immutable-at-stage-boundary snapshot used to explain ranking separately
     # from later self-check/signature verification/harness calibration.
@@ -936,6 +947,7 @@ def _aggregate_evidence(state: PipelineState) -> None:
     artifact_positions: dict[
         tuple[str, str, str, str, str, str], tuple[list[Any], int]
     ] = {}
+    old_ids_by_key: dict[tuple[str, str, str, str, str, str], list[str]] = {}
     for result in state.results:
         retained = []
         for item in result.artifacts:
@@ -953,6 +965,9 @@ def _aggregate_evidence(state: PipelineState) -> None:
                 # unrelated Pods/facts.
                 "" if query or title else _json_fingerprint(getattr(item, "result", None)),
             )
+            old_id = str(getattr(item, "evidence_id", "") or "")
+            if old_id:
+                old_ids_by_key.setdefault(key, []).append(old_id)
             previous = artifact_positions.get(key)
             if previous is not None:
                 previous_artifacts, position = previous
@@ -967,12 +982,94 @@ def _aggregate_evidence(state: PipelineState) -> None:
     from app.services.harness import assign_evidence_ids
 
     state.artifacts = assign_evidence_ids(state.results)
+    evidence_id_map = {
+        old_id: str(getattr(artifacts[position], "evidence_id", "") or "")
+        for key, (artifacts, position) in artifact_positions.items()
+        for old_id in old_ids_by_key.get(key, [])
+    }
+    _remap_state_evidence_ids(state, evidence_id_map)
     state.missing = sorted({item for result in state.results for item in result.missing_data})
     state.warnings = sorted(
         {item for result in state.results for item in result.warnings}
         | set(state.extra_warnings)
         | set(kg_warnings)
     )
+
+
+_EVIDENCE_REFERENCE_FIELDS = frozenset(
+    {
+        "contradicting_evidence",
+        "contradicting_evidence_ids",
+        "contradiction_evidence_ids",
+        "evidence_against",
+        "evidence_for",
+        "evidence_id",
+        "evidence_ids",
+        "evidence_links",
+        "support_evidence_ids",
+        "supporting_evidence",
+        "supporting_evidence_ids",
+    }
+)
+
+
+def _remap_state_evidence_ids(state: PipelineState, evidence_id_map: Mapping[str, str]) -> None:
+    if not evidence_id_map:
+        return
+    seen_candidates: set[int] = set()
+    seen_fields: set[int] = set()
+    candidates = [
+        *state.root_cause_candidates,
+        *state.open_world_candidates,
+        *(
+            [state.ranking_candidate_before_self_check]
+            if state.ranking_candidate_before_self_check is not None
+            else []
+        ),
+    ]
+    for candidate in candidates:
+        if id(candidate) in seen_candidates:
+            continue
+        seen_candidates.add(id(candidate))
+        candidate.support_evidence_ids = _remap_evidence_id_list(
+            candidate.support_evidence_ids, evidence_id_map
+        )
+        candidate.contradiction_evidence_ids = _remap_evidence_id_list(
+            candidate.contradiction_evidence_ids, evidence_id_map
+        )
+        _remap_evidence_fields(candidate.score_breakdown, evidence_id_map, seen_fields)
+
+    _remap_evidence_fields(state.investigation_context, evidence_id_map, seen_fields)
+    for result in state.results:
+        _remap_evidence_fields(result.details, evidence_id_map, seen_fields)
+
+
+def _remap_evidence_id_list(values: list[str], evidence_id_map: Mapping[str, str]) -> list[str]:
+    return list(dict.fromkeys(evidence_id_map.get(str(value), str(value)) for value in values))
+
+
+def _remap_evidence_fields(
+    value: object, evidence_id_map: Mapping[str, str], seen: set[int]
+) -> object:
+    if isinstance(value, str):
+        return evidence_id_map.get(value, value)
+    if isinstance(value, list):
+        if id(value) in seen:
+            return value
+        seen.add(id(value))
+        for index, item in enumerate(value):
+            value[index] = _remap_evidence_fields(item, evidence_id_map, seen)
+        return value
+    if isinstance(value, dict):
+        if id(value) in seen:
+            return value
+        seen.add(id(value))
+        for key, item in value.items():
+            if key in _EVIDENCE_REFERENCE_FIELDS:
+                value[key] = _remap_evidence_fields(item, evidence_id_map, seen)
+            elif isinstance(item, (dict, list)):
+                _remap_evidence_fields(item, evidence_id_map, seen)
+    return value
 
 
 def _artifact_observation_scope(item: object) -> str:
@@ -2807,6 +2904,15 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         language=getattr(settings, "language", "en"),
         eligible_support_ids=eligible_support_ids,
     )
+    state.chat_adhoc_knowledge = None
+    if _is_chat_adhoc(request) and eligible_support_ids == set():
+        try:
+            state.chat_adhoc_knowledge = await _chat_adhoc_knowledge_ladder_lines(
+                state, _operator_question_text(request)
+            )
+        except Exception:  # noqa: BLE001 - the RCA can still return an honest no-match answer
+            _log.warning("chat-adhoc knowledge ladder failed", exc_info=True)
+            state.chat_adhoc_knowledge = ChatAdhocKnowledge()
     playbook_fallback = load_troubleshooting_cases(settings.troubleshooting_cases_file)
     state.detail = _detail_from(
         request,
@@ -2831,6 +2937,7 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         self_check_next=state.self_check_next,
         runtime_knowledge_hints=state.runtime_knowledge_hints,
         xid_codes=state.xid_codes,
+        chat_adhoc_knowledge=state.chat_adhoc_knowledge,
     )
     # Restore the explicitly non-diagnostic guide when the RCA had no supported
     # action and the report builder did not already carry one.
@@ -2857,25 +2964,6 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
                 ]
             )
             state.detail = _append_general_guidance(state.detail, block)
-
-    # Chat-adhoc operator questions ("XID48 에러가 발생했는데...") that found no
-    # cluster evidence get a deterministic, clearly-bannered knowledge answer
-    # too -- see _build_chat_adhoc_knowledge_block. Same "nothing eligible"
-    # signal as the guide above (not the broader _needs_general_guidance,
-    # which also fires on a merely-unsettled top family); inserted before the
-    # appendix like Self-Check/Operator Questions below, ahead of the guide's
-    # own always-last block. Never fabricates a cause, never touches
-    # root_cause_family -- harness_stage carries it across an abstain exactly
-    # like the guide.
-    if _is_chat_adhoc(request) and eligible_support_ids == set():
-        try:
-            knowledge_block = await _build_chat_adhoc_knowledge_block(
-                state, getattr(settings, "language", "en")
-            )
-        except Exception:  # noqa: BLE001 - a missing knowledge answer is not a failed RCA
-            _log.warning("chat-adhoc knowledge answer failed", exc_info=True)
-        else:
-            state.detail = _insert_before_appendix(state.detail, knowledge_block)
 
     # Self-check caveat (optional hook) + re-analysis note — inserted BEFORE the
     # appendix so the document reads problem -> cause -> actions -> checks -> appendix.
@@ -3123,10 +3211,12 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             candidate_before_harness=candidate_before_harness,
         )
         response.context["analysis_hash"] = analysis_hash(response)
-        if _is_chat_adhoc(state.request) and response.root_cause_family == "insufficient_evidence":
-            knowledge_language = getattr(state.settings, "language", "en")
-            if _extract_chat_adhoc_knowledge_block(response.analysis_detail, knowledge_language):
-                response.context["answer_mode"] = "knowledge_only"
+        if (
+            _is_chat_adhoc(state.request)
+            and response.root_cause_family == "insufficient_evidence"
+            and state.chat_adhoc_knowledge is not None
+        ):
+            response.context["answer_mode"] = "knowledge_only"
         return state
 
     repairs = 0
@@ -3169,13 +3259,12 @@ async def harness_stage(state: PipelineState) -> PipelineState:
         # explicitly not a conclusion, so a failed gate is no reason to drop it.
         language = getattr(state.settings, "language", "en")
         carried_guidance = _general_guidance_block(response.analysis_detail, language)
-        # Same carry for the chat-adhoc knowledge answer: it is inserted
-        # before the appendix (_insert_before_appendix), not appended last
-        # like the guide above, so its own extractor bounds itself at the
-        # next ## heading instead of end-of-string -- see
-        # _extract_chat_adhoc_knowledge_block.
-        carried_knowledge_answer = _extract_chat_adhoc_knowledge_block(
-            response.analysis_detail, language
+        carried_knowledge_answer = (
+            _chat_adhoc_knowledge_sections(
+                state.request, state.chat_adhoc_knowledge, language
+            )
+            if _is_chat_adhoc(state.request) and state.chat_adhoc_knowledge is not None
+            else ""
         )
         abstain(
             response,
@@ -3248,14 +3337,16 @@ async def harness_stage(state: PipelineState) -> PipelineState:
     # short summary after that decision so a demotion cannot leave a confident
     # mechanism sentence beside ``insufficient_evidence``.
     final_family = response.root_cause_family
-    if _is_chat_adhoc(state.request) and final_family == "insufficient_evidence":
+    if (
+        _is_chat_adhoc(state.request)
+        and final_family == "insufficient_evidence"
+        and state.chat_adhoc_knowledge is not None
+    ):
         # Never on root_cause_family/verdict -- this only flags that the
-        # chat-adhoc knowledge-answer section rendered (content or an
-        # explicit no-match), for the frontend to badge the answer instead
-        # of presenting it as a diagnosis.
-        knowledge_language = getattr(state.settings, "language", "en")
-        if _extract_chat_adhoc_knowledge_block(response.analysis_detail, knowledge_language):
-            response.context["answer_mode"] = "knowledge_only"
+        # state-carried knowledge result rendered (content or an explicit
+        # no-match), for the frontend to badge the answer instead of presenting
+        # it as a diagnosis.
+        response.context["answer_mode"] = "knowledge_only"
     if final_family == "insufficient_evidence":
         _warn_on_discarded_support(state, response)
         _warn_on_starved_evidence(state, response)
@@ -4522,6 +4613,7 @@ def _detail_from(
     effective_target: AnalysisTarget | None = None,
     scope_derivation: dict[str, object] | None = None,
     knowledge: ReportKnowledge,
+    chat_adhoc_knowledge: ChatAdhocKnowledge | None = None,
 ) -> str:
     """Problem -> Root Cause -> Recommended Actions, then everything else in an
     appendix. Sections 1-3 are the ~1-page report an operator (or a Word export)
@@ -4531,6 +4623,11 @@ def _detail_from(
     annotations = request.alert.annotations
     alert_name = labels.get("alertname") or request.alert.labels.get("alert_name") or "alert"
     target = resolve_target(labels, annotations)
+    chat_bodies = (
+        _chat_adhoc_knowledge_section_bodies(request, chat_adhoc_knowledge, knowledge.language)
+        if chat_adhoc_knowledge is not None
+        else None
+    )
 
     # --- header -------------------------------------------------------------
     meta = [f"{h['severity']}: {target.severity}"]
@@ -4545,121 +4642,111 @@ def _detail_from(
 
     # --- 1. Problem -----------------------------------------------------------
     lines.extend([h["problem"], ""])
-    lines.append(f"- {h['what']}: {_root_cause_statement(request, language=knowledge.language)}")
-    if (
-        scope_derivation
-        and effective_target is not None
-        and effective_target.node
-        and not target.node
-    ):
+    if chat_bodies is not None:
+        lines.extend(chat_bodies[0])
+    else:
         lines.append(
-            f"- Investigation scope candidate: `node/{effective_target.node}` — derived "
-            "from a unique physical-versus-allocatable GPU deficit; the alert did not "
-            "declare a node."
+            f"- {h['what']}: {_root_cause_statement(request, language=knowledge.language)}"
         )
-    if where:
-        lines.append(f"- {h['where']}: {where}")
-    if request.occurrence_count > 1:
-        impact = (
-            f"같은 워크로드에서 {request.occurrence_count}회 반복 발생"
-            if knowledge.language == "ko"
-            else f"recurred {request.occurrence_count} times on the same workload"
-        )
-        lines.append(f"- {h['impact']}: {impact}")
+        if (
+            scope_derivation
+            and effective_target is not None
+            and effective_target.node
+            and not target.node
+        ):
+            lines.append(
+                f"- Investigation scope candidate: `node/{effective_target.node}` — derived "
+                "from a unique physical-versus-allocatable GPU deficit; the alert did not "
+                "declare a node."
+            )
+        if where:
+            lines.append(f"- {h['where']}: {where}")
+        if request.occurrence_count > 1:
+            impact = (
+                f"같은 워크로드에서 {request.occurrence_count}회 반복 발생"
+                if knowledge.language == "ko"
+                else f"recurred {request.occurrence_count} times on the same workload"
+            )
+            lines.append(f"- {h['impact']}: {impact}")
 
     # --- 2. Root Cause --------------------------------------------------------
     observed_text = _observed_text(
         results, request, eligible_support_ids=eligible_support_ids
     )
-    lines.extend(["", h["cause"], ""])
-    lines.append(
-        _failure_mode_root_cause_statement(
-            root_cause_candidates or [],
-            request,
-            observed_text,
-            knowledge.failure_modes or {},
-            knowledge.language,
-            results=results,
-            eligible_evidence_ids=eligible_support_ids,
-        )
-    )
-    # Multi-axis facets (Locus / Nature / Trigger) for the top cause — names the
-    # subsystem, the KIND of cause, and (when known) what set it off.
-    if root_cause_candidates:
-        facets = _facets_line(root_cause_candidates[0], knowledge.language)
-        if facets:
-            lines.append(facets)
-    # What the failing entity was configured with — the limit that was exceeded,
-    # the request no node could satisfy, the capacity a node ran out of.
-    lines.extend(_observed_configuration_lines(results, eligible_support_ids, knowledge.language))
-    # Ground the coarse family in the most specific signature match when one exists:
-    # a recognised known issue (with its affected/fixed version) is far more precise.
-    lines.extend(
-        # This section headlines "Recognised known issue: **X**" as settled fact
-        # (not a hedged suggestion), so its fuzzy_query must be the narrow text —
-        # match_runai_known_issues ignores fuzzy_query today, but this call site
-        # should not depend on that staying true to remain safe.
-        _known_issue_cause_lines(
-            knowledge.known_issues, observed_text, knowledge.language, _alert_signature_text(request)
-        )
-    )
-    supporting = _supporting_evidence(results, eligible_support_ids=eligible_support_ids)
-    if supporting:
-        lines.append("")
-        lines.extend(f"- **{agent}**: {finding}" for agent, finding in supporting)
-    # A graph/XID chain is useful remediation knowledge, but it is not a
-    # current incident observation by itself.  Keep it out of the headline
-    # causal narrative when every collected artifact was demoted to context or
-    # rejected for a different target/window.  Otherwise "fix root XID first"
-    # can look like a current, grounded instruction despite having no eligible
-    # observation in this run.
-    # Curated alert/component/playbook/graph actions are *guidance*, not a
-    # current-incident observation.  They all need the same target/window gate:
-    # otherwise an all-context run could withhold graph fixes yet still tell an
-    # operator to execute a documented-alert fix or repeat a historical remedy.
     allow_cause_specific_actions = eligible_support_ids is None or bool(eligible_support_ids)
-    # The run's own observed XID codes (alert text + evidence), distinct from
-    # graph_fixes.root_xids -- a pure catalog "what can escalate into this"
-    # lookup that never checked whether this run actually saw its upstream
-    # codes. Passing this through lets _causal_chain_line/_numbered_actions
-    # tell a confirmed upstream cause from a catalog-only candidate.
     observed_xid_codes = set(xid_codes) if xid_codes is not None else None
-    causal = (
-        _causal_chain_line(graph_fixes, knowledge.language, observed_xid_codes)
-        if allow_cause_specific_actions
-        else ""
-    )
-    if causal:
-        lines.extend(["", causal])
-    if allow_cause_specific_actions:
-        lines.extend(_xid_diagnostic_guidance_lines(graph_fixes, knowledge.language))
+    lines.extend(["", h["cause"], ""])
+    if chat_bodies is not None:
+        lines.extend(chat_bodies[1])
+    else:
+        lines.append(
+            _failure_mode_root_cause_statement(
+                root_cause_candidates or [],
+                request,
+                observed_text,
+                knowledge.failure_modes or {},
+                knowledge.language,
+                results=results,
+                eligible_evidence_ids=eligible_support_ids,
+            )
+        )
+        if root_cause_candidates:
+            facets = _facets_line(root_cause_candidates[0], knowledge.language)
+            if facets:
+                lines.append(facets)
+        lines.extend(
+            _observed_configuration_lines(results, eligible_support_ids, knowledge.language)
+        )
+        lines.extend(
+            _known_issue_cause_lines(
+                knowledge.known_issues,
+                observed_text,
+                knowledge.language,
+                _alert_signature_text(request),
+            )
+        )
+        supporting = _supporting_evidence(results, eligible_support_ids=eligible_support_ids)
+        if supporting:
+            lines.append("")
+            lines.extend(f"- **{agent}**: {finding}" for agent, finding in supporting)
+        causal = (
+            _causal_chain_line(graph_fixes, knowledge.language, observed_xid_codes)
+            if allow_cause_specific_actions
+            else ""
+        )
+        if causal:
+            lines.extend(["", causal])
+        if allow_cause_specific_actions:
+            lines.extend(_xid_diagnostic_guidance_lines(graph_fixes, knowledge.language))
 
     # --- 3. Recommended Actions ------------------------------------------------
     lines.extend(["", h["actions"], ""])
-    numbered = _numbered_actions(
-        plan,
-        graph_fixes,
-        root_cause_candidates,
-        observed_text,
-        missing,
-        request,
-        knowledge=knowledge,
-        allow_cause_specific_actions=allow_cause_specific_actions,
-        self_check_next=self_check_next,
-        facts=_remediation_facts(results, eligible_support_ids, target),
-        observed_codes=observed_xid_codes,
-    )
-    if numbered:
-        lines.extend(numbered)
+    if chat_bodies is not None:
+        lines.extend(chat_bodies[2])
     else:
-        # Never a dangling empty section — say honestly why there are no actions.
-        lines.append(
-            "증거가 부족하여 구체적인 조치를 제시하기 어렵습니다. "
-            "아래 확인 요청을 먼저 진행해 주세요."
-            if knowledge.language == "ko"
-            else "Not enough evidence for concrete actions yet — please address the "
-            "questions below first."
+        numbered = _numbered_actions(
+            plan,
+            graph_fixes,
+            root_cause_candidates,
+            observed_text,
+            missing,
+            request,
+            knowledge=knowledge,
+            allow_cause_specific_actions=allow_cause_specific_actions,
+            self_check_next=self_check_next,
+            facts=_remediation_facts(results, eligible_support_ids, target),
+            observed_codes=observed_xid_codes,
         )
+        if numbered:
+            lines.extend(numbered)
+        else:
+            lines.append(
+                "증거가 부족하여 구체적인 조치를 제시하기 어렵습니다. "
+                "아래 확인 요청을 먼저 진행해 주세요."
+                if knowledge.language == "ko"
+                else "Not enough evidence for concrete actions yet — please address the "
+                "questions below first."
+            )
 
     # --- 4. Appendix (reference material; evidence lives in Evidence Trace) ---
     lines.extend(["", h["appendix"]])
@@ -4888,14 +4975,6 @@ def _general_guidance_block(detail: str, language: str) -> str:
 # is untouched.
 
 
-def _chat_adhoc_knowledge_heading(language: str) -> str:
-    return (
-        "## 지식 기반 답변 (클러스터 직접 증거 없음)"
-        if language == "ko"
-        else "## Knowledge-Based Answer (No Direct Cluster Evidence)"
-    )
-
-
 def _chat_adhoc_knowledge_banner(language: str) -> str:
     if language == "ko":
         return (
@@ -4926,37 +5005,6 @@ def _chat_adhoc_knowledge_no_match_lines(ko: bool) -> list[str]:
         "- Share the affected pod, node, or workload name.",
         "- Share the alert name, if this relates to a specific alert.",
     ]
-
-
-def _xid_knowledge_lines(result: dict[str, Any], ko: bool, masker: Masker) -> list[str]:
-    """One XID catalog/ontology entry. ``fixes`` is the stable key across both
-    the TypeDB and YAML-catalog shapes _tool_xid_lookup can return."""
-    label = "**[XID 카탈로그]**" if ko else "**[XID Catalog]**"
-    identity = str(result.get("description") or result.get("mnemonic") or "").strip()
-    severity = str(result.get("severity") or "").strip()
-    header = f"XID {result.get('code')}"
-    if identity:
-        header += f" — {_safe_line(identity, limit=160, masker=masker)}"
-    if severity:
-        header += f" ({severity})"
-    lines = [f"- {label} {header}"]
-    fixes = [str(fix) for fix in (result.get("fixes") or []) if str(fix).strip()]
-    lines.extend(f"  - {_safe_line(fix, limit=360, masker=masker)}" for fix in fixes[:3])
-    return lines
-
-
-def _known_issue_knowledge_lines(issue: dict[str, Any], ko: bool, masker: Masker) -> list[str]:
-    label = "**[알려진 이슈]**" if ko else "**[Known Issue]**"
-    name = _safe_line(issue.get("issue"), limit=180, masker=masker)
-    lines = [f"- {label} {name}"]
-    reason = _safe_line(issue.get("reason"), limit=360, masker=masker)
-    if reason:
-        lines.append(f"  - {reason}")
-    lines.extend(
-        f"  - {_safe_line(action, limit=360, masker=masker)}"
-        for action in issue.get("actions", [])[:3]
-    )
-    return lines
 
 
 def _symptom_knowledge_lines(
@@ -5012,7 +5060,77 @@ def _family_lead_knowledge_lines(
     return lines
 
 
-async def _chat_adhoc_knowledge_ladder_lines(state: PipelineState, question: str) -> list[str]:
+def _chat_adhoc_knowledge_section_bodies(
+    request: AlertAnalysisRequest, result: ChatAdhocKnowledge, language: str
+) -> tuple[list[str], list[str], list[str]]:
+    ko = language == "ko"
+    question = _safe_line(_operator_question_text(request), limit=120)
+    problem = [_chat_adhoc_knowledge_banner(language), *result.problem_lines]
+    if question:
+        label = "운영자 질문" if ko else "Operator question"
+        problem.append(f'- **{label}**: "{question}"')
+
+    cause = [
+        (
+            "클러스터 직접 증거가 없으므로 아래 내용은 현재 원인 진단이 아닙니다."
+            if ko
+            else "Without direct cluster evidence, the content below is not a diagnosis "
+            "of the current cause."
+        )
+    ]
+    no_match = _chat_adhoc_knowledge_no_match_lines(ko)
+    if result.match_status == "none":
+        cause.append(no_match[0])
+    else:
+        cause.extend(result.cause_lines)
+
+    source_actions = (
+        [line for line in no_match[1:] if line]
+        if result.match_status == "none"
+        else list(result.action_lines)
+    )
+    actions = [
+        f"{index}. {line.removeprefix('- ')}"
+        for index, line in enumerate(source_actions, 1)
+    ]
+    if result.supplementary_lines:
+        if actions:
+            actions.append("")
+        actions.extend(result.supplementary_lines)
+    if not actions:
+        actions.append(
+            "일치한 지식에는 구체적인 권장 조치가 명시되어 있지 않습니다."
+            if ko
+            else "The matched knowledge does not specify a concrete recommended action."
+        )
+    return problem, cause, actions
+
+
+def _chat_adhoc_knowledge_sections(
+    request: AlertAnalysisRequest, result: ChatAdhocKnowledge, language: str
+) -> str:
+    h = _HEADINGS.get(language, _HEADINGS["en"])
+    problem, cause, actions = _chat_adhoc_knowledge_section_bodies(request, result, language)
+    return "\n".join(
+        [
+            h["problem"],
+            "",
+            *problem,
+            "",
+            h["cause"],
+            "",
+            *cause,
+            "",
+            h["actions"],
+            "",
+            *actions,
+        ]
+    )
+
+
+async def _chat_adhoc_knowledge_ladder_lines(
+    state: PipelineState, question: str
+) -> ChatAdhocKnowledge:
     """Deterministic knowledge-only ladder for a chat-adhoc question with no
     cluster evidence: XID catalog -> known issue -> curated symptom ->
     external case -> (only when ALL of those are empty) qualified BM25
@@ -5020,13 +5138,18 @@ async def _chat_adhoc_knowledge_ladder_lines(state: PipelineState, question: str
     lookup is a catalog/ontology read; no LLM call anywhere in this ladder.
     """
     if not question:
-        return []
+        return ChatAdhocKnowledge()
     settings = state.settings
     language = getattr(settings, "language", "en")
     ko = language == "ko"
     masker = state.masker or build_masker(())
-    lines: list[str] = []
-    found = False
+    problem_lines: list[str] = []
+    cause_lines: list[str] = []
+    action_lines: list[str] = []
+    supplementary_lines: list[str] = []
+    provenance_tags: list[str] = []
+    exact_found = False
+    nearest_found = False
 
     # a. XID codes named in the question -- ontology-first (owner directive:
     # TypeDB is the runtime source of truth, YAML is catalog_fallback only),
@@ -5048,18 +5171,87 @@ async def _chat_adhoc_knowledge_ladder_lines(state: PipelineState, question: str
                 result = entry.get("result") if isinstance(entry, dict) else None
                 if not result:
                     continue
-                found = True
-                lines.extend(_xid_knowledge_lines(result, ko, masker))
+                exact_found = True
+                source = str(entry.get("source") or "unknown")
+                provenance_tags.append(f"xid_catalog:{source}")
+                code = result.get("code")
+                identity = _safe_line(
+                    result.get("description") or result.get("mnemonic"),
+                    limit=160,
+                    masker=masker,
+                )
+                severity = _safe_line(result.get("severity"), limit=40, masker=masker)
+                digest = f"XID {code}"
+                if identity:
+                    digest += f" — {identity}"
+                if severity:
+                    digest += f" ({severity})"
+                models = [
+                    _safe_line(model, limit=40, masker=masker)
+                    for model in (result.get("gpu_models") or [])
+                    if str(model).strip()
+                ]
+                if models:
+                    model_label = "대상 GPU 모델" if ko else "Applicable GPU models"
+                    applicability = "카탈로그 적용 대상" if ko else "catalog applicability"
+                    digest += f" · {model_label}: {', '.join(models)} ({applicability})"
+                problem_lines.append(digest)
+                label = "**[XID 카탈로그]**" if ko else "**[XID Catalog]**"
+                description_label = "설명" if ko else "Description"
+                description = identity or (
+                    "카탈로그에 설명이 명시되어 있지 않습니다."
+                    if ko
+                    else "The catalog does not specify a description."
+                )
+                cause_lines.append(f"- {label} {description_label}: {description}")
+                trigger = _safe_line(result.get("trigger"), limit=800, masker=masker)
+                if trigger:
+                    trigger_text = trigger
+                elif ko:
+                    trigger_text = f"XID {code} 카탈로그에는 트리거가 명시되어 있지 않습니다."
+                else:
+                    trigger_text = f"The catalog does not specify a trigger for XID {code}."
+                cause_lines.append(f"- **{'트리거' if ko else 'Trigger'}**: {trigger_text}")
+                action_lines.extend(
+                    f"{label} {_safe_line(fix, limit=360, masker=masker)}"
+                    for fix in (result.get("fixes") or [])[:3]
+                    if str(fix).strip()
+                )
 
     # b. Exact known-issue keyword match on the question itself.
     for issue in match_runai_known_issues(state.known_issues, question)[:2]:
-        found = True
-        lines.extend(_known_issue_knowledge_lines(issue, ko, masker))
+        exact_found = True
+        provenance_tags.append("known_issue")
+        label = "**[알려진 이슈]**" if ko else "**[Known Issue]**"
+        name = _safe_line(issue.get("issue"), limit=180, masker=masker)
+        problem_lines.append(f"{label} {name}")
+        reason = _safe_line(issue.get("reason"), limit=360, masker=masker)
+        if reason:
+            cause_lines.append(f"- {label} {reason}")
+        action_lines.extend(
+            f"{label} {_safe_line(action, limit=360, masker=masker)}"
+            for action in issue.get("actions", [])[:3]
+            if str(action).strip()
+        )
 
     # c. Exact curated symptom match, across every family.
     for family, symptom in match_failure_mode_symptoms(state.failure_modes, question)[:2]:
-        found = True
-        lines.extend(_symptom_knowledge_lines(family, symptom, language, masker))
+        exact_found = True
+        provenance_tags.append(f"curated_symptom:{family}")
+        label = "**[지식베이스 증상]**" if ko else "**[Curated Symptom]**"
+        name = _safe_line(
+            _localized_failure_mode_name(symptom, language), limit=180, masker=masker
+        )
+        problem_lines.append(f"{label} {name} ({_family_label(family)})")
+        reason = _safe_line(
+            symptom.get("reason_ko" if ko else "reason"), limit=360, masker=masker
+        )
+        if reason:
+            cause_lines.append(f"- {label} {reason}")
+        action_lines.extend(
+            f"{label} {_safe_line(action, limit=360, masker=masker)}"
+            for action in _localized_failure_mode_actions(symptom, language)[:3]
+        )
 
     # d. External-case exact signature hits already retrieved for this run
     # (state.kg_context.case_cards) -- labelled as historical support cases,
@@ -5070,15 +5262,31 @@ async def _chat_adhoc_knowledge_ladder_lines(state: PipelineState, question: str
     if external_cards:
         rendered = _external_case_lines(external_cards, language, masker)
         if rendered:
-            found = True
-            lines.append("**[과거 지원 사례]**" if ko else "**[Past Support Case]**")
-            lines.extend(rendered)
+            exact_found = True
+            provenance_tags.append("external_case")
+            label = "**[과거 지원 사례]**" if ko else "**[Past Support Case]**"
+            for card in external_cards[:3]:
+                identity = _safe_line(
+                    card.get("case_id") or card.get("analysis_summary"),
+                    limit=180,
+                    masker=masker,
+                )
+                if identity:
+                    problem_lines.append(f"{label} {identity}")
+                summary = _safe_line(
+                    card.get("analysis_summary") or card.get("mechanism"),
+                    limit=360,
+                    masker=masker,
+                )
+                if summary:
+                    cause_lines.append(f"- {label} {summary}")
+            supplementary_lines.extend([label, *rendered])
 
     # e. Only when a-d found nothing at all: qualified BM25 nearest symptoms
     # (bm25.py's own qualification gate -- 2+ rare-token hits or one
     # signature-grade hit), max 3, explicitly labelled as an approximate
     # match. Never runs alongside an exact hit above.
-    if not found:
+    if not exact_found:
         fuzzy_matches = match_failure_mode_symptoms(
             state.failure_modes, question, fuzzy_query=question
         )
@@ -5088,74 +5296,44 @@ async def _chat_adhoc_knowledge_ladder_lines(state: PipelineState, question: str
             if symptom.get("matched_via") == "bm25"
         ][:3]
         for family, symptom in nearest:
-            found = True
-            lines.extend(_symptom_knowledge_lines(family, symptom, language, masker, nearest=True))
+            nearest_found = True
+            provenance_tags.append(f"bm25:{family}")
+            supplementary_lines.extend(
+                _symptom_knowledge_lines(family, symptom, language, masker, nearest=True)
+            )
+        if nearest_found:
+            cause_lines.append(
+                "질문과 정확히 일치하는 지식은 찾지 못했습니다."
+                if ko
+                else "No exact knowledge match was found for the question."
+            )
 
     # f. Planner families (the LLM already read the question, closed catalog
     # only -- see _plan_families) as a supplementary "interpreted as" lead.
-    # Always shown when available; never gated on a-e.
-    for family in _plan_families(state.plan)[:2]:
-        symptoms = [
-            symptom
-            for symptom in (state.failure_modes.get(family) or [])
-            if _localized_failure_mode_actions(symptom, language)
-        ]
-        if not symptoms:
-            continue
-        found = True
-        lines.extend(_family_lead_knowledge_lines(family, symptoms, language, masker))
+    # It may accompany BM25, but never an exact a-d match.
+    if not exact_found:
+        for family in _plan_families(state.plan)[:2]:
+            symptoms = [
+                symptom
+                for symptom in (state.failure_modes.get(family) or [])
+                if _localized_failure_mode_actions(symptom, language)
+            ]
+            if not symptoms:
+                continue
+            provenance_tags.append(f"planner_family:{family}")
+            supplementary_lines.extend(
+                _family_lead_knowledge_lines(family, symptoms, language, masker)
+            )
 
-    return lines
-
-
-async def _build_chat_adhoc_knowledge_block(state: PipelineState, language: str) -> str:
-    """The full chat-adhoc knowledge-answer section: bilingual heading, the
-    non-diagnostic banner, then the ladder's results or an explicit no-match
-    statement. Built deterministically (no LLM) so it is safe to run before
-    the Korean translation pass -- Korean subsections already use the
-    curated _ko fields directly, so the translator's Hangul-skip leaves them
-    untouched; only the English fallbacks (known issues, XID catalog text)
-    get swept into that later pass, same as everywhere else they render.
-    """
-    question = _operator_question_text(state.request)
-    ko = language == "ko"
-    try:
-        ladder_lines = await _chat_adhoc_knowledge_ladder_lines(state, question)
-    except Exception:  # noqa: BLE001 - a missing knowledge answer is not a failed RCA
-        _log.warning("chat-adhoc knowledge ladder failed", exc_info=True)
-        ladder_lines = []
-    body = ladder_lines if ladder_lines else _chat_adhoc_knowledge_no_match_lines(ko)
-    return "\n".join(
-        [
-            _chat_adhoc_knowledge_heading(language),
-            "",
-            _chat_adhoc_knowledge_banner(language),
-            "",
-            *body,
-        ]
+    match_status = "exact" if exact_found else "nearest" if nearest_found else "none"
+    return ChatAdhocKnowledge(
+        problem_lines=tuple(problem_lines),
+        cause_lines=tuple(cause_lines),
+        action_lines=tuple(action_lines),
+        supplementary_lines=tuple(supplementary_lines),
+        match_status=match_status,
+        provenance_tags=tuple(dict.fromkeys(provenance_tags)),
     )
-
-
-def _extract_chat_adhoc_knowledge_block(detail: str, language: str) -> str:
-    """The chat-adhoc knowledge-answer section of a report, heading included,
-    or "" when absent. Unlike ``_general_guidance_block`` (always the last
-    thing in the document), this section is inserted before the appendix
-    (``_insert_before_appendix``), so later ``##`` sections (Self-Check,
-    Operator Questions, Appendix) can follow it -- bound the extraction at
-    the next ``##`` heading instead of end-of-string.
-    """
-    for heading in (
-        _chat_adhoc_knowledge_heading(language),
-        _chat_adhoc_knowledge_heading("en"),
-        _chat_adhoc_knowledge_heading("ko"),
-    ):
-        index = (detail or "").find(heading)
-        if index < 0:
-            continue
-        rest = detail[index:]
-        next_heading = rest.find("\n## ", len(heading))
-        return (rest[:next_heading] if next_heading >= 0 else rest).rstrip()
-    return ""
 
 
 def _supporting_evidence(

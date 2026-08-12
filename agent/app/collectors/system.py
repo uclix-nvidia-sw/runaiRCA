@@ -2,10 +2,11 @@
 
 The agent pod can't read host logs, so a privileged DaemonSet runs on every node
 and exposes a read-only HTTP endpoint
-(GET /logs?source=dmesg|journal|syslog|fabricmanager|nvidia-smi|nvlink).
+(GET /logs?source=dmesg|journal|syslog|fabricmanager|nvidia-smi|nvlink|ibstat).
 This collector queries that endpoint for the alert's node and surfaces
 kernel/GPU/hardware errors (NVIDIA XID, NVRM, OOM, MCE, I/O errors, ext4, NVLink,
-"fell off the bus") that RCA would otherwise never see.
+"fell off the bus") that RCA would otherwise never see, plus an InfiniBand HCA/port
+inventory (ibstat) so a physically-missing or degraded HCA is visible too.
 
 Degrades gracefully exactly like loki.py: unconfigured -> status='unavailable'.
 """
@@ -63,10 +64,27 @@ _SNAPSHOT_FIELD = re.compile(r"^\s*[^:]+?\s*:\s*(.*?)\s*$")
 _HEALTHY_SNAPSHOT_VALUES = {"", "n/a", "none", "disabled", "not active"}
 _ATTACHED_GPUS = re.compile(r"^\s*Attached\s+GPUs\s*:\s*(.*?)\s*$", re.IGNORECASE)
 
+# ``ibstat`` structure: ``CA 'name'`` blocks, each holding one or more
+# ``Port N:`` sub-blocks with State/Physical state/Rate/Link layer fields.
+# Anomaly detection reads these fields directly (not the generic error-line
+# scanner above): "Down"/"Polling"/etc are ordinary words with no fixed
+# vocabulary a keyword regex could enumerate, and "Active"/"LinkUp" must never
+# be flagged as evidence just because they mention link/port state.
+_IBSTAT_CA = re.compile(r"^CA\s+'([^']+)'")
+_IBSTAT_PORT = re.compile(r"^\s*Port\s+(\d+):\s*$")
+_IBSTAT_FIELD = re.compile(r"^\s*(State|Physical state|Rate|Link layer)\s*:\s*(.*?)\s*$")
+_IB_HEALTHY_STATE = "active"
+_IB_HEALTHY_PHYSICAL_STATE = "linkup"
+
 # Sources the DaemonSet endpoint understands. Only journalctl-backed sources
 # can be verified against a historical incident window; the rest are snapshots.
-_SOURCES = ("dmesg", "journal", "syslog", "fabricmanager", "nvidia-smi", "nvlink")
-_GPU_ONLY_SOURCES = {"fabricmanager", "nvidia-smi", "nvlink"}
+_SOURCES = ("dmesg", "journal", "syslog", "fabricmanager", "nvidia-smi", "nvlink", "ibstat")
+# Skipped on a node a cluster-wide scan has confirmed is not a GPU node (see
+# ``sources_skipped`` below). InfiniBand fabric is deployed alongside GPUs in
+# this repo's clusters (DGX/HGX-style nodes), so ibstat rides along with the
+# other GPU-adjacent hardware probes; an alert that names its node directly
+# still always scans ibstat (gpu_node is None on that path).
+_GPU_ONLY_SOURCES = {"fabricmanager", "nvidia-smi", "nvlink", "ibstat"}
 _TIME_WINDOWABLE_SOURCES = ("journal", "fabricmanager")
 
 # The ad-hoc capability remains bounded. It is an incident discriminator, not
@@ -102,6 +120,135 @@ def _attached_gpu_count(lines: list[str]) -> int | None:
         _log.warning("nvidia-smi Attached GPUs value was malformed: %r", value)
         return None
     return None
+
+
+def _parse_ibstat(lines: list[str]) -> list[dict[str, object]]:
+    """Parse ``ibstat`` output into CA/port records.
+
+    Returns ``[{"name": "mlx5_0", "ports": [{"port": "1", "state": "Active",
+    "physical_state": "LinkUp", "rate": "200", "link_layer": "InfiniBand"}, ...]}]``.
+    Unknown/blank output (no ``ibstat`` binary, no IB hardware) yields ``[]``.
+    """
+    cas: list[dict[str, object]] = []
+    ports: list[dict[str, str]] | None = None
+    port: dict[str, str] | None = None
+    for line in lines:
+        ca_match = _IBSTAT_CA.match(line)
+        if ca_match:
+            ports = []
+            cas.append({"name": ca_match.group(1), "ports": ports})
+            port = None
+            continue
+        port_match = _IBSTAT_PORT.match(line)
+        if port_match and ports is not None:
+            port = {"port": port_match.group(1)}
+            ports.append(port)
+            continue
+        field_match = _IBSTAT_FIELD.match(line)
+        if field_match and port is not None:
+            key = field_match.group(1).lower().replace(" ", "_")
+            port[key] = field_match.group(2)
+    return cas
+
+
+def _ib_degraded_ports(cas: list[dict[str, object]]) -> list[dict[str, str]]:
+    """Ports whose State/Physical state are not the healthy Active/LinkUp pair."""
+    degraded: list[dict[str, str]] = []
+    for ca in cas:
+        for port in ca.get("ports", []):
+            state = str(port.get("state", "")).strip().casefold()
+            physical = str(port.get("physical_state", "")).strip().casefold()
+            if state != _IB_HEALTHY_STATE or physical != _IB_HEALTHY_PHYSICAL_STATE:
+                degraded.append({"ca": str(ca.get("name", "")), **port})
+    return degraded
+
+
+def _ib_artifacts(
+    settings: Settings,
+    *,
+    agent: str,
+    node: str,
+    cas: list[dict[str, object]],
+    time_range: dict[str, str] | None,
+    historical_node_scope_verified: bool,
+) -> list:
+    """Node IB inventory + (only when unhealthy) degraded-port artifacts.
+
+    Mirrors the GPU inventory-deficit artifact: computed after the log-scan
+    verdict and appended to the artifact list, never feeding back into the
+    collector's overall status/confidence/summary. The inventory artifact is
+    plain, neutral fact-reporting (never inflated to "ok"/"high" as if it were
+    a proven fault); the degraded-port artifact only exists when a real
+    anomaly was parsed.
+    """
+    if not cas:
+        return []
+    scoped = historical_node_scope_verified
+    inventory_observation = {
+        "kind": "node_ib_inventory",
+        "predicate": "node_ib_inventory",
+        "source_group": "node_ib_inventory",
+        "independence_group": "node_ib_inventory",
+        "scope": {"node": node},
+        "observed_entity": {"kind": "node", "name": node},
+        "polarity": "unknown",
+        "coverage": "scoped" if scoped else "partial",
+        "observation_window": time_range or {},
+        "target_identity_verified": scoped,
+        "ca_count": len(cas),
+        "cas": cas,
+    }
+    artifacts = [
+        artifact(
+            agent=agent,
+            source="system_agent",
+            type="node_ib_inventory",
+            status="ok",
+            confidence="medium",
+            query="ibstat",
+            summary=ko_en(
+                settings,
+                f"노드 {node}: ibstat이 InfiniBand CA {len(cas)}개를 보고했습니다.",
+                f"Node {node}: ibstat reported {len(cas)} InfiniBand CA(s).",
+            ),
+            result={**inventory_observation, "observation": inventory_observation},
+        )
+    ]
+    degraded = _ib_degraded_ports(cas)
+    if degraded:
+        anomaly_observation = {
+            "kind": "ib_port_degraded",
+            "predicate": "ib_port_degraded",
+            "source_group": "node_ib_inventory",
+            "independence_group": "node_ib_inventory",
+            "scope": {"node": node},
+            "observed_entity": {"kind": "node", "name": node},
+            "polarity": "present",
+            "coverage": "scoped" if scoped else "partial",
+            "observation_window": time_range or {},
+            "target_identity_verified": scoped,
+            "degraded_port_count": len(degraded),
+            "degraded_ports": degraded,
+        }
+        artifacts.append(
+            artifact(
+                agent=agent,
+                source="system_agent",
+                type="node_ib_inventory",
+                status="ok" if scoped else "partial",
+                confidence="medium" if scoped else "low",
+                query="ibstat",
+                summary=ko_en(
+                    settings,
+                    f"노드 {node}: ibstat에서 비정상 InfiniBand 포트 {len(degraded)}개를 "
+                    "발견했습니다 (State/Physical state가 Active/LinkUp이 아님).",
+                    f"Node {node}: ibstat found {len(degraded)} InfiniBand port(s) not in "
+                    "the healthy Active/LinkUp state.",
+                ),
+                result={**anomaly_observation, "observation": anomaly_observation},
+            )
+        )
+    return artifacts
 
 
 async def system_log_query(settings: Settings, target: AnalysisTarget, args: dict) -> dict:
@@ -504,6 +651,8 @@ async def _scan_source(
         attached_gpus = _attached_gpu_count(lines)
         if attached_gpus is not None:
             result["driver_attached_gpus"] = attached_gpus
+    elif source == "ibstat":
+        result["ib_cas"] = _parse_ibstat(lines)
     return result, matches
 
 
@@ -1032,6 +1181,14 @@ class SystemCollector:
             and kubernetes_gpu_capacity > driver_attached_gpus
             else None
         )
+        ib_cas = next(
+            (
+                item.get("ib_cas")
+                for item in source_results
+                if item.get("source") == "ibstat" and isinstance(item.get("ib_cas"), list)
+            ),
+            [],
+        )
 
         scan = _NodeScan(
             node=node,
@@ -1178,6 +1335,16 @@ class SystemCollector:
                     result={**gpu_observation, "observation": gpu_observation},
                 )
             )
+        artifacts.extend(
+            _ib_artifacts(
+                self._settings,
+                agent=self.name,
+                node=node,
+                cas=ib_cas,
+                time_range=time_range,
+                historical_node_scope_verified=historical_node_scope_verified,
+            )
+        )
         return CollectorResult(
             agent=self.name,
             status=status,

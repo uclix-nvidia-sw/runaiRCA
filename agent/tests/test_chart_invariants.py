@@ -299,9 +299,18 @@ def test_system_agent_slices_snapshots_from_head_and_logs_from_tail() -> None:
     text = SYSTEM_AGENT_TEMPLATE.read_text(encoding="utf-8")
     collect = text.split("    def collect(", 1)[1].split("    class Handler", 1)[0]
 
-    assert 'if source in ("nvidia-smi", "nvlink"):' in collect
+    assert 'if source in ("nvidia-smi", "nvlink", "ibstat"):' in collect
     assert "return output[:lines]" in collect
     assert "return output[-lines:]" in collect
+
+
+def test_system_agent_sources_include_ibstat() -> None:
+    # dgx02 incident: the node was cordoned for having fewer InfiniBand HCAs
+    # than normal (physically removed) and the RCA system collected nothing
+    # about IB. ibstat must be a defined source and, like nvidia-smi/nvlink,
+    # a head-sliced current-state snapshot rather than a tailed log.
+    text = SYSTEM_AGENT_TEMPLATE.read_text(encoding="utf-8")
+    assert '"ibstat": NSENTER + ["ibstat"],' in text
 
 
 def test_runai_crd_rbac_matches_the_k8s_read_allowlist_exactly() -> None:

@@ -9,7 +9,7 @@ This is a concise reference for terms that have more than one implementation-spe
 
 ### `family`
 
-**Definition.** A `family` is one of the 16 fault categories in `agent/knowledge/families.yaml`, mirrored in code as `DEFAULT_FAMILY_RULES` in `agent/app/knowledge.py`. The deterministic ranker scores families using their `keywords`; `planner_keywords` help the investigation planner recall hypotheses, but never contribute to the family score. When no family reaches the ranking evidence floor, the pipeline injects the synthetic `insufficient_evidence` family.
+**Definition.** A `family` is one of the 18 fault categories in `agent/knowledge/families.yaml`, mirrored in code as `DEFAULT_FAMILY_RULES` in `agent/app/knowledge.py`. The deterministic ranker scores families using their `keywords`; `planner_keywords` help the investigation planner recall hypotheses, but never contribute to the family score. When no family reaches the ranking evidence floor, the pipeline injects the synthetic `insufficient_evidence` family.
 
 **Where you see it.** As the root-cause family label in ranked candidates, the RCA headline, harness claims, and related evidence or knowledge records.
 

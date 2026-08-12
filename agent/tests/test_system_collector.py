@@ -40,6 +40,72 @@ class _Settings:
     llm_api_key = ""
 
 
+# Trimmed real `ibstat` shape: one CA, two healthy ports (State: Active,
+# Physical state: LinkUp) -- the never-evidence baseline every anomaly test
+# below is a deliberate mutation of.
+_IBSTAT_HEALTHY = [
+    "CA 'mlx5_0'",
+    "\tCA type: MT4123",
+    "\tNumber of ports: 2",
+    "\tFirmware version: 20.31.1014",
+    "\tHardware version: 0",
+    "\tNode GUID: 0x1070fd0300f9f4bc",
+    "\tSystem image GUID: 0x1070fd0300f9f4bc",
+    "\tPort 1:",
+    "\t\tState: Active",
+    "\t\tPhysical state: LinkUp",
+    "\t\tRate: 200",
+    "\t\tBase lid: 5",
+    "\t\tLMC: 0",
+    "\t\tSM lid: 1",
+    "\t\tCapability mask: 0xa651e848",
+    "\t\tPort GUID: 0x1270fd0300f9f4bc",
+    "\t\tLink layer: InfiniBand",
+    "\tPort 2:",
+    "\t\tState: Active",
+    "\t\tPhysical state: LinkUp",
+    "\t\tRate: 200",
+    "\t\tBase lid: 6",
+    "\t\tLMC: 0",
+    "\t\tSM lid: 1",
+    "\t\tCapability mask: 0xa651e848",
+    "\t\tPort GUID: 0x1270fd0300f9f4bd",
+    "\t\tLink layer: InfiniBand",
+]
+
+# Same CA, but port 2's cable is unplugged: State/Physical state go bad while
+# port 1 stays healthy -- the degraded artifact must list only port 2.
+_IBSTAT_ONE_PORT_DOWN = [
+    "CA 'mlx5_0'",
+    "\tCA type: MT4123",
+    "\tNumber of ports: 2",
+    "\tFirmware version: 20.31.1014",
+    "\tHardware version: 0",
+    "\tNode GUID: 0x1070fd0300f9f4bc",
+    "\tSystem image GUID: 0x1070fd0300f9f4bc",
+    "\tPort 1:",
+    "\t\tState: Active",
+    "\t\tPhysical state: LinkUp",
+    "\t\tRate: 200",
+    "\t\tBase lid: 5",
+    "\t\tLMC: 0",
+    "\t\tSM lid: 1",
+    "\t\tCapability mask: 0xa651e848",
+    "\t\tPort GUID: 0x1270fd0300f9f4bc",
+    "\t\tLink layer: InfiniBand",
+    "\tPort 2:",
+    "\t\tState: Down",
+    "\t\tPhysical state: Polling",
+    "\t\tRate: 40",
+    "\t\tBase lid: 6",
+    "\t\tLMC: 0",
+    "\t\tSM lid: 1",
+    "\t\tCapability mask: 0xa651e848",
+    "\t\tPort GUID: 0x1270fd0300f9f4bd",
+    "\t\tLink layer: InfiniBand",
+]
+
+
 def test_base_url_substitutes_node() -> None:
     assert _base_url_for_node("http://{node}:9095", "n1") == "http://n1:9095"
     assert _base_url_for_node("http://{node}:9095", "n1/../../evil@host") == (
@@ -131,6 +197,47 @@ def test_attached_gpu_count_warns_for_malformed_value(caplog: pytest.LogCaptureF
     lines = ["Attached GPUs                          : unknown"]
     assert system_mod._attached_gpu_count(lines) is None
     assert "Attached GPUs value was malformed" in caplog.text
+
+
+def test_parse_ibstat_healthy_output() -> None:
+    cas = system_mod._parse_ibstat(_IBSTAT_HEALTHY)
+    assert len(cas) == 1
+    assert cas[0]["name"] == "mlx5_0"
+    assert [port["port"] for port in cas[0]["ports"]] == ["1", "2"]
+    assert all(
+        port["state"] == "Active"
+        and port["physical_state"] == "LinkUp"
+        and port["rate"] == "200"
+        and port["link_layer"] == "InfiniBand"
+        for port in cas[0]["ports"]
+    )
+    assert system_mod._ib_degraded_ports(cas) == []
+
+
+def test_parse_ibstat_flags_only_the_down_port() -> None:
+    cas = system_mod._parse_ibstat(_IBSTAT_ONE_PORT_DOWN)
+    degraded = system_mod._ib_degraded_ports(cas)
+    assert len(degraded) == 1
+    assert degraded[0]["ca"] == "mlx5_0"
+    assert degraded[0]["port"] == "2"
+    assert degraded[0]["state"] == "Down"
+    assert degraded[0]["physical_state"] == "Polling"
+
+
+def test_parse_ibstat_empty_output_yields_no_cas() -> None:
+    assert system_mod._parse_ibstat([]) == []
+    assert system_mod._parse_ibstat(["ibstat: command not found"]) == []
+
+
+def test_ibstat_lines_never_match_the_generic_error_scanner() -> None:
+    """Healthy AND degraded ibstat lines must never leak into the generic
+    kernel/hardware error scanner (`_matching_lines`) -- IB anomaly detection
+    is exclusively the dedicated CA/port-state parser above, so a healthy
+    "State: Active"/"Physical state: LinkUp" line can never become evidence,
+    and a real "State: Down" is reported once, through the dedicated
+    ib_port_degraded artifact, not duplicated as a generic error line."""
+    assert system_mod._matching_lines("ibstat", _IBSTAT_HEALTHY) == []
+    assert system_mod._matching_lines("ibstat", _IBSTAT_ONE_PORT_DOWN) == []
 
 
 @pytest.mark.asyncio
@@ -255,7 +362,12 @@ async def test_non_gpu_cluster_node_skips_gpu_sources_and_reports_breakdown(
 
     assert calls == ["dmesg", "journal", "syslog"]
     assert result.status == "partial"
-    assert artifact_result["sources_skipped"] == ["fabricmanager", "nvidia-smi", "nvlink"]
+    assert artifact_result["sources_skipped"] == [
+        "fabricmanager",
+        "nvidia-smi",
+        "nvlink",
+        "ibstat",
+    ]
     assert {item["source"] for item in artifact_result["sources_scanned"]} == {
         "dmesg",
         "journal",
@@ -267,7 +379,9 @@ async def test_non_gpu_cluster_node_skips_gpu_sources_and_reports_breakdown(
         for item in artifact_result["sources_scanned"]
     )
     assert "ran=[dmesg,journal,syslog]" in result.artifacts[0].query
-    assert "skipped(non-GPU)=[fabricmanager,nvidia-smi,nvlink]" in result.artifacts[0].query
+    assert (
+        "skipped(non-GPU)=[fabricmanager,nvidia-smi,nvlink,ibstat]" in result.artifacts[0].query
+    )
 
 
 @pytest.mark.asyncio
@@ -359,6 +473,7 @@ async def test_detects_kernel_errors(monkeypatch: pytest.MonkeyPatch) -> None:
         "fabricmanager": ["Fabric Manager healthy"],
         "nvidia-smi": ["GPU 0: healthy"],
         "nvlink": ["GPU 0: NVLink status active"],
+        "ibstat": [],
     }
 
     async def fake_get_json(*, base_url, path, timeout_seconds, params, **kwargs):
@@ -469,6 +584,103 @@ async def test_unknown_driver_gpu_count_skips_capacity_read(
 
     assert len(result.artifacts) == 1
     assert result.artifacts[0].type == "node_logs"
+
+
+@pytest.mark.asyncio
+async def test_ib_inventory_artifact_for_healthy_node(monkeypatch: pytest.MonkeyPatch) -> None:
+    """dgx02-style visibility for the GOOD case: ibstat output always produces
+    an always-on inventory artifact (plain facts, neutral status/confidence),
+    and a healthy node produces zero anomaly artifacts."""
+
+    async def fake_get_json(*, params, **_kwargs):
+        lines = _IBSTAT_HEALTHY if params["source"] == "ibstat" else []
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": lines})
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_target())
+
+    ib_kinds = [
+        a.result["kind"]
+        for a in result.artifacts
+        if isinstance(a.result, dict) and "kind" in a.result
+    ]
+    assert ib_kinds.count("node_ib_inventory") == 1
+    assert "ib_port_degraded" not in ib_kinds
+
+    inventory = next(a for a in result.artifacts if a.result.get("kind") == "node_ib_inventory")
+    assert inventory.source == "system_agent"
+    assert inventory.type == "node_ib_inventory"
+    assert (inventory.status, inventory.confidence) == ("ok", "medium")
+    assert inventory.result["source_group"] == "node_ib_inventory"
+    assert inventory.result["ca_count"] == 1
+    assert inventory.result["cas"][0]["name"] == "mlx5_0"
+    assert len(inventory.result["cas"][0]["ports"]) == 2
+    # Never inflated into a fault claim.
+    assert inventory.result["polarity"] == "unknown"
+
+    ibstat_source = next(s for s in result.details["sources"] if s["source"] == "ibstat")
+    assert ibstat_source["error_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ib_degraded_port_artifact_for_dgx02_style_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dgx02 motivating case, partially: a port that IS reported but is
+    unhealthy must produce a dedicated ib_port_degraded artifact alongside
+    the always-on inventory artifact."""
+
+    async def fake_get_json(*, params, **_kwargs):
+        lines = _IBSTAT_ONE_PORT_DOWN if params["source"] == "ibstat" else []
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": lines})
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_target())
+
+    inventory = next(a for a in result.artifacts if a.result.get("kind") == "node_ib_inventory")
+    assert inventory.result["ca_count"] == 1
+
+    degraded = next(a for a in result.artifacts if a.result.get("kind") == "ib_port_degraded")
+    assert degraded.source == "system_agent"
+    assert degraded.type == "node_ib_inventory"
+    assert degraded.result["source_group"] == "node_ib_inventory"
+    assert degraded.result["polarity"] == "present"
+    assert degraded.result["degraded_port_count"] == 1
+    assert degraded.result["degraded_ports"] == [
+        {
+            "ca": "mlx5_0",
+            "port": "2",
+            "state": "Down",
+            "physical_state": "Polling",
+            "rate": "40",
+            "link_layer": "InfiniBand",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ib_artifacts_absent_when_ibstat_source_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No `ibstat` binary on the node (or no IB hardware at all) -> empty
+    snapshot -> nothing emitted, no crash. This is the physically-missing-HCA
+    shape too when EVERY CA is gone: there is no baseline to compare against
+    (see the capacity-deficit discussion), so the collector stays silent
+    rather than inventing a claim."""
+
+    async def fake_get_json(**_kwargs):
+        return JsonResponse(url="http://node/logs", status_code=200, data={"lines": []})
+
+    monkeypatch.setattr(system_mod, "get_json", fake_get_json)
+
+    result = await SystemCollector(_Settings()).collect(_target())
+
+    assert not any(
+        isinstance(a.result, dict) and a.result.get("source_group") == "node_ib_inventory"
+        for a in result.artifacts
+    )
 
 
 @pytest.mark.asyncio
@@ -659,7 +871,8 @@ async def test_system_log_query_accepts_new_sources_and_rejects_unknown(
 
     assert calls == ["fabricmanager", "nvidia-smi", "nvlink"]
     assert unknown["error"] == (
-        "source must be one of: dmesg, journal, syslog, fabricmanager, nvidia-smi, nvlink"
+        "source must be one of: dmesg, journal, syslog, fabricmanager, nvidia-smi, "
+        "nvlink, ibstat"
     )
 
 

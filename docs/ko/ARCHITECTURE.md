@@ -159,7 +159,7 @@ pgvector 유사도와 레이블 중첩으로는 표현할 수 없는 관계형 �
   `control_plane_component`, `xid_error`, ...)와 관계(`runs_on`, `exposes`,
   `grouped_into`, `has_symptom`, `indicates`, `resolved_by`, `depends_on`,
   `leads_to`, ...), 그리고 `sub` 타입으로 모델링된
-  16개의 근본 원인(root cause) 패밀리.
+  18개의 근본 원인(root cause) 패밀리.
 - **수집(Ingestion)**(`agent/ontology/ingest.py`, CronJob): Dashboard 승인을 받고 유예 기간 이후
   해결된 `incidents`/`alerts`를 그래프로 결정론적으로 투영합니다(`requireApproval=true`가 기본값).
   케이스 사실만 투영합니다. 인시던트 한 건으로 "알림 이름 X = 패밀리 Y"를 그래프에 가르치던

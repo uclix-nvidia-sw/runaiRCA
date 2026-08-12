@@ -175,13 +175,13 @@ so they were removed rather than left as a promise the schema does not keep.
 consults. Fed by five loaders — see [How data gets in](#3-how-data-gets-in) and
 the [Knowledge Base](KNOWLEDGE-BASE.md) doc.
 
-### Root-cause taxonomy (16 families, `sub root_cause`)
+### Root-cause taxonomy (18 families, `sub root_cause`)
 `node_kubelet_pressure`, `runai_scheduling_quota`, `k8s_scheduling_error`,
 `runai_control_plane_error`, `k8s_control_plane_error`, `workload_startup_error`,
 `image_pull_error`, `gpu_hardware_error`, `network_fabric_error`,
 `cluster_network_error`, `k8s_storage_error`, `storage_backend_error`,
 `workload_runtime_error`, `observability_accuracy`, `platform_auth_error`,
-`platform_lifecycle_change`
+`platform_lifecycle_change`, `platform_version_bug`, `expected_known_behavior`
 (+ `insufficient_evidence`). Must stay in sync with the loader `FAMILIES` sets and
 `agent/app/services/root_cause_ranking.py`; guardrail tests enforce it.
 

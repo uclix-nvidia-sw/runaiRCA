@@ -2851,11 +2851,12 @@ def _domain_tools(
                 "description": (
                     "Read one bounded, metadata-only host log observation for the alert node. "
                     "No raw log body is returned. args: source "
-                    "(dmesg|journal|syslog|fabricmanager|nvidia-smi|nvlink), "
+                    "(dmesg|journal|syslog|fabricmanager|nvidia-smi|nvlink|ibstat), "
                     "node? (must equal the resolved alert node), lookback_seconds? "
                     "(60..86400), lines? (1..1000), grep? (bounded literal). For a past "
                     "incident prefer journal or fabricmanager, which are queried with the incident "
-                    "start/end. dmesg, syslog, nvidia-smi, and nvlink are current-state snapshots."
+                    "start/end. dmesg, syslog, nvidia-smi, nvlink, and ibstat are current-state "
+                    "snapshots (ibstat = InfiniBand HCA/port state)."
                 ),
                 "call": _tool_system_log_query,
             }

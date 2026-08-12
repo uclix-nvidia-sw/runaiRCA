@@ -127,8 +127,16 @@ range from 60 to 86,400 seconds. Successful change results are cached for about
   and can trigger an on-demand RCA. It is grounded in the same TypeDB knowledge
   graph as the pipeline, including prior cases, per-family knowledge, and blast
   radius. Drill-down defaults to the loaded incident/alert target; a frontend
-  context picker provides an explicit cluster scope. The deterministic,
-  context-grounded answer is the fallback only when no chat LLM is configured.
+  context picker lets the operator pin the conversation to one incident — there
+  is no whole-cluster option. Ordinary Send requires that incident/alert
+  context; a new question instead goes through the RCA button, which creates a
+  chat-adhoc incident and runs a full analysis. When that analysis finds no
+  matching cluster evidence, the report is a deterministic knowledge-base
+  answer (`answer_mode="knowledge_only"`, shown behind a UI banner) instead of
+  a bare insufficient-evidence stub; such runs never become similar-incident
+  memory or promoted knowledge. The deterministic, context-grounded answer for
+  ordinary chat replies is otherwise the fallback only when no chat LLM is
+  configured.
   If chat is opened from a dashboard page without attached incident or alert RCA
   content, Backend attaches dashboard and analysis-run state so Chat can report
   current alert counts, latest run state, agent timeout/failure warnings,

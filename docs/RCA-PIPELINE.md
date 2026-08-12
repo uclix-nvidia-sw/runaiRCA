@@ -134,7 +134,7 @@ Each collector owns one domain and returns a `CollectorResult` (summary +
 | **prometheus** | Queue/project GPU metrics, pending/restart/resource signals |
 | **loki** | Workload logs + `runai`/`runai-backend` control-plane logs |
 | **postgres** | RCA-store health: pgvector, embeddings, feedback, persistence |
-| **system** | Node infra below Kubernetes — dmesg/journalctl/syslog, NVIDIA XID/NVRM/OOM/MCE via a per-node DaemonSet |
+| **system** | Node infra below Kubernetes — dmesg/journalctl/syslog, NVIDIA XID/NVRM/OOM/MCE, and InfiniBand HCA/port state (`ibstat`) via a per-node DaemonSet |
 | **change** | *"What changed?"* — recently-bumped controllers, new/deleting pods, node-condition transitions, recent events |
 
 Collector ceilings are generous (120s each) so evidence is deep; a single slow
@@ -172,6 +172,17 @@ collector still fails gracefully to `unavailable`. Sensitive values are masked
   for naive audit timestamps. Individual audit-table failures, discovery caps,
   and named control-plane connection failures remain visible without erasing
   other collected evidence.
+- System's `nvidia-smi`/`nvlink` snapshot sources are head-sliced (so
+  `Attached GPUs : N` is captured) and require a non-zero counter or an Xid/
+  inactive-link line to match — a healthy `Label : Value` reading of `0`/`N/A`/
+  `None`/`Disabled` is never cited as a fault. When the driver enumerates fewer
+  GPUs than the node's Kubernetes capacity, a `node_gpu_inventory_deficit`
+  artifact states the gap with both provenances (a cordoned/NotReady node keeps
+  its last-reported capacity, so a physical GPU pull stays visible). `ibstat`
+  similarly emits an always-on `node_ib_inventory` artifact (neutral CA/port
+  facts) and an `ib_port_degraded` observation only when a port is not
+  `Active`/`LinkUp`; neither makes a capacity-deficit claim, since RDMA
+  resource units are per-cluster device-plugin conventions.
 
 ## 3. Deterministic follow-up
 
@@ -434,6 +445,27 @@ reviewing when it has no recorded fix. A header states plainly that these are
 reference actions grounded in accumulated knowledge and past cases, not a
 confirmed diagnosis. Ranking itself is untouched — this only changes what the
 playbook renders for a family that never became a headline cause.
+
+**Chat-adhoc questions with no cluster evidence** get a more direct answer than
+the hedged appendix above. When an RCA-button question creates a synthetic
+chat-adhoc alert (its summary IS the operator's question) and the run ends with
+no eligible support, `_chat_adhoc_knowledge_ladder_lines` replaces sections 1–3
+(Problem / Root Cause / Recommended Actions) outright with a deterministic
+knowledge ladder: XID catalog (TypeDB-first via the drill-down tool, YAML
+`catalog_fallback`) → exact known-issue match → exact curated-symptom match
+across all families → external support case, and — only when every one of
+those is empty — qualified BM25 nearest symptoms plus the planner's
+closed-catalog family as an "interpreted as" lead. No LLM call runs in this
+ladder. The response carries `context["answer_mode"] = "knowledge_only"`;
+`root_cause_family` stays `insufficient_evidence` and the harness verdict is
+unaffected. The frontend renders a banner stating the answer is knowledge-base
+guidance, not a diagnosis of the current cluster, and the backend excludes
+these runs from similar-incident memory and knowledge promotion even after
+operator approval (`answer_mode` fencing in `upsertMemoryLocked` and
+`knowledgePromotionGates`). Seed honesty keeps the question text itself out of
+the evidence path: for a chat-adhoc run, the question-derived summary is
+excluded from the alert-signature text, so asking about "XID48" cannot mint its
+own alertmanager-sourced signature match.
 
 ## 9. Runtime harness
 
