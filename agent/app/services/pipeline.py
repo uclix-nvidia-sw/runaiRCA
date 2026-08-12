@@ -2640,7 +2640,7 @@ async def self_check_stage(state: PipelineState) -> PipelineState:
                     state.root_cause_candidates[0].confidence = calibrated
                 state.self_check_caveat = str(check.get("caveat") or "").strip()
                 state.self_check_refuted = bool(check.get("refuted"))
-                state.self_check_next = str(check.get("next_check") or "").strip()
+                state.self_check_next = _polite_ko(str(check.get("next_check") or "").strip())
             state.self_check_confidence_after = state.root_cause_candidates[0].confidence
             state.progress.emit(
                 "self_check",
@@ -2699,7 +2699,7 @@ async def _resolve_refuted_top_from_existing_candidates(state: PipelineState) ->
                 replace(previous, confidence="low"),
             ]
             state.self_check_caveat = last_caveat
-            state.self_check_next = last_next
+            state.self_check_next = _polite_ko(last_next)
             state.self_check_refuted = False
             state.self_check_confidence_after = candidate.confidence
             return
@@ -2715,7 +2715,7 @@ async def _resolve_refuted_top_from_existing_candidates(state: PipelineState) ->
         *[replace(candidate, confidence="low") for candidate in alternatives],
     ]
     state.self_check_caveat = last_caveat
-    state.self_check_next = last_next
+    state.self_check_next = _polite_ko(last_next)
     state.self_check_refuted = True
     state.self_check_confidence_after = "low"
 
@@ -2737,7 +2737,7 @@ async def _self_check_if_top_changed(state: PipelineState, previous_family: str)
     if calibrated in ("low", "medium", "high"):
         current.confidence = calibrated
     state.self_check_caveat = str(check.get("caveat") or "").strip()
-    state.self_check_next = str(check.get("next_check") or "").strip()
+    state.self_check_next = _polite_ko(str(check.get("next_check") or "").strip())
     state.self_check_refuted = bool(check.get("refuted"))
     state.self_check_confidence_before = confidence_before
     state.self_check_confidence_after = current.confidence
@@ -2976,6 +2976,12 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         next_label = "다음 확인" if getattr(settings, "language", "en") == "ko" else "Next check"
         self_check_lines.append(f"- **{next_label}**: {state.self_check_next}")
     if self_check_lines:
+        # Choke point: self_check.py's LLM-authored caveat/next_check text (and
+        # the reanalysis note) land here verbatim -- same tone pass as the
+        # numbered actions above, so a plain-imperative ending never survives
+        # regardless of which self-check field it came from.
+        if getattr(settings, "language", "en") == "ko":
+            self_check_lines = [_polite_ko(line) for line in self_check_lines]
         state.detail = _insert_before_appendix(
             state.detail, "## Self-Check\n\n" + "\n\n".join(self_check_lines)
         )
@@ -3515,7 +3521,7 @@ async def _investigate_until_settled(state: PipelineState) -> None:
                 outcome.candidates[0].family if outcome.candidates else "insufficient_evidence"
             )
         state.self_check_refuted = outcome.refuted
-        state.self_check_next = outcome.next_check
+        state.self_check_next = _polite_ko(outcome.next_check)
         _aggregate_evidence(state)
         _refresh_public_reasoning_trace(state)
         open_world = _merge_open_world_candidates(state, state.root_cause_candidates)
@@ -6698,6 +6704,13 @@ def _numbered_actions(
         action = _safe_line(
             fill_placeholders(str(action), observed), limit=420, masker=action_masker
         )
+        # Choke point: every rendered action line, from every source above
+        # (self-check's next_check, XID/symptom/known-issue/component
+        # guidance, the translator's Korean output), gets the same
+        # plain-imperative -> polite tone pass. English lines/segments and
+        # already-polite endings pass through unchanged.
+        if knowledge.language == "ko":
+            action = _polite_ko(action)
         if not action or action in seen:
             continue
         seen.add(action)
@@ -9046,6 +9059,59 @@ def _safe_line(value: object, *, limit: int, masker: Masker | None = None) -> st
     active_masker = masker or build_masker(())
     text = " ".join(active_masker.mask_text(str(value or "")).split())
     return textwrap.shorten(text, width=limit, placeholder="…") if text else text
+
+
+# Sentence-final plain-imperative endings -> polite form. Checked longest/most
+# specific first so "하지 마라"/"하지 말라" (which do NOT end in 하라/해라) never
+# fall through to a less specific rule by accident, though none of these
+# suffixes actually overlap.
+_POLITE_KO_ENDINGS = (
+    ("하지 마라", "하지 마세요"),
+    ("하지마라", "하지 마세요"),
+    ("하지 말라", "하지 마세요"),
+    ("하지말라", "하지 마세요"),
+    ("해라", "하세요"),
+    ("하라", "하세요"),
+)
+# Trailing punctuation/whitespace to look past when checking the ending, kept
+# verbatim on output ("수집하라." -> "수집하세요.", not "수집하세요").
+_POLITE_KO_TRAILING_RE = re.compile(r"([.!?~…]*\s*)$")
+
+
+def _polite_ko_tail(text: str) -> str:
+    trailing = _POLITE_KO_TRAILING_RE.search(text).group(1)
+    stem = text[: len(text) - len(trailing)] if trailing else text
+    for ending, polite in _POLITE_KO_ENDINGS:
+        if stem.endswith(ending):
+            return stem[: -len(ending)] + polite + trailing
+    return text
+
+
+def _polite_ko(line: str) -> str:
+    """Rewrite a rendered Korean line's plain-imperative sentence ending
+    (~하라/~해라/~하지 마라/~말라) to polite form (~하세요/~하지 마세요).
+
+    The single choke point for report-rendered guidance/action/check text,
+    regardless of source (self-check's LLM-generated next_check/caveat, the
+    English->Korean batch translator, curated catalog actions, future
+    additions) -- so tone is a property of RENDERING, not of every producer
+    getting it right independently. Deliberately narrow: only the very end of
+    the line (outside any backtick code span) is a candidate, so a quoted
+    command, log line, or mid-sentence text is never touched; a line with
+    unbalanced backticks is left alone rather than guessed at. An
+    already-polite ending (하세요/하십시오/합니다/...) or an English line simply
+    matches no suffix here and passes through unchanged.
+    """
+    if not line:
+        return line
+    segments = line.split("`")
+    if len(segments) % 2 == 0:  # unbalanced backticks -- don't guess spans
+        return line
+    rewritten = _polite_ko_tail(segments[-1])
+    if rewritten == segments[-1]:
+        return line
+    segments[-1] = rewritten
+    return "`".join(segments)
 
 
 def _investigation_plan_lines(plan: InvestigationPlan | None) -> list[str]:
