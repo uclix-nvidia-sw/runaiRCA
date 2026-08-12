@@ -1430,7 +1430,7 @@ func (s *Store) RecurrenceStats(days int, now time.Time) RecurrenceStats {
 			continue
 		}
 		alert := s.latestAlertForIncidentLocked(incident.IncidentID)
-		if alert == nil {
+		if alert == nil || isChatAdhocAlert(alertFromRecord(*alert)) {
 			continue
 		}
 		stats.Total++
@@ -1456,6 +1456,12 @@ func (s *Store) RecurrenceStats(days int, now time.Time) RecurrenceStats {
 		stats:     cloneRecurrenceStats(stats),
 	}
 	return cloneRecurrenceStats(stats)
+}
+
+func isChatAdhocAlert(alert Alert) bool {
+	return alert.Labels["alertname"] == "OperatorRequestedAnalysis" &&
+		alert.Labels["source"] == "chat" &&
+		strings.HasPrefix(alert.Fingerprint, "chat-adhoc-")
 }
 
 func (s *Store) invalidateRecurrenceStatsLocked() {
