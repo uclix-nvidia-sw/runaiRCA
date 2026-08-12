@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import re
 import time
 from typing import Any
@@ -27,7 +28,10 @@ from app.collectors.runai_mcp import (
 from app.config import Settings
 from app.mcp_client import mcp_tls_verify
 
+_log = logging.getLogger(__name__)
+
 _VERSION_RE = re.compile(r"\d+\.\d+(?:\.\d+)?")
+_RUNAI_VERSION_PATH = "/api/v1/clusters/minimal"
 _RUNAI_TOKEN_CACHE_TTL_SECONDS = 30.0
 _RUNAI_TOKEN_CACHE: dict[tuple[str, str, str, str], tuple[str, float]] = {}
 _RUNAI_TOKEN_INFLIGHT: dict[
@@ -65,19 +69,32 @@ def _extract_version(data: Any) -> str:
 async def _fetch_runai_version(settings: Settings, headers: dict[str, str]) -> str:
     """Best-effort Run:ai control-plane version, '' when unavailable.
 
-    The path is configurable (RUNAI_VERSION_PATH) and this never fails the collector
-    — an unknown version simply means no version-aware known-issue suppression."""
-    if not settings.runai_base_url or not settings.runai_version_path:
+    Uses the product-defined version endpoint and never fails the collector — an
+    unknown version simply means no version-aware known-issue suppression."""
+    if not settings.runai_base_url:
         return ""
     resp = await get_json(
         base_url=settings.runai_base_url,
-        path=settings.runai_version_path,
+        path=_RUNAI_VERSION_PATH,
         timeout_seconds=settings.runai_timeout_seconds,
         headers=headers,
         verify=mcp_tls_verify(),
     )
-    return _extract_version(resp.data) if resp.ok else ""
-
+    if not resp.ok:
+        _log.warning(
+            "Run:ai version request failed: path=%s status=%s error=%s",
+            _RUNAI_VERSION_PATH,
+            resp.status_code,
+            resp.error,
+        )
+        return ""
+    version = _extract_version(resp.data)
+    if not version:
+        _log.warning(
+            "Run:ai version response had no parseable version: path=%s",
+            _RUNAI_VERSION_PATH,
+        )
+    return version
 
 
 def _mcp_cluster_gpu_model(query_results: list[dict[str, object]]) -> str:

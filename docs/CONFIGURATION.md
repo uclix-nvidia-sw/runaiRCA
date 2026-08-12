@@ -67,7 +67,6 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `RUNAI_WORKLOADS_PATH` | Run:ai workloads API path, default `/api/v1/workloads` |
 | `RUNAI_PROJECTS_PATH` | Run:ai projects API path, default `/api/v1/projects` |
 | `RUNAI_QUEUES_PATH` | Run:ai queues API path, default `/api/v1/queues` |
-| `RUNAI_VERSION_PATH` | Run:ai control-plane version API path, default `/api/v1/clusters` — enables version-aware suppression of already-fixed known issues |
 | `RUNAI_TIMEOUT_SECONDS` | Run:ai API request timeout, default `120` |
 | `RUNAI_MCP_URL` | Official NVIDIA Run:ai MCP shared-service URL (streamable HTTP at `/mcp`, e.g. `http://runai-rca-runai-mcp:8080/mcp`). When set, the runai collector + drill-down use its focused read-only set of 16 tools. The endpoint is OIDC-protected; Helm deploys it as a shared ClusterIP service and sets this URL by default (`runaiMcp.enabled: true`). Any failure falls back to direct Run:ai HTTP reads. |
 | `RUNAI_LOG_NAMESPACES` | Comma-separated Run:ai control-plane log namespaces, default `runai,runai-backend` |

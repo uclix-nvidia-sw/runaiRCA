@@ -3,8 +3,12 @@ Run:ai version are suppressed (no false 'you have this bug')."""
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from types import SimpleNamespace
 
+from app.collectors import runai
+from app.collectors.http_json import JsonResponse
 from app.collectors.runai import _extract_version
 from app.services.pipeline import (
     _known_issue_fixed_in_running,
@@ -54,22 +58,52 @@ def test_runai_version_from_results() -> None:
     assert _runai_version_from([SimpleNamespace(agent="runai", details={})]) == ""
 
 
-def test_extract_version_from_clusters_list_response() -> None:
-    # The REST API has no dedicated version endpoint (verified against the
-    # v2.20 docs and live runs where runai_version stayed empty): the version
-    # rides on each cluster object from GET /api/v1/clusters — the default
-    # RUNAI_VERSION_PATH now points there.
-    from app.collectors.runai import _extract_version
-
-    payload = {
-        "clusters": [
-            {
-                "uuid": "aaaa-bbbb",
-                "name": "prod",
-                "version": "2.23.31",
-                "status": {"state": "Connected"},
-            }
+def test_extract_version_from_minimal_clusters_response() -> None:
+    assert _extract_version(
+        [{"uuid": "u1", "name": "c1", "version": "2.23.60", "domain": None}]
+    ) == "2.23.60"
+    assert _extract_version([{"uuid": "u1", "name": "c1", "version": None}]) == ""
+    # Multiple clusters resolve to the first non-empty version in response order.
+    assert _extract_version(
+        [
+            {"uuid": "u1", "name": "c1", "version": None},
+            {"uuid": "u2", "name": "c2", "version": "2.24.1"},
         ]
-    }
-    assert _extract_version(payload) == "2.23.31"
-    assert _extract_version([{"name": "x", "version": "2.19.0"}]) == "2.19.0"
+    ) == "2.24.1"
+
+
+def test_fetch_runai_version_warns_only_on_failures(monkeypatch, caplog) -> None:
+    responses = iter(
+        [
+            JsonResponse(url="https://runai.example/version", status_code=503, error="HTTP 503"),
+            JsonResponse(url="https://runai.example/version", status_code=200, data=[]),
+            JsonResponse(
+                url="https://runai.example/version",
+                status_code=200,
+                data=[{"version": "2.24.1"}],
+            ),
+        ]
+    )
+
+    async def fake_get_json(**_kwargs):
+        return next(responses)
+
+    monkeypatch.setattr(runai, "get_json", fake_get_json)
+    monkeypatch.setattr(runai, "mcp_tls_verify", lambda: True)
+    # The Run:ai version path is fixed at /api/v1/clusters/minimal.
+    settings = SimpleNamespace(
+        runai_base_url="https://runai.example",
+        runai_timeout_seconds=120,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=runai.__name__):
+        assert asyncio.run(runai._fetch_runai_version(settings, {})) == ""
+        assert asyncio.run(runai._fetch_runai_version(settings, {})) == ""
+        assert asyncio.run(runai._fetch_runai_version(settings, {})) == "2.24.1"
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "Run:ai version request failed: path=/api/v1/clusters/minimal "
+        "status=503 error=HTTP 503",
+        "Run:ai version response had no parseable version: "
+        "path=/api/v1/clusters/minimal",
+    ]
