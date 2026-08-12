@@ -167,7 +167,7 @@ separate agent. Full detail: [Knowledge Base](KNOWLEDGE-BASE.md).
   `control_plane_component`, `xid_error`, ...) and relations (`runs_on`,
   `exposes`, `grouped_into`, `has_symptom`, `indicates`, `resolved_by`,
   `depends_on`, `leads_to`, ...),
-  with 16 root-cause families modeled as `sub` types.
+  with 18 root-cause families modeled as `sub` types.
 - **Ingestion** (`agent/ontology/ingest.py`, CronJob): a deterministic projection
   of Dashboard-approved, resolved `incidents`/`alerts` into the graph after a grace
   window (`requireApproval=true` by default). It projects case facts only. The old

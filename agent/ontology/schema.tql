@@ -1,7 +1,8 @@
 # Run:AI RCA ontology — TypeDB 3.x (TypeQL).
 #
 # The durable, store-independent model behind the RCA knowledge graph: typed
-# entities + relations + a root_cause taxonomy (5 families as sub-types).
+# entities + relations + a root_cause taxonomy (18 fixed families as
+# sub-types, plus insufficient_evidence and the generic cause_instance).
 # Apply with:  python -m ontology.load_schema   (see agent/ontology/load_schema.py)
 #
 # ponytail: GPU capacity/demand are NOT modelled here at all (no `gpu` entity,

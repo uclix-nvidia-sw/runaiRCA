@@ -126,7 +126,7 @@ flowchart LR
 | **prometheus** | 큐/프로젝트 GPU 메트릭, 대기/재시작/리소스 신호 |
 | **loki** | 워크로드 로그 + `runai`/`runai-backend` 컨트롤 플레인 로그 |
 | **postgres** | RCA 스토어 상태: pgvector, 임베딩(embedding), 피드백, 영속화 |
-| **system** | Kubernetes 아래 노드 인프라 — dmesg/journalctl/syslog, 노드별 DaemonSet을 통한 NVIDIA XID/NVRM/OOM/MCE |
+| **system** | Kubernetes 아래 노드 인프라 — dmesg/journalctl/syslog, NVIDIA XID/NVRM/OOM/MCE, 노드별 DaemonSet을 통한 InfiniBand HCA/포트 상태(`ibstat`) |
 | **change** | *"무엇이 바뀌었나?"* — 최근 업데이트된 컨트롤러, 신규/삭제 중인 파드, 노드 컨디션 전이, 최근 이벤트 |
 
 수집기 상한은 넉넉하여(각 120초) 증거가 깊습니다. 느린 수집기 하나가 있어도 여전히 `unavailable`로
@@ -157,6 +157,15 @@ flowchart LR
 - Run:ai 컨트롤 플레인 Postgres 읽기는 UTC를 고정하고 naive audit timestamp의 UTC 가정을
   공개합니다. 개별 audit-table 실패, 발견 제한, 이름이 표시된 컨트롤 플레인 연결 실패는 다른 수집
   증거를 지우지 않고 계속 보입니다.
+- System의 `nvidia-smi`/`nvlink` 스냅샷 소스는 head-slice되어(`Attached GPUs : N`을
+  포착) non-zero 카운터나 Xid/inactive-link 라인이 있어야만 매칭됩니다 — `0`/`N/A`/`None`/
+  `Disabled` 같은 정상 `Label : Value` 값은 절대 fault로 인용되지 않습니다. 드라이버가
+  열거한 GPU 수가 노드의 Kubernetes capacity보다 적으면 `node_gpu_inventory_deficit`
+  아티팩트가 두 출처 값을 모두 담아 그 차이를 명시합니다(cordon/NotReady 노드는 마지막으로
+  보고된 capacity를 유지하므로, 물리적으로 GPU가 빠졌을 때도 이 차이가 보입니다). `ibstat`도
+  마찬가지로 항상 켜져 있는 `node_ib_inventory` 아티팩트(중립적인 CA/포트 사실)와, 포트가
+  `Active`/`LinkUp`이 아닐 때만 나오는 `ib_port_degraded` 관찰을 냅니다. RDMA 리소스 단위는
+  클러스터마다 다른 device-plugin 관례이므로 둘 다 capacity 부족을 주장하지 않습니다.
 
 ## 3. Deterministic follow-up
 
@@ -376,6 +385,24 @@ Playbook과 "### Knowledge Base (Ontology)" 부록 모두 침묵하거나 과신
 안내입니다. 헤더는 이 항목들이 축적된 지식과 과거 사례에 근거한 참고 조치일 뿐 확정
 진단이 아니라고 명시적으로 밝힙니다. 랭킹 자체는 건드리지 않습니다 — 헤드라인 원인이
 되지 못한 family에 대해 playbook이 무엇을 렌더링하는지만 바뀝니다.
+
+**클러스터 증거가 없는 chat-adhoc 질문**은 위의 헤지된 부록보다 더 직접적인 답을
+받습니다. RCA 버튼으로 던진 질문이 합성 chat-adhoc 알림(그 summary가 곧 운영자의
+질문 문장)을 만들고 run이 적격 증거 없이 끝나면, `_chat_adhoc_knowledge_ladder_lines`가
+섹션 1~3(Problem / Root Cause / Recommended Actions)을 결정론적 지식 ladder로 통째로
+교체합니다: XID 카탈로그(드릴다운 툴을 통한 TypeDB 우선, YAML `catalog_fallback`) →
+정확히 일치하는 알려진 이슈 → 전체 family를 아우르는 정확히 일치하는 지식베이스 증상 →
+외부 서포트 케이스, 그리고 — 이들이 모두 비어 있을 때만 — 적격 BM25 최근접 증상과
+planner의 닫힌 카탈로그 family를 "다음으로 해석됨" 리드로 덧붙입니다. 이 ladder에는
+LLM 호출이 전혀 없습니다. 응답에는 `context["answer_mode"] = "knowledge_only"`가
+실리고, `root_cause_family`는 `insufficient_evidence`로 유지되며 harness 판정도
+그대로입니다. 프런트엔드는 이 답변이 지식 베이스 안내이지 현재 클러스터에 대한 진단이
+아니라는 배너를 표시하고, 백엔드는 운영자가 나중에 승인하더라도 이런 run을 유사
+인시던트 메모리와 지식 승격에서 제외합니다(`upsertMemoryLocked`와
+`knowledgePromotionGates`의 `answer_mode` 배제). Seed honesty는 질문 문장 자체를 증거
+경로 밖에 둡니다: chat-adhoc run에서는 질문에서 파생된 summary를 alert-signature
+텍스트에서 제외하므로, "XID48"을 물어봤다고 해서 그 자체가 alertmanager 발신 시그니처
+매치를 만들어 낼 수 없습니다.
 
 ## 9. Runtime harness
 

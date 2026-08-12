@@ -9,7 +9,7 @@
 
 ### `family`
 
-**정의.** `family`는 `agent/knowledge/families.yaml`의 16개 장애 범주 중 하나이며, `agent/app/knowledge.py`의 `DEFAULT_FAMILY_RULES`에도 미러링되어 있습니다. 결정론적 ranker는 family의 `keywords`를 사용해 점수를 계산합니다. `planner_keywords`는 조사 planner가 가설을 회수하는 데만 도움을 주며 family 점수에는 절대 반영되지 않습니다. 어떤 family도 ranking 증거 하한에 도달하지 못하면 파이프라인은 합성 family인 `insufficient_evidence`를 주입합니다.
+**정의.** `family`는 `agent/knowledge/families.yaml`의 18개 장애 범주 중 하나이며, `agent/app/knowledge.py`의 `DEFAULT_FAMILY_RULES`에도 미러링되어 있습니다. 결정론적 ranker는 family의 `keywords`를 사용해 점수를 계산합니다. `planner_keywords`는 조사 planner가 가설을 회수하는 데만 도움을 주며 family 점수에는 절대 반영되지 않습니다. 어떤 family도 ranking 증거 하한에 도달하지 못하면 파이프라인은 합성 family인 `insufficient_evidence`를 주입합니다.
 
 **어디에서 보이나.** 순위가 매겨진 후보의 근본 원인 family 레이블, RCA 헤드라인, harness claim, 관련 증거 및 지식 레코드에서 보입니다.
 
