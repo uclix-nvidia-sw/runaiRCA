@@ -18,6 +18,21 @@ from app.services.pipeline import PipelineState, harness_stage, synthesize_stage
 from app.services.root_cause_ranking import RankedCause
 from tests.test_orchestrator import make_settings, make_target
 
+# A non-empty knowledge catalog that never matches XID8_QUESTION -- so
+# _kb_remediation_lines walks its symptom loop and falls through to the
+# "no closely-matching prior knowledge" line, instead of the KGContext's own
+# empty-catalog early-out (a knowledge={} dict short-circuits before that
+# line is ever reached).
+_UNMATCHED_KNOWLEDGE = {
+    "node_kubelet_pressure": [
+        {
+            "symptom": "Node Disk Pressure",
+            "keywords": ["diskpressure-unrelated-keyword"],
+            "actions": ["Cordon or drain the node"],
+        }
+    ]
+}
+
 XID_QUESTION = "XID48 에러가 발생했는데 어떤 걸 해야할까요?"
 XID8_QUESTION = "XID 8은 무엇이고 어떻게 조치해야 하나요?"
 FAILURE_MODES_PATH = "knowledge/failure_modes.yaml"
@@ -48,10 +63,15 @@ EXPECTED_XID8_SECTIONS_KO = "\n".join(
 
 
 def _chat_adhoc_request(
-    question: str, *, fingerprint: str = "chat-adhoc-testfp0001abcd"
+    question: str, *, fingerprint: str = "chat-adhoc-testfp0001abcd", manual: bool = False
 ) -> AlertAnalysisRequest:
+    # ``manual=True`` mirrors an operator manually re-analyzing a chat-adhoc
+    # incident: same synthetic-alert identity (chat.go mints it once), but
+    # analysis_type/analysis_request_source say "manual" instead of "chat" --
+    # the trigger for THIS run, not what the alert is.
+    trigger = "manual" if manual else "chat"
     return AlertAnalysisRequest(
-        analysis_type="chat",
+        analysis_type=trigger,
         alert=Alert(
             status="firing",
             labels={
@@ -62,7 +82,7 @@ def _chat_adhoc_request(
             annotations={
                 "summary": question[:160],
                 "operator_prompt": question,
-                "analysis_request_source": "chat",
+                "analysis_request_source": trigger,
             },
             fingerprint=fingerprint,
         ),
@@ -86,11 +106,23 @@ def _make_state(request: AlertAnalysisRequest, *, settings=None, **overrides) ->
     return state
 
 
-# Marker predicate: all production markers are required.
+# Marker predicate: only the THREE alert-identity markers matter (alertname,
+# source label, fingerprint prefix) -- chat.go mints them exclusively for its
+# synthetic ad-hoc alert. analysis_type/analysis_request_source describe which
+# button triggered THIS run, not what the alert is, and must NOT gate this.
 
 
-def test_is_chat_adhoc_true_with_all_four_markers() -> None:
+def test_is_chat_adhoc_true_with_the_three_identity_markers() -> None:
     assert pipeline._is_chat_adhoc(_chat_adhoc_request(XID_QUESTION))
+
+
+def test_is_chat_adhoc_true_for_a_manual_rerun_of_a_chat_adhoc_incident() -> None:
+    # An operator manually re-analyzing a chat-adhoc incident: the backend
+    # sends analysis_type="manual" and analysis_request_source="manual", but
+    # the alert being re-run is still chat.go's synthetic ad-hoc alert (same
+    # three identity markers). This must stay chat-adhoc -- the whole point of
+    # the fix -- or the operator's own question text re-enters evidence.
+    assert pipeline._is_chat_adhoc(_chat_adhoc_request(XID8_QUESTION, manual=True))
 
 
 def test_is_chat_adhoc_false_for_a_real_alert() -> None:
@@ -168,6 +200,23 @@ def test_chat_adhoc_xid_question_does_not_promote_gpu_hardware_error() -> None:
     request = _chat_adhoc_request(XID_QUESTION)
     codes = pipeline._xid_codes_from_results([], pipeline._alert_signature_text(request))
     assert codes == []
+
+
+def test_manual_rerun_of_chat_adhoc_xid_question_mints_no_alert_signature_evidence() -> None:
+    # The hole this predicate fix closes: live incident
+    # INC-1786508710550925434-000001's manual re-analysis (analysis_type=
+    # "manual") of "Xid 8..." previously fell out of _is_chat_adhoc, so the
+    # question's own "XID 8" re-entered evidence and "confirmed" itself via
+    # E77-style self-evidence. Same assertions as the chat-triggered test
+    # above, but analysis_type/analysis_request_source="manual".
+    request = _chat_adhoc_request(XID8_QUESTION, manual=True)
+    codes, matched_by_family = pipeline._asserted_alert_signatures(request)
+    assert codes == []
+    assert matched_by_family == {}
+    assert pipeline._alert_signature_evidence_result(request, make_target()) is None
+    assert "8" not in pipeline._alert_signature_text(request)
+    assert "8" in pipeline._alert_text(request)
+    assert pipeline._xid_codes_from_results([], pipeline._alert_signature_text(request)) == []
 
 
 def test_real_alert_xid_in_summary_is_completely_unaffected() -> None:
@@ -392,6 +441,33 @@ async def test_xid8_replaces_sections_one_two_three_without_question_echo_or_fam
 
 
 @pytest.mark.asyncio
+async def test_manual_rerun_with_zero_eligible_support_also_renders_knowledge_sections() -> None:
+    # Same scenario as the chat-triggered test above, but the request is a
+    # manual re-analysis (analysis_type="manual") of the same chat-adhoc
+    # incident. With _is_chat_adhoc now identity-only, this must behave
+    # identically to the chat-triggered run -- the knowledge sections render
+    # and answer_mode is knowledge_only, regardless of which button re-ran it.
+    settings = replace(make_settings(), language="ko", enable_rca_output_harness=False)
+    plan = InvestigationPlan(hypotheses=[{"family": "runai_scheduling_quota"}], llm_refined=True)
+    state = _make_state(
+        _chat_adhoc_request(XID8_QUESTION, manual=True),
+        settings=settings,
+        plan=plan,
+        failure_modes=SCHEDULING_MODES,
+        root_cause_candidates=[RankedCause("insufficient_evidence", "low", 0.0)],
+    )
+
+    await synthesize_stage(state)
+    await harness_stage(state)
+
+    assert state.response is not None
+    assert state.chat_adhoc_knowledge is not None
+    detail = state.response.analysis_detail
+    assert EXPECTED_XID8_SECTIONS_KO in detail
+    assert state.response.context.get("answer_mode") == "knowledge_only"
+
+
+@pytest.mark.asyncio
 async def test_no_match_replaces_sections_and_sets_answer_mode() -> None:
     question = "user deleted old experiment after successful completion"
     settings = replace(make_settings(), enable_rca_output_harness=False)
@@ -501,3 +577,56 @@ async def test_chat_adhoc_with_eligible_evidence_does_not_use_knowledge_sections
     assert state.chat_adhoc_knowledge is None
     assert "XID 8 — GPU stopped processing" not in state.response.analysis_detail
     assert "answer_mode" not in state.response.context
+
+
+@pytest.mark.asyncio
+async def test_chat_adhoc_with_eligible_evidence_appendix_is_proper_korean(
+    monkeypatch,
+) -> None:
+    # Same "evidence turned up after all" scenario as the test above (real
+    # incident INC-1786508710550925434-000001: the alertmanager XID-8 report
+    # itself became eligible support evidence), but with the Knowledge Base
+    # appendix enabled -- its ko no-match line used to read half-English
+    # ("...closely-matching하는 사전 지식이 아직 없습니다").
+    monkeypatch.setattr(
+        pipeline, "_eligible_support_ids_for_output", lambda state: {"kubernetes:1"}
+    )
+    state = _make_state(
+        _chat_adhoc_request(XID8_QUESTION),
+        settings=replace(make_settings(), language="ko", enable_rca_output_harness=False),
+        kg_context=KGContext(enabled=True, available=True, knowledge=_UNMATCHED_KNOWLEDGE),
+        root_cause_candidates=[RankedCause("gpu_hardware_error", "high", 9.0)],
+    )
+
+    await synthesize_stage(state)
+    await harness_stage(state)
+
+    assert state.response is not None
+    detail = state.response.analysis_detail
+    assert "answer_mode" not in state.response.context  # not a knowledge-only run
+    assert "이 증거와 밀접하게 일치하는 사전 지식은 아직 없습니다." in detail
+    assert "closely-matching" not in detail
+
+
+@pytest.mark.asyncio
+async def test_chat_adhoc_knowledge_only_appendix_does_not_contradict_the_answer() -> None:
+    # No eligible evidence at all -- a true knowledge-only run (like a chat
+    # question whose cluster sweep found nothing). The Knowledge Base
+    # appendix's no-match line must not read as contradicting the knowledge
+    # answer already given in sections 1-3 above it.
+    state = _make_state(
+        _chat_adhoc_request(XID8_QUESTION),
+        settings=replace(make_settings(), language="ko", enable_rca_output_harness=False),
+        kg_context=KGContext(enabled=True, available=True, knowledge=_UNMATCHED_KNOWLEDGE),
+        root_cause_candidates=[RankedCause("insufficient_evidence", "low", 0.0)],
+    )
+
+    await synthesize_stage(state)
+    await harness_stage(state)
+
+    assert state.response is not None
+    detail = state.response.analysis_detail
+    assert state.response.context.get("answer_mode") == "knowledge_only"
+    assert "위 답변은 클러스터 증거가 아니라 이 질문에 대한 지식 베이스 매칭 결과로" in detail
+    assert "closely-matching" not in detail
+    assert "이 증거와 밀접하게 일치하는 사전 지식은 아직 없습니다." not in detail

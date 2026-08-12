@@ -680,20 +680,24 @@ def _is_chat_adhoc(request: AlertAnalysisRequest) -> bool:
     """True only for the synthetic ad-hoc alert chat.go mints when an operator
     asks a general knowledge question with no matching alert -- a
     ``chat-adhoc-`` fingerprint, alertname ``OperatorRequestedAnalysis``, and
-    ``source: chat`` on both the request and the alert's own label. All four
-    markers must agree; a real alert re-run via chat, or a manual re-analysis
-    that merely carries an ``operator_prompt``, satisfies at most one or two
-    of them and stays a normal alert -- its own text remains full evidence.
+    ``source: chat`` on the alert's own label. These three are minted
+    exclusively by chat.go's ad-hoc creation path and never by a real alert.
+
+    Deliberately independent of ``request.analysis_type`` /
+    ``analysis_request_source`` -- those describe which BUTTON triggered THIS
+    run (chat vs. an operator's manual re-analysis), not what the alert IS.
+    An operator manually re-running a chat-adhoc incident still re-runs a
+    synthetic alert whose ``summary`` is their own question, not an
+    Alertmanager observation; letting the trigger flip this predicate let
+    that question text re-enter ``_alert_signature_text`` on a manual rerun
+    and mint self-evidence from the operator's own words (XID 8 in the
+    question "confirmed" by the question itself) -- the seed-honesty hole
+    this comment replaces. Identity over trigger.
     """
     alert = request.alert
     labels = alert.labels or {}
-    annotations = alert.annotations or {}
-    is_chat_source = (
-        request.analysis_type == "chat" or annotations.get("analysis_request_source") == "chat"
-    )
     return (
-        is_chat_source
-        and labels.get("alertname") == "OperatorRequestedAnalysis"
+        labels.get("alertname") == "OperatorRequestedAnalysis"
         and labels.get("source") == "chat"
         and str(alert.fingerprint or "").startswith("chat-adhoc-")
     )
@@ -4762,6 +4766,8 @@ def _detail_from(
             _alert_signature_text(request),
             knowledge.masker,
             allow_remediation=allow_cause_specific_actions,
+            language=knowledge.language,
+            knowledge_only=chat_adhoc_knowledge is not None,
         )
     )
     lines.extend(_runtime_knowledge_hint_lines(runtime_knowledge_hints or [], knowledge.masker))
@@ -5597,6 +5603,53 @@ def _xid_identity_clause(
         return ""
     name = _safe_line(name, limit=80, masker=masker)
     return f"{name} ({severity})" if severity else name
+
+
+# The ontology's XID fix text is the catalog's `resolution_buckets` sentence
+# (agent/knowledge/xid_catalog.yaml, owner-curated -- never edited here),
+# verbatim. Translating it via the LLM batch pass is fine once (the first
+# fix for a code, whose header still carries an English identity clause that
+# needs the same pass), but a REPEATED fix on the same code -- see the bare
+# vs. full header split in _numbered_actions below -- has a bare "(XID N)"
+# header with nothing left to translate, so it is safe to render fully in
+# fixed, polite Korean instead of depending on the translator's tone for a
+# closed, well-known set of resolution codes. Keys are the exact English
+# sentences from the catalog; unmapped/long-form sentences (the multi-clause
+# WORKFLOW_* essays) fall through to the translator unchanged.
+_XID_ACTION_KO: dict[str, str] = {
+    "The application should be restarted RESET_GPU or RESTART_BM is not deemed necessary.": (
+        "애플리케이션을 재시작하세요. RESET_GPU 또는 RESTART_BM은 필요하지 않습니다."
+    ),
+    "Please contact your support organization for further investigation.": (
+        "추가 조사를 위해 지원 조직에 문의하세요."
+    ),
+    "No Action required": "별도 조치가 필요하지 않습니다.",
+    "Refer to https://docs.nvidia.com/deploy/gpu-debug-guidelines/index.html for GPU Reset "
+    "capabilities & limitations RESTART_BM is not deemed necessary.": (
+        "GPU 재설정 기능 및 제한 사항은 NVIDIA GPU 디버그 가이드라인 문서를 참고하세요. "
+        "RESTART_BM은 필요하지 않습니다."
+    ),
+    "Check to ensure that device seating and all applicable connections to it are secure.": (
+        "장치의 장착 상태와 관련 커넥터 연결이 안전한지 확인하세요."
+    ),
+    "Restart bare metal, system should be restarted": "베어메탈을 재시작하세요.",
+    "VM owning the affected GPU must be restarted RESET_GPU or RESTART_BM is not deemed "
+    "necessary.": (
+        "해당 GPU를 사용하는 VM을 재시작하세요. RESET_GPU 또는 RESTART_BM은 필요하지 않습니다."
+    ),
+    "If UVM/vGPU is being utilized, RESET_GPU; otherwise IGNORE": (
+        "UVM/vGPU를 사용 중이라면 RESET_GPU를 수행하고, 그렇지 않다면 별도 조치가 필요하지 "
+        "않습니다."
+    ),
+    "Follow XID 154 reported guidance": "XID 154에 안내된 조치를 따르세요.",
+    "Check other logs as this is likely a secondary indicator of some action or fault "
+    "(may be OOB).": (
+        "다른 조치나 결함의 2차 지표일 가능성이 있으므로 다른 로그도 함께 확인하세요."
+    ),
+    "Investigate SW or user initiated if unexpected": (
+        "예상치 못한 상황이라면 소프트웨어 또는 사용자 조작 여부를 조사하세요."
+    ),
+}
 
 
 def _xid_diagnostic_guidance_lines(
@@ -6606,8 +6659,24 @@ def _numbered_actions(
             # the operator reads English rather than nothing.
             label = "root XID" if code in root_codes else "XID"
             identity = _xid_identity_clause(graph_fixes, code, masker)
-            header = f"{label} {code} — {identity}" if identity else f"{label} {code}"
-            fixes = [f"({header}) {fix}" for fix in graph_fixes.xid_fixes[code]]
+            full_header = f"{label} {code} — {identity}" if identity else f"{label} {code}"
+            bare_header = f"{label} {code}"
+            fixes = []
+            for index, fix in enumerate(graph_fixes.xid_fixes[code]):
+                # Only the FIRST fix for a code carries the identity clause --
+                # repeating "(XID 8 — GPU has stopped processing)" on every
+                # sibling fix (e.g. immediate_action + investigatory_action,
+                # RESTART_APP + CONTACT_SUPPORT) was pure noise once the first
+                # line had already named the fault.
+                if index == 0:
+                    fixes.append(f"({full_header}) {fix}")
+                    continue
+                # A bare header carries no English prose of its own (unlike
+                # full_header's identity clause), so it is safe to render a
+                # known resolution-bucket sentence as fixed, polite Korean
+                # right here instead of leaving its tone to the translator.
+                ko_fix = _XID_ACTION_KO.get(fix.strip()) if knowledge.language == "ko" else None
+                fixes.append(f"({bare_header}) {ko_fix or fix}")
             specific_actions += len(fixes)
             ordered.extend(fixes)
     ordered.extend(
@@ -8423,6 +8492,8 @@ def _knowledge_base_lines(
     masker: Masker | None = None,
     *,
     allow_remediation: bool = True,
+    language: str = "en",
+    knowledge_only: bool = False,
 ) -> list[str]:
     if not kg_context or not kg_context.get("enabled"):
         return []
@@ -8519,10 +8590,31 @@ def _knowledge_base_lines(
                 limit=320,
             )
             body.append(f"  - {incident_id}: {summary}")
-    if allow_remediation:
+    if knowledge_only:
+        # A chat-adhoc knowledge-only run (no cluster evidence -- see
+        # _is_chat_adhoc/ChatAdhocKnowledge) always has allow_remediation=False
+        # (it is derived from the same empty eligible_support_ids that gates
+        # chat_adhoc_knowledge), so it would otherwise always hit the
+        # "remediation is withheld ..." branch below -- a line about CLUSTER
+        # evidence that reads as contradicting sections 1-3, which already ARE
+        # the knowledge answer, assembled from the question. Say so plainly
+        # instead.
+        body.append(
+            "- 위 답변은 클러스터 증거가 아니라 이 질문에 대한 지식 베이스 매칭 결과로 "
+            "구성되었습니다."
+            if language == "ko"
+            else "- The answer above was assembled from knowledge-base matches against "
+            "the question, not cluster evidence."
+        )
+    elif allow_remediation:
         body.extend(
             _kb_remediation_lines(
-                kg_context, candidates, observed_text, fuzzy_query, active_masker
+                kg_context,
+                candidates,
+                observed_text,
+                fuzzy_query,
+                active_masker,
+                language=language,
             )
         )
     elif kg_context.get("knowledge"):
@@ -8541,6 +8633,8 @@ def _kb_remediation_lines(
     observed_text: str,
     fuzzy_query: str = "",
     masker: Masker | None = None,
+    *,
+    language: str = "en",
 ) -> list[str]:
     knowledge = kg_context.get("knowledge") or {}
     if not knowledge:
@@ -8600,7 +8694,12 @@ def _kb_remediation_lines(
             "family prior from the knowledge base (no verified action recorded)."
         ]
     # No symptom keyword matched the observed evidence: don't dump a generic family
-    # checklist as if it were a match — say so plainly.
+    # checklist as if it were a match — say so plainly. (The chat-adhoc
+    # knowledge-only rewording of this line lives one level up, in
+    # _knowledge_base_lines -- a knowledge-only run always has
+    # allow_remediation=False, so it never reaches this function at all.)
+    if language == "ko":
+        return ["- 이 증거와 밀접하게 일치하는 사전 지식은 아직 없습니다."]
     return ["- No closely-matching prior knowledge for this evidence yet."]
 
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from app.collectors.http_json import _client_timeout
 from app.schemas import Alert, AlertAnalysisRequest
 from app.services.kg_enrichment import GraphRemediation
@@ -245,3 +247,51 @@ def test_numbered_actions_ko_keeps_the_catalog_text_translatable() -> None:
         assert "RESET_GPU" in line
         assert not _HANGUL_RE.search(line), f"untranslatable mixed line: {line}"
     assert any(_translatable_report_lines(line) for line in xid_lines)
+
+
+def test_second_xid_fix_for_the_same_code_drops_the_repeated_identity() -> None:
+    # XID 8's catalog has TWO resolution actions (immediate_action RESTART_APP +
+    # investigatory_action CONTACT_SUPPORT), both filed under the same code. The
+    # report used to repeat "(XID 8 -- GPU stopped processing (non-fatal))" on
+    # BOTH lines -- pure noise once the first line had already named the fault.
+    gr = GraphRemediation(
+        xid_fixes={8: ["restart the application", "contact support"]},
+        xid_descriptions={8: "GPU stopped processing"},
+        xid_severities={8: "non-fatal"},
+    )
+    xid_lines = [
+        re.sub(r"^\d+\.\s*", "", a)
+        for a in _xid_actions(gr)
+        if "restart the application" in a or "contact support" in a
+    ]
+    assert len(xid_lines) == 2
+    assert xid_lines[0] == "(XID 8 — GPU stopped processing (non-fatal)) restart the application"
+    assert xid_lines[1] == "(XID 8) contact support"
+
+
+def test_second_xid_fix_known_resolution_bucket_renders_deterministic_polite_korean() -> None:
+    # RESET_GPU/RESTART_APP/CONTACT_SUPPORT-derived resolution-bucket sentences
+    # (agent/knowledge/xid_catalog.yaml) used to depend entirely on the LLM
+    # translation pass for Korean tone, which is not deterministic and has
+    # produced plain-imperative "~하라" style output. Once a fix's header is
+    # bare (the repeat case above), it carries no English prose of its own, so
+    # a known sentence renders as fixed, polite Korean instead.
+    gr = GraphRemediation(
+        xid_fixes={
+            8: [
+                "The application should be restarted RESET_GPU or RESTART_BM is not "
+                "deemed necessary.",
+                "Please contact your support organization for further investigation.",
+            ]
+        },
+        xid_descriptions={8: "GPU stopped processing"},
+        xid_severities={8: "non-fatal"},
+    )
+    xid_lines = [re.sub(r"^\d+\.\s*", "", a) for a in _xid_actions(gr, "ko") if "8" in a]
+    assert len(xid_lines) == 2
+    # First fix keeps the full header -- still English, still translator-bound.
+    assert xid_lines[0].startswith("(XID 8 — GPU stopped processing (non-fatal))")
+    assert not _HANGUL_RE.search(xid_lines[0])
+    # Second fix is bare-headered and fully, deterministically Korean.
+    assert xid_lines[1] == "(XID 8) 추가 조사를 위해 지원 조직에 문의하세요."
+    assert not xid_lines[1].endswith("하라") and not xid_lines[1].endswith("하라.")
