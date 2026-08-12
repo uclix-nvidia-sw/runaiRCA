@@ -41,9 +41,8 @@ export type ChatContextValue = {
   context: Record<string, unknown>;
 };
 
-// 'auto' follows the open page; 'cluster' forces whole-cluster (no context);
-// an explicit incident pins the conversation to its RCA.
-export type ChatContextChoice = 'auto' | 'cluster' | `incident:${string}`;
+// 'auto' follows the open page; an explicit incident pins the conversation to its RCA.
+export type ChatContextChoice = 'auto' | `incident:${string}`;
 
 const MAX_CONVERSATIONS = 30;
 
@@ -65,8 +64,7 @@ export function useRcaChat({
   const [manualIncidentID, setManualIncidentID] = useState('');
   const [manualAlertID, setManualAlertID] = useState('');
   // Explicit context choice from the chat-dashboard picker. 'auto' follows the
-  // open page / manual IDs (existing behavior); 'cluster' deliberately sends no
-  // incident/alert so the agent answers from the live cluster.
+  // open page / manual IDs (existing behavior).
   const [contextChoice, setContextChoice] = useState<ChatContextChoice>('auto');
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -85,6 +83,12 @@ export function useRcaChat({
     [],
   );
   const messages = activeConversation?.messages ?? [welcomeMessage];
+  const selectedIncidentID = contextChoice.startsWith('incident:')
+    ? contextChoice.slice('incident:'.length)
+    : '';
+  const effectiveIncidentID = selectedIncidentID || manualIncidentID.trim() || chatContext.incidentID;
+  const effectiveAlertID = selectedIncidentID ? '' : manualAlertID.trim() || chatContext.alertID;
+  const canSendOrdinary = Boolean(effectiveIncidentID || effectiveAlertID);
 
   useEffect(() => {
     setManualIncidentID(chatContext.incidentID);
@@ -124,22 +128,16 @@ export function useRcaChat({
 
   const send = useCallback(async (options?: { analyze?: boolean }) => {
     const message = input.trim();
-    if (!message || sending || inFlight.current) return;
+    if (!message || sending || inFlight.current || (!options?.analyze && !canSendOrdinary)) return;
     inFlight.current = true;
 
     const now = new Date().toISOString();
     const conversationID = activeConversation?.id || randomID('chat');
     // Explicit picker choice wins; 'auto' keeps the page-follow / manual-ID behavior.
-    let incidentID = manualIncidentID.trim() || chatContext.incidentID;
-    let alertID = manualAlertID.trim() || chatContext.alertID;
+    const incidentID = effectiveIncidentID;
+    const alertID = effectiveAlertID;
     let contextLabel = chatContext.label;
-    if (contextChoice === 'cluster') {
-      incidentID = '';
-      alertID = '';
-      contextLabel = 'Whole cluster';
-    } else if (contextChoice.startsWith('incident:')) {
-      incidentID = contextChoice.slice('incident:'.length);
-      alertID = '';
+    if (selectedIncidentID) {
       contextLabel = `Incident ${incidentID}`;
     }
     const userMessage = makeChatMessage('user', message);
@@ -223,18 +221,21 @@ export function useRcaChat({
     }
   }, [
     activeConversation,
+    canSendOrdinary,
     chatContext,
     contextChoice,
+    effectiveAlertID,
+    effectiveIncidentID,
     input,
-    manualAlertID,
-    manualIncidentID,
     onAnalysisCreated,
+    selectedIncidentID,
     sending,
   ]);
 
   return {
     activeConversation,
     activeConversationID,
+    canSendOrdinary,
     chatContext,
     contextChoice,
     conversations,

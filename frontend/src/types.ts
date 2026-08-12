@@ -136,6 +136,7 @@ export type AnalysisRun = {
   warnings: string[];
   artifacts: Artifact[];
   metadata?: Record<string, unknown> & {
+    answer_mode?: string;
     progress_log?: AnalysisProgressEntry[];
     pinned?: boolean;
     operator_correction?: {

@@ -219,6 +219,9 @@ export function ChatDashboard({
       </aside>
 
       <section className={`full-chat-main ${activeMessages.length === 0 ? 'is-empty' : 'has-messages'}`}>
+        <div className="chat-usage-notice">
+          New question? Press the RCA button — it runs a full analysis and creates an incident. Send replies within the selected incident.
+        </div>
         <div className="full-chat-messages" ref={listRef}>
           {activeMessages.length === 0 ? (
             <div className="full-chat-empty">
@@ -269,8 +272,7 @@ export function ChatDashboard({
                 value={chat.contextChoice}
                 onChange={(event) => chat.setContextChoice(event.target.value as typeof chat.contextChoice)}
               >
-                <option value="auto">Auto ({chat.chatContext.label})</option>
-                <option value="cluster">Whole cluster (live)</option>
+                <option value="auto" disabled hidden>Select an incident…</option>
                 {chat.incidents.length > 0 && (
                   <optgroup label="Incidents">
                     {chat.incidents.slice(0, 25).map((incident) => (
@@ -281,6 +283,17 @@ export function ChatDashboard({
                   </optgroup>
                 )}
               </select>
+              {chat.contextChoice.startsWith('incident:') && (
+                <button
+                  className="full-chat-context-clear"
+                  type="button"
+                  onClick={() => chat.setContextChoice('auto')}
+                  aria-label="Clear selected incident"
+                  title="Clear selected incident"
+                >
+                  ✕
+                </button>
+              )}
             </span>
             {chat.activeConversation && (
               <button
@@ -306,7 +319,7 @@ export function ChatDashboard({
             <button
               className="full-chat-send"
               type="button"
-              disabled={chat.sending || !chat.input.trim()}
+              disabled={chat.sending || !chat.input.trim() || !chat.canSendOrdinary}
               onClick={() => void chat.send()}
               aria-label="Send"
               title="Send"

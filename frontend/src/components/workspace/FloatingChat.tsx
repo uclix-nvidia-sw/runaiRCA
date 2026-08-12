@@ -120,6 +120,9 @@ export function FloatingChat({
           </div>
 
           <footer className="chat-compose">
+            {!chat.canSendOrdinary && (
+              <small className="chat-send-hint">Select an incident to chat, or use RCA for a new question.</small>
+            )}
             <textarea
               value={chat.input}
               onChange={(event) => chat.setInput(event.target.value)}
@@ -135,7 +138,7 @@ export function FloatingChat({
             >
               <Radar size={16} /> RCA
             </button>
-            <button className="primary-button" disabled={chat.sending || !chat.input.trim()} onClick={() => void chat.send()}>
+            <button className="primary-button" disabled={chat.sending || !chat.input.trim() || !chat.canSendOrdinary} onClick={() => void chat.send()}>
               <Send size={16} /> Send
             </button>
           </footer>
