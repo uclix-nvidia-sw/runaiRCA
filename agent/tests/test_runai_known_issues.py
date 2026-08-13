@@ -252,6 +252,44 @@ def test_match_titles_does_not_change_a_keyword_hit() -> None:
     assert with_titles == without_titles
 
 
+def test_include_fixed_is_the_single_choke_point_for_version_suppression() -> None:
+    # pipeline._suppress_fixed_known_issues annotates (never drops) an entry
+    # already fixed in the running Run:ai version; the matcher is where that
+    # annotation actually stops it from surfacing -- by default, everywhere.
+    catalog = [
+        {
+            "issue": "bug fixed already",
+            "family": "runai_scheduling_quota",
+            "keywords": ["some rare error string"],
+            "actions": [],
+            "_fixed_in_running": True,
+            "_running_version": "2.23.71",
+            "fixed_version": "2.23.60",
+        }
+    ]
+    text = "log line containing some rare error string"
+
+    # Evidence-path guard: identical to the old filter's observable behavior.
+    assert match_runai_known_issues(catalog, text) == []
+    assert match_runai_known_issues(catalog, text, fuzzy_query=text) == []
+
+    # Question path opts in explicitly.
+    hits = match_runai_known_issues(catalog, text, include_fixed=True)
+    assert [h["issue"] for h in hits] == ["bug fixed already"]
+    assert hits[0]["_fixed_in_running"] is True
+    assert hits[0]["_running_version"] == "2.23.71"
+
+
+def test_include_fixed_does_not_affect_unannotated_entries() -> None:
+    # An entry with no _fixed_in_running marker (running version was unknown,
+    # or it isn't fixed yet) matches identically regardless of include_fixed.
+    catalog = load_runai_known_issues(CATALOG)
+    text = "Error: the administrator prohibited modifying item 'project-data'"
+    assert match_runai_known_issues(catalog, text) == match_runai_known_issues(
+        catalog, text, include_fixed=True
+    )
+
+
 def test_missing_file_is_empty() -> None:
     assert load_runai_known_issues("/nope/does-not-exist.yaml") == []
 

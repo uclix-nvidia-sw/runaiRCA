@@ -322,6 +322,87 @@ def test_structured_ladder_preserves_exact_rung_content_and_provenance() -> None
     assert "Past Support Case" in "\n".join(case.supplementary_lines)
 
 
+# A known issue already fixed in the cluster's running Run:ai version is
+# ANNOTATED (never dropped, see _suppress_fixed_known_issues), so the evidence
+# path stops matching it by default but the chat question path -- rung b, the
+# only include_fixed=True caller -- can still show the knowledge, with a
+# caveat naming both versions instead of silently returning nothing.
+FIXED_KNOWN_ISSUE_FIXTURE = [
+    {
+        "issue": "Scheduler Livez Deadlock",
+        "family": "runai_control_plane_error",
+        "keywords": ["livez deadlock"],
+        "reason": "KI-REASON a stale lock held past its lease.",
+        "actions": ["KI-ACTION restart the scheduler pod."],
+        "affected_version": "",
+        "fixed_version": "2.23.60",
+        "refs": [],
+        "_fixed_in_running": True,
+        "_running_version": "2.23.71",
+    }
+]
+
+
+def test_fixed_in_running_known_issue_still_answers_with_a_version_caveat() -> None:
+    question = "scheduler livez deadlock 발생했는데 어떻게 하나요?"
+    result = asyncio.run(
+        pipeline._chat_adhoc_knowledge_ladder_lines(
+            _make_state(
+                _chat_adhoc_request(question),
+                settings=replace(make_settings(), language="ko"),
+                known_issues=FIXED_KNOWN_ISSUE_FIXTURE,
+            ),
+            question,
+        )
+    )
+    assert result.match_status == "exact"
+    assert result.provenance_tags == ("known_issue",)
+    assert "Scheduler Livez Deadlock" in "\n".join(result.problem_lines)
+    cause_text = "\n".join(result.cause_lines)
+    assert "KI-REASON" in cause_text
+    assert "2.23.71" in cause_text  # running version
+    assert "2.23.60" in cause_text  # fixed version
+    assert "재현된다면 다른 원인이거나 회귀" in cause_text
+
+
+@pytest.mark.asyncio
+async def test_fixed_in_running_known_issue_headline_still_names_the_title() -> None:
+    # Integration with the headline fix: even carrying a version caveat, the
+    # knowledge_only headline must still name the matched issue's title, not
+    # the generic insufficient-evidence sentence.
+    question = "scheduler livez deadlock 발생했는데 어떻게 하나요?"
+    settings = replace(make_settings(), language="ko", enable_rca_output_harness=False)
+    state = _make_state(
+        _chat_adhoc_request(question),
+        settings=settings,
+        known_issues=FIXED_KNOWN_ISSUE_FIXTURE,
+        root_cause_candidates=[RankedCause("insufficient_evidence", "low", 0.0)],
+    )
+
+    await synthesize_stage(state)
+    await harness_stage(state)
+
+    assert state.chat_adhoc_knowledge is not None
+    assert state.chat_adhoc_knowledge.match_status == "exact"
+    assert state.chat_adhoc_knowledge.top_match_title == "Scheduler Livez Deadlock"
+    assert state.response is not None
+    assert "지식 기반 답변: Scheduler Livez Deadlock" in state.response.analysis_summary
+    assert "확정할 근거가 충분하지" not in state.response.analysis_summary
+
+
+def test_evidence_path_still_suppresses_a_fixed_in_running_known_issue() -> None:
+    # The observable evidence-path behavior is unchanged from the old filter:
+    # match_runai_known_issues' default (include_fixed=False, used everywhere
+    # except rung b) skips an annotated entry even when its keyword IS in the
+    # evidence text.
+    from app.knowledge import match_runai_known_issues
+
+    hits = match_runai_known_issues(
+        FIXED_KNOWN_ISSUE_FIXTURE, "the runai-scheduler reported a livez deadlock"
+    )
+    assert hits == []
+
+
 QUESTION_MATCH_CASE_CARD = {
     "kind": "external",
     "case_id": "enterprise_support:question-match-1",

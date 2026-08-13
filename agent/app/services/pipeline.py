@@ -5288,7 +5288,12 @@ async def _chat_adhoc_knowledge_ladder_lines(
 
     # b. Exact known-issue keyword match on the question itself -- match_titles
     # is safe ONLY here: the question is prose, never observed cluster evidence.
-    for issue in match_runai_known_issues(state.known_issues, question, match_titles=True)[:2]:
+    # include_fixed=True: a question naming an already-fixed issue should still
+    # get the knowledge answer (with a version caveat below), not silently
+    # nothing -- unlike the evidence path, which stays suppressed by default.
+    for issue in match_runai_known_issues(
+        state.known_issues, question, match_titles=True, include_fixed=True
+    )[:2]:
         exact_found = True
         provenance_tags.append("known_issue")
         label = "**[알려진 이슈]**" if ko else "**[Known Issue]**"
@@ -5299,6 +5304,19 @@ async def _chat_adhoc_knowledge_ladder_lines(
         reason = _safe_line(issue.get("reason"), limit=360, masker=masker)
         if reason:
             cause_lines.append(f"- {label} {reason}")
+        if issue.get("_fixed_in_running"):
+            running = _safe_line(issue.get("_running_version"), limit=40, masker=masker)
+            fixed = _safe_line(issue.get("fixed_version"), limit=40, masker=masker)
+            if running and fixed:
+                cause_lines.append(
+                    f"- {label} 이 클러스터의 Run:ai 버전({running})은 이 이슈의 수정 버전"
+                    f"({fixed}) 이후입니다 — 그래도 재현된다면 다른 원인이거나 회귀일 수 "
+                    "있습니다."
+                    if ko
+                    else f"- {label} This cluster's Run:ai version ({running}) is already past "
+                    f"this issue's fixed version ({fixed}) — if you still reproduce it, it's a "
+                    "different cause or a regression."
+                )
         action_lines.extend(
             f"{label} {_safe_line(action, limit=360, masker=masker)}"
             for action in issue.get("actions", [])[:3]
@@ -6472,14 +6490,53 @@ def _xid_candidate_still_supported(rationale: str, refuted_labels: set[str]) -> 
     return bool(codes - refuted_codes)
 
 
+# Trusts ONLY the Run:ai control-plane Helm chart label -- never a workload
+# image tag or a bare app.kubernetes.io/version label, either of which any
+# user workload can carry with any value.
+_CONTROL_PLANE_CHART_VERSION_RE = re.compile(
+    r"helm\.sh/chart['\"]?\s*:\s*['\"]?control-plane-(\d+\.\d+(?:\.\d+)?)"
+)
+
+
+def _control_plane_chart_versions(value: object, *, limit: int = 20000) -> set[str]:
+    """Run:ai control-plane chart versions named in a serialized k8s payload.
+
+    # ponytail: bounded (not exhaustive) scan of one already-collected value;
+    # a version buried past `limit` chars is missed, not mis-detected -- an
+    # unbounded scan for a value this small isn't worth the extra code.
+    """
+    if value is None:
+        return set()
+    text = json.dumps(value, default=str)[:limit]
+    return set(_CONTROL_PLANE_CHART_VERSION_RE.findall(text))
+
+
 def _runai_version_from(results: list[CollectorResult]) -> str:
-    """The running Run:ai control-plane version, if the runai collector resolved one."""
+    """The running Run:ai control-plane version. Prefers the runai collector's
+    own resolved version; when that fetch failed, falls back to the SAME run's
+    already-collected kubernetes evidence (deterministic, no extra API calls):
+    the control-plane pod listing (details.runai_control_plane_pods) plus every
+    artifact's raw payload (covers the case where the alert's own target pod IS
+    a control-plane pod, e.g. its full-YAML describe artifact). More than one
+    distinct chart version found is ambiguity, not evidence."""
     for result in results:
         if result.agent == "runai":
             value = result.details.get("runai_version")
             if isinstance(value, str) and value.strip():
                 return value.strip()
-    return ""
+    versions: set[str] = set()
+    for result in results:
+        if result.agent != "kubernetes":
+            continue
+        versions |= _control_plane_chart_versions(result.details.get("runai_control_plane_pods"))
+        for art in result.artifacts:
+            versions |= _control_plane_chart_versions(art.result)
+    if len(versions) > 1:
+        _log.warning(
+            "ambiguous Run:ai control-plane chart versions in k8s evidence: %s", sorted(versions)
+        )
+        return ""
+    return next(iter(versions), "")
 
 
 def _version_tuple(text: str) -> tuple[int, ...]:
@@ -6495,11 +6552,21 @@ def _known_issue_fixed_in_running(issue: dict, running_version: str) -> bool:
 
 
 def _suppress_fixed_known_issues(known_issues: list[dict], running_version: str) -> list[dict]:
-    """Drop known issues already fixed in the running Run:ai version (precision:
-    don't attribute a symptom to a bug the cluster is already patched against)."""
+    """Annotate (never drop) known issues already fixed in the running Run:ai
+    version. Dropping conflicts with the question path: a chat question naming
+    an already-fixed issue should still get the knowledge answer, with a
+    version caveat -- not silently nothing. The evidence path keeps today's
+    precision through a single choke point instead: match_runai_known_issues
+    skips an annotated entry by default (include_fixed=False everywhere except
+    the chat ladder's rung b)."""
     if not running_version:
         return known_issues
-    return [k for k in known_issues if not _known_issue_fixed_in_running(k, running_version)]
+    return [
+        {**k, "_fixed_in_running": True, "_running_version": running_version}
+        if _known_issue_fixed_in_running(k, running_version)
+        else k
+        for k in known_issues
+    ]
 
 
 def _known_issue_cause_lines(
