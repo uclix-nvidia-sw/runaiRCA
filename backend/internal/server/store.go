@@ -613,6 +613,19 @@ func (s *Store) upsertAlertResultLocked(
 	alertStatus := status(alert.Status)
 	now := time.Now().UTC()
 	alertFiredAt := firstTime(alert.StartsAt, now)
+	if alert.StartsAt == "" {
+		// A zero-StartsAt resend (chat-adhoc alerts carry no Alertmanager
+		// timestamp) reuses the live episode's firing time so it cannot count
+		// as a re-fire — but only while that episode's incident is still
+		// alive. A deleted incident's alert must not lend its timestamp:
+		// reusing it would hand the resend to the episode tombstone and drop
+		// it, when a post-deletion resend is a fresh episode by design.
+		existing := s.alerts[s.alertByFinger[fingerprint]]
+		if existing != nil && existing.Status == "firing" &&
+			!incidentDeleted(s.incidents[existing.IncidentID]) {
+			alertFiredAt = existing.FiredAt
+		}
+	}
 	if s.episodeTombstoneDropsLocked(fingerprint, alertStatus, alertFiredAt) {
 		return AlertUpsertResult{CorrelationKey: key, Dropped: true}, nil, nil
 	}
@@ -1417,7 +1430,7 @@ func (s *Store) RecurrenceStats(days int, now time.Time) RecurrenceStats {
 			continue
 		}
 		alert := s.latestAlertForIncidentLocked(incident.IncidentID)
-		if alert == nil {
+		if alert == nil || isChatAdhocAlert(alertFromRecord(*alert)) {
 			continue
 		}
 		stats.Total++
@@ -1443,6 +1456,12 @@ func (s *Store) RecurrenceStats(days int, now time.Time) RecurrenceStats {
 		stats:     cloneRecurrenceStats(stats),
 	}
 	return cloneRecurrenceStats(stats)
+}
+
+func isChatAdhocAlert(alert Alert) bool {
+	return alert.Labels["alertname"] == "OperatorRequestedAnalysis" &&
+		alert.Labels["source"] == "chat" &&
+		strings.HasPrefix(alert.Fingerprint, "chat-adhoc-")
 }
 
 func (s *Store) invalidateRecurrenceStatsLocked() {
@@ -2244,7 +2263,11 @@ func (s *Store) completeAnalysisRun(runID string, response AgentAnalysisResponse
 	run.Metadata = mergeAnalysisMetadata(run.Metadata, metadataFromAgentContext(response.Context))
 	run.UpdatedAt = time.Now().UTC()
 	if run.FirstCompletedAt == nil {
-		run.FirstCompletedAt = &run.UpdatedAt
+		// Own copy, never &run.UpdatedAt: aliasing into the record makes every
+		// later UpdatedAt write mutate what FirstCompletedAt points at — and
+		// races with any clone/marshal that captured the shared pointer.
+		firstCompleted := run.UpdatedAt
+		run.FirstCompletedAt = &firstCompleted
 	}
 	var delivery SlackAnalysisDelivery
 	if slackIncidentID != "" {

@@ -76,8 +76,8 @@ flowchart LR
 | `LOKI_TIMEOUT_SECONDS` | Loki 쿼리 타임아웃 |
 | `LOKI_QUERY_LIMIT` | Loki 쿼리 그룹당 요청하는 최대 로그 라인 수. 기본값 `20` |
 | `LOKI_MCP_URL` | Loki tool을 위한 Grafana MCP URL. managed `grafanaMcp`가 켜져 있으면 같은 ClusterIP 서비스 URL로 설정하고, 실패 시 `LOKI_URL`로 폴백합니다 |
-| `ENABLE_SYSTEM_AGENT` | 노드 인프라 System 수집기(노드별 DaemonSet을 통한 dmesg/journalctl/syslog)를 활성화합니다. 기본값 `true`. `SYSTEM_AGENT_URL`이 설정되지 않으면 `unavailable`로 축소됩니다 |
-| `SYSTEM_AGENT_URL` | 노드별 System 에이전트 DaemonSet 엔드포인트(`GET /logs?source=dmesg\|journal\|syslog`). 과거 incident 수집에서는 정확한 RFC3339 시간창을 `journal`에 전달하며, dmesg/syslog는 현재 상태 tail로만 취급합니다. |
+| `ENABLE_SYSTEM_AGENT` | 노드 인프라 System 수집기(노드별 DaemonSet을 통한 dmesg/journalctl/syslog/fabricmanager/nvidia-smi/nvlink/ibstat)를 활성화합니다. 기본값 `true`. `SYSTEM_AGENT_URL`이 설정되지 않으면 `unavailable`로 축소됩니다 |
+| `SYSTEM_AGENT_URL` | 노드별 System 에이전트 DaemonSet 엔드포인트(`GET /logs?source=dmesg\|journal\|syslog\|fabricmanager\|nvidia-smi\|nvlink\|ibstat`). `journal`과 `fabricmanager`는 journalctl 기반이라 과거 incident 수집 시 정확한 RFC3339 시간창을 전달할 수 있고, `dmesg`, `syslog`, `nvidia-smi`, `nvlink`, `ibstat`은 현재 상태 스냅샷만 제공합니다. |
 | `SYSTEM_AGENT_TOKEN` | System 에이전트 엔드포인트용 선택 사항인 bearer 토큰 |
 | `SYSTEM_AGENT_TIMEOUT_SECONDS` | System 에이전트 요청 타임아웃. 기본값 `120` |
 | `ENABLE_POD_EXEC` | Kubernetes 수집기의 거부 목록(denylist) 기반 읽기 전용 pod-exec를 허용합니다. 상태를 바꾸는 명령, shell/인터프리터, shell 메타문자를 차단하고 shell 없이 단일 argv만 실행합니다. 기본값 `true` |

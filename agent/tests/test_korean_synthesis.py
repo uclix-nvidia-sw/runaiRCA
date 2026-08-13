@@ -30,6 +30,7 @@ from app.services.pipeline import (
     _apply_line_translations,
     _detail_from,
     _gpu_model_from,
+    _polite_ko,
     _summary_from,
     _translatable_report_lines,
     _translate_report_lines_ko,
@@ -949,3 +950,78 @@ async def test_translation_runs_after_every_section_is_appended(monkeypatch) -> 
     # And they must actually be picked up as translatable prose, not just present.
     batch = set(pipeline._translatable_report_lines(body).values())
     assert any(state.self_check_caveat in line for line in batch)
+
+
+# _polite_ko: the single choke point that rewrites a rendered Korean line's
+# plain-imperative sentence ending (~하라/~해라/~하지 마라/~말라) to polite form.
+
+
+def test_polite_ko_rewrites_hara_with_trailing_period() -> None:
+    assert _polite_ko("GPU 오류 증거를 수집하라.") == "GPU 오류 증거를 수집하세요."
+
+
+def test_polite_ko_rewrites_hara_with_no_trailing_punctuation() -> None:
+    assert _polite_ko("dmesg 로그를 확인하라") == "dmesg 로그를 확인하세요"
+
+
+def test_polite_ko_rewrites_haji_mara() -> None:
+    assert _polite_ko("재시작하지 마라") == "재시작하지 마세요"
+    assert _polite_ko("재시작하지 말라.") == "재시작하지 마세요."
+
+
+def test_polite_ko_rewrites_haera() -> None:
+    assert _polite_ko("지금 바로 실행해라") == "지금 바로 실행하세요"
+
+
+def test_polite_ko_leaves_already_polite_lines_unchanged() -> None:
+    for line in ("dmesg 로그를 확인하세요.", "지원 조직에 문의하십시오.", "다시 시작합니다."):
+        assert _polite_ko(line) == line
+
+
+def test_polite_ko_leaves_english_lines_unchanged() -> None:
+    line = "Check the node dmesg log to collect evidence."
+    assert _polite_ko(line) == line
+
+
+def test_polite_ko_never_touches_a_code_span() -> None:
+    # The code span itself must survive byte-for-byte even though it CONTAINS
+    # a string that would otherwise match -- only the true end of the line,
+    # outside every backtick span, is a rewrite candidate. A code span earlier
+    # in the line neither gets rewritten nor blocks the real tail from being.
+    line = "`kubectl get pods -n 하라예제` 명령으로 상태를 확인하라"
+    rewritten = _polite_ko(line)
+    assert "`kubectl get pods -n 하라예제`" in rewritten
+    assert rewritten == "`kubectl get pods -n 하라예제` 명령으로 상태를 확인하세요"
+
+
+def test_polite_ko_bails_on_unbalanced_backticks() -> None:
+    line = "설정을 `nvidia-smi 확인하라"
+    assert _polite_ko(line) == line
+
+
+@pytest.mark.asyncio
+async def test_self_check_next_hara_renders_polite_in_recommended_actions() -> None:
+    # Integration: a self-check-sourced Korean next_check ending in the plain
+    # imperative ("...수집하라.") must render as the polite form in report
+    # section 3 -- the live incident this fix was written for.
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "OperatorRequestedAnalysis"},
+            fingerprint="polite-ko-fp",
+        )
+    )
+    detail = _detail_from(
+        request,
+        [],
+        [],
+        root_cause_candidates=[RankedCause("gpu_hardware_error", "high", 8.0)],
+        self_check_next=(
+            "해당 노드(dgx01, dgx02 등)의 dmesg 또는 NVIDIA XID 로그를 확인하여 "
+            "GPU 오류 증거를 수집하라."
+        ),
+        knowledge=ReportKnowledge(language="ko"),
+    )
+    actions = detail.split("## 3. 권장 조치", 1)[1].split("## 부록", 1)[0]
+    assert "GPU 오류 증거를 수집하세요." in actions
+    assert "수집하라" not in actions

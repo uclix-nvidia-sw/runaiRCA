@@ -1140,6 +1140,62 @@ def test_kb_insufficient_evidence_no_match_keeps_existing_line() -> None:
     assert lines == ["- No closely-matching prior knowledge for this evidence yet."]
 
 
+def test_kb_no_match_korean_is_proper_korean_not_konglish() -> None:
+    # A real ko run rendered "이 증거와 closely-matching하는 사전 지식이 아직
+    # 없습니다" -- the English source line half-translated by the LLM batch
+    # pass. The Korean rendering must be a deterministic, complete sentence
+    # with no leftover English fragment.
+    kg = KGContext(enabled=True, available=True, knowledge=_KNOWLEDGE).as_dict()
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+    lines = _kb_remediation_lines(
+        kg, candidates, "some unrelated evidence text", language="ko"
+    )
+    assert lines == ["- 이 증거와 밀접하게 일치하는 사전 지식은 아직 없습니다."]
+    assert "closely-matching" not in lines[0]
+
+
+def test_kb_no_match_knowledge_only_run_does_not_contradict_the_answer_above() -> None:
+    # A chat-adhoc knowledge-only run (no cluster evidence at all, so
+    # allow_remediation is always False for it -- see _detail_from) has no
+    # "run's evidence" to have matched against -- the report body above IS the
+    # knowledge answer. Both the generic no-match line AND the "remediation
+    # withheld" line (the one allow_remediation=False would otherwise render)
+    # talk about CLUSTER evidence and read as contradicting that answer, so
+    # a knowledge-only run gets an honest restatement instead, from
+    # _knowledge_base_lines itself -- it must win before the allow_remediation
+    # branch is even considered.
+    kg = KGContext(enabled=True, available=True, knowledge=_KNOWLEDGE).as_dict()
+    candidates = [RankedCause(family="insufficient_evidence", confidence="low", score=0.0)]
+    en = _knowledge_base_lines(
+        kg,
+        candidates,
+        "some unrelated evidence text",
+        allow_remediation=False,
+        knowledge_only=True,
+    )
+    assert en == [
+        "",
+        "### Knowledge Base (Ontology)",
+        "",
+        "- The answer above was assembled from knowledge-base matches against the "
+        "question, not cluster evidence.",
+    ]
+    ko = _knowledge_base_lines(
+        kg,
+        candidates,
+        "some unrelated evidence text",
+        allow_remediation=False,
+        language="ko",
+        knowledge_only=True,
+    )
+    assert ko[-1] == (
+        "- 위 답변은 클러스터 증거가 아니라 이 질문에 대한 지식 베이스 매칭 결과로 "
+        "구성되었습니다."
+    )
+    assert "closely-matching" not in ko[-1] and "evidence yet" not in ko[-1]
+    assert "withheld" not in "\n".join(ko)
+
+
 def test_kb_insufficient_evidence_learned_family_keeps_prefix_with_tag() -> None:
     # A matcher-only ("novel_*") family is exactly the learned/open-world case
     # is_matcher_only_family exists for -- the learned framing and the new

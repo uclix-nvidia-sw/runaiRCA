@@ -107,3 +107,22 @@ def test_fetch_runai_version_warns_only_on_failures(monkeypatch, caplog) -> None
         "Run:ai version response had no parseable version: "
         "path=/api/v1/clusters/minimal",
     ]
+
+
+def test_fetch_runai_version_uses_a_short_timeout_not_the_collector_budget(monkeypatch) -> None:
+    # A slow best-effort version read must not eat the full collector timeout
+    # budget (120s) -- it gets its own short, hardcoded ceiling.
+    captured: dict = {}
+
+    async def fake_get_json(**kwargs):
+        captured.update(kwargs)
+        return JsonResponse(url="https://runai.example/version", status_code=200, data=[])
+
+    monkeypatch.setattr(runai, "get_json", fake_get_json)
+    monkeypatch.setattr(runai, "mcp_tls_verify", lambda: True)
+    settings = SimpleNamespace(runai_base_url="https://runai.example", runai_timeout_seconds=120)
+
+    asyncio.run(runai._fetch_runai_version(settings, {}))
+
+    assert captured["timeout_seconds"] == runai._RUNAI_VERSION_TIMEOUT_SECONDS
+    assert captured["timeout_seconds"] != settings.runai_timeout_seconds

@@ -1198,6 +1198,14 @@ func cloneAnalysisRun(in *AnalysisRun) AnalysisRun {
 	out.Warnings = cloneStrings(in.Warnings)
 	out.Artifacts = cloneArtifacts(in.Artifacts)
 	out.Metadata = cloneAnyMap(in.Metadata)
+	if in.FirstCompletedAt != nil {
+		// Rebase the pointer: the live record aliases can point INTO the
+		// record itself (completeAnalysisRun once set it to &run.UpdatedAt),
+		// and a shared *time.Time lets a later completion write the memory a
+		// handler is concurrently JSON-marshalling (race caught by CI -race).
+		ts := *in.FirstCompletedAt
+		out.FirstCompletedAt = &ts
+	}
 	return out
 }
 

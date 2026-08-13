@@ -65,7 +65,12 @@ from app.schemas import AlertAnalysisRequest, AlertAnalysisResponse, SimilarInci
 from app.services.decision_tree import resolve_tree, walk_tree
 from app.services.evidence_projection import EXECUTION_METADATA_KEYS
 from app.services.general_guidance import _external_case_lines, general_guidance_lines
-from app.services.kg_enrichment import GraphRemediation, enrich, graph_remediation
+from app.services.kg_enrichment import (
+    GraphRemediation,
+    enrich,
+    external_case_cards,
+    graph_remediation,
+)
 from app.services.planner import plan_investigation
 from app.services.query_memory import QueryMemory
 from app.services.remediation import (
@@ -680,20 +685,24 @@ def _is_chat_adhoc(request: AlertAnalysisRequest) -> bool:
     """True only for the synthetic ad-hoc alert chat.go mints when an operator
     asks a general knowledge question with no matching alert -- a
     ``chat-adhoc-`` fingerprint, alertname ``OperatorRequestedAnalysis``, and
-    ``source: chat`` on both the request and the alert's own label. All four
-    markers must agree; a real alert re-run via chat, or a manual re-analysis
-    that merely carries an ``operator_prompt``, satisfies at most one or two
-    of them and stays a normal alert -- its own text remains full evidence.
+    ``source: chat`` on the alert's own label. These three are minted
+    exclusively by chat.go's ad-hoc creation path and never by a real alert.
+
+    Deliberately independent of ``request.analysis_type`` /
+    ``analysis_request_source`` -- those describe which BUTTON triggered THIS
+    run (chat vs. an operator's manual re-analysis), not what the alert IS.
+    An operator manually re-running a chat-adhoc incident still re-runs a
+    synthetic alert whose ``summary`` is their own question, not an
+    Alertmanager observation; letting the trigger flip this predicate let
+    that question text re-enter ``_alert_signature_text`` on a manual rerun
+    and mint self-evidence from the operator's own words (XID 8 in the
+    question "confirmed" by the question itself) -- the seed-honesty hole
+    this comment replaces. Identity over trigger.
     """
     alert = request.alert
     labels = alert.labels or {}
-    annotations = alert.annotations or {}
-    is_chat_source = (
-        request.analysis_type == "chat" or annotations.get("analysis_request_source") == "chat"
-    )
     return (
-        is_chat_source
-        and labels.get("alertname") == "OperatorRequestedAnalysis"
+        labels.get("alertname") == "OperatorRequestedAnalysis"
         and labels.get("source") == "chat"
         and str(alert.fingerprint or "").startswith("chat-adhoc-")
     )
@@ -2636,7 +2645,7 @@ async def self_check_stage(state: PipelineState) -> PipelineState:
                     state.root_cause_candidates[0].confidence = calibrated
                 state.self_check_caveat = str(check.get("caveat") or "").strip()
                 state.self_check_refuted = bool(check.get("refuted"))
-                state.self_check_next = str(check.get("next_check") or "").strip()
+                state.self_check_next = _polite_ko(str(check.get("next_check") or "").strip())
             state.self_check_confidence_after = state.root_cause_candidates[0].confidence
             state.progress.emit(
                 "self_check",
@@ -2695,7 +2704,7 @@ async def _resolve_refuted_top_from_existing_candidates(state: PipelineState) ->
                 replace(previous, confidence="low"),
             ]
             state.self_check_caveat = last_caveat
-            state.self_check_next = last_next
+            state.self_check_next = _polite_ko(last_next)
             state.self_check_refuted = False
             state.self_check_confidence_after = candidate.confidence
             return
@@ -2711,7 +2720,7 @@ async def _resolve_refuted_top_from_existing_candidates(state: PipelineState) ->
         *[replace(candidate, confidence="low") for candidate in alternatives],
     ]
     state.self_check_caveat = last_caveat
-    state.self_check_next = last_next
+    state.self_check_next = _polite_ko(last_next)
     state.self_check_refuted = True
     state.self_check_confidence_after = "low"
 
@@ -2733,7 +2742,7 @@ async def _self_check_if_top_changed(state: PipelineState, previous_family: str)
     if calibrated in ("low", "medium", "high"):
         current.confidence = calibrated
     state.self_check_caveat = str(check.get("caveat") or "").strip()
-    state.self_check_next = str(check.get("next_check") or "").strip()
+    state.self_check_next = _polite_ko(str(check.get("next_check") or "").strip())
     state.self_check_refuted = bool(check.get("refuted"))
     state.self_check_confidence_before = confidence_before
     state.self_check_confidence_after = current.confidence
@@ -2972,6 +2981,12 @@ async def synthesize_stage(state: PipelineState) -> PipelineState:
         next_label = "다음 확인" if getattr(settings, "language", "en") == "ko" else "Next check"
         self_check_lines.append(f"- **{next_label}**: {state.self_check_next}")
     if self_check_lines:
+        # Choke point: self_check.py's LLM-authored caveat/next_check text (and
+        # the reanalysis note) land here verbatim -- same tone pass as the
+        # numbered actions above, so a plain-imperative ending never survives
+        # regardless of which self-check field it came from.
+        if getattr(settings, "language", "en") == "ko":
+            self_check_lines = [_polite_ko(line) for line in self_check_lines]
         state.detail = _insert_before_appendix(
             state.detail, "## Self-Check\n\n" + "\n\n".join(self_check_lines)
         )
@@ -3511,7 +3526,7 @@ async def _investigate_until_settled(state: PipelineState) -> None:
                 outcome.candidates[0].family if outcome.candidates else "insufficient_evidence"
             )
         state.self_check_refuted = outcome.refuted
-        state.self_check_next = outcome.next_check
+        state.self_check_next = _polite_ko(outcome.next_check)
         _aggregate_evidence(state)
         _refresh_public_reasoning_trace(state)
         open_world = _merge_open_world_candidates(state, state.root_cause_candidates)
@@ -4762,6 +4777,8 @@ def _detail_from(
             _alert_signature_text(request),
             knowledge.masker,
             allow_remediation=allow_cause_specific_actions,
+            language=knowledge.language,
+            knowledge_only=chat_adhoc_knowledge is not None,
         )
     )
     lines.extend(_runtime_knowledge_hint_lines(runtime_knowledge_hints or [], knowledge.masker))
@@ -5257,8 +5274,22 @@ async def _chat_adhoc_knowledge_ladder_lines(
     # (state.kg_context.case_cards) -- labelled as historical support cases,
     # reusing general_guidance's own renderer (foreign-language marking,
     # what-helped/what-didn't) instead of a second implementation of it.
+    # That retrieval matches OBSERVED EVIDENCE + component identity, so a
+    # question that names a case's own error signature in its wording (no
+    # cluster evidence to match against) would otherwise surface nothing --
+    # also run the SAME exact signature matcher against the question text
+    # itself and union the hits (deduped by case_id, capped at 2 total).
     case_cards = list(getattr(state.kg_context, "case_cards", None) or [])
     external_cards = [card for card in case_cards if card.get("kind") == "external"]
+    if len(external_cards) < 2:
+        question_cards, _warnings = await external_case_cards(settings, question, limit=2)
+        seen_ids = {cid for card in external_cards if (cid := card.get("case_id"))}
+        for card in question_cards:
+            cid = card.get("case_id")
+            if card.get("kind") == "external" and cid and cid not in seen_ids:
+                external_cards.append(card)
+                seen_ids.add(cid)
+        external_cards = external_cards[:2]
     if external_cards:
         rendered = _external_case_lines(external_cards, language, masker)
         if rendered:
@@ -5597,6 +5628,53 @@ def _xid_identity_clause(
         return ""
     name = _safe_line(name, limit=80, masker=masker)
     return f"{name} ({severity})" if severity else name
+
+
+# The ontology's XID fix text is the catalog's `resolution_buckets` sentence
+# (agent/knowledge/xid_catalog.yaml, owner-curated -- never edited here),
+# verbatim. Translating it via the LLM batch pass is fine once (the first
+# fix for a code, whose header still carries an English identity clause that
+# needs the same pass), but a REPEATED fix on the same code -- see the bare
+# vs. full header split in _numbered_actions below -- has a bare "(XID N)"
+# header with nothing left to translate, so it is safe to render fully in
+# fixed, polite Korean instead of depending on the translator's tone for a
+# closed, well-known set of resolution codes. Keys are the exact English
+# sentences from the catalog; unmapped/long-form sentences (the multi-clause
+# WORKFLOW_* essays) fall through to the translator unchanged.
+_XID_ACTION_KO: dict[str, str] = {
+    "The application should be restarted RESET_GPU or RESTART_BM is not deemed necessary.": (
+        "애플리케이션을 재시작하세요. RESET_GPU 또는 RESTART_BM은 필요하지 않습니다."
+    ),
+    "Please contact your support organization for further investigation.": (
+        "추가 조사를 위해 지원 조직에 문의하세요."
+    ),
+    "No Action required": "별도 조치가 필요하지 않습니다.",
+    "Refer to https://docs.nvidia.com/deploy/gpu-debug-guidelines/index.html for GPU Reset "
+    "capabilities & limitations RESTART_BM is not deemed necessary.": (
+        "GPU 재설정 기능 및 제한 사항은 NVIDIA GPU 디버그 가이드라인 문서를 참고하세요. "
+        "RESTART_BM은 필요하지 않습니다."
+    ),
+    "Check to ensure that device seating and all applicable connections to it are secure.": (
+        "장치의 장착 상태와 관련 커넥터 연결이 안전한지 확인하세요."
+    ),
+    "Restart bare metal, system should be restarted": "베어메탈을 재시작하세요.",
+    "VM owning the affected GPU must be restarted RESET_GPU or RESTART_BM is not deemed "
+    "necessary.": (
+        "해당 GPU를 사용하는 VM을 재시작하세요. RESET_GPU 또는 RESTART_BM은 필요하지 않습니다."
+    ),
+    "If UVM/vGPU is being utilized, RESET_GPU; otherwise IGNORE": (
+        "UVM/vGPU를 사용 중이라면 RESET_GPU를 수행하고, 그렇지 않다면 별도 조치가 필요하지 "
+        "않습니다."
+    ),
+    "Follow XID 154 reported guidance": "XID 154에 안내된 조치를 따르세요.",
+    "Check other logs as this is likely a secondary indicator of some action or fault "
+    "(may be OOB).": (
+        "다른 조치나 결함의 2차 지표일 가능성이 있으므로 다른 로그도 함께 확인하세요."
+    ),
+    "Investigate SW or user initiated if unexpected": (
+        "예상치 못한 상황이라면 소프트웨어 또는 사용자 조작 여부를 조사하세요."
+    ),
+}
 
 
 def _xid_diagnostic_guidance_lines(
@@ -6606,8 +6684,24 @@ def _numbered_actions(
             # the operator reads English rather than nothing.
             label = "root XID" if code in root_codes else "XID"
             identity = _xid_identity_clause(graph_fixes, code, masker)
-            header = f"{label} {code} — {identity}" if identity else f"{label} {code}"
-            fixes = [f"({header}) {fix}" for fix in graph_fixes.xid_fixes[code]]
+            full_header = f"{label} {code} — {identity}" if identity else f"{label} {code}"
+            bare_header = f"{label} {code}"
+            fixes = []
+            for index, fix in enumerate(graph_fixes.xid_fixes[code]):
+                # Only the FIRST fix for a code carries the identity clause --
+                # repeating "(XID 8 — GPU has stopped processing)" on every
+                # sibling fix (e.g. immediate_action + investigatory_action,
+                # RESTART_APP + CONTACT_SUPPORT) was pure noise once the first
+                # line had already named the fault.
+                if index == 0:
+                    fixes.append(f"({full_header}) {fix}")
+                    continue
+                # A bare header carries no English prose of its own (unlike
+                # full_header's identity clause), so it is safe to render a
+                # known resolution-bucket sentence as fixed, polite Korean
+                # right here instead of leaving its tone to the translator.
+                ko_fix = _XID_ACTION_KO.get(fix.strip()) if knowledge.language == "ko" else None
+                fixes.append(f"({bare_header}) {ko_fix or fix}")
             specific_actions += len(fixes)
             ordered.extend(fixes)
     ordered.extend(
@@ -6629,6 +6723,13 @@ def _numbered_actions(
         action = _safe_line(
             fill_placeholders(str(action), observed), limit=420, masker=action_masker
         )
+        # Choke point: every rendered action line, from every source above
+        # (self-check's next_check, XID/symptom/known-issue/component
+        # guidance, the translator's Korean output), gets the same
+        # plain-imperative -> polite tone pass. English lines/segments and
+        # already-polite endings pass through unchanged.
+        if knowledge.language == "ko":
+            action = _polite_ko(action)
         if not action or action in seen:
             continue
         seen.add(action)
@@ -8423,6 +8524,8 @@ def _knowledge_base_lines(
     masker: Masker | None = None,
     *,
     allow_remediation: bool = True,
+    language: str = "en",
+    knowledge_only: bool = False,
 ) -> list[str]:
     if not kg_context or not kg_context.get("enabled"):
         return []
@@ -8519,10 +8622,31 @@ def _knowledge_base_lines(
                 limit=320,
             )
             body.append(f"  - {incident_id}: {summary}")
-    if allow_remediation:
+    if knowledge_only:
+        # A chat-adhoc knowledge-only run (no cluster evidence -- see
+        # _is_chat_adhoc/ChatAdhocKnowledge) always has allow_remediation=False
+        # (it is derived from the same empty eligible_support_ids that gates
+        # chat_adhoc_knowledge), so it would otherwise always hit the
+        # "remediation is withheld ..." branch below -- a line about CLUSTER
+        # evidence that reads as contradicting sections 1-3, which already ARE
+        # the knowledge answer, assembled from the question. Say so plainly
+        # instead.
+        body.append(
+            "- 위 답변은 클러스터 증거가 아니라 이 질문에 대한 지식 베이스 매칭 결과로 "
+            "구성되었습니다."
+            if language == "ko"
+            else "- The answer above was assembled from knowledge-base matches against "
+            "the question, not cluster evidence."
+        )
+    elif allow_remediation:
         body.extend(
             _kb_remediation_lines(
-                kg_context, candidates, observed_text, fuzzy_query, active_masker
+                kg_context,
+                candidates,
+                observed_text,
+                fuzzy_query,
+                active_masker,
+                language=language,
             )
         )
     elif kg_context.get("knowledge"):
@@ -8541,6 +8665,8 @@ def _kb_remediation_lines(
     observed_text: str,
     fuzzy_query: str = "",
     masker: Masker | None = None,
+    *,
+    language: str = "en",
 ) -> list[str]:
     knowledge = kg_context.get("knowledge") or {}
     if not knowledge:
@@ -8600,7 +8726,12 @@ def _kb_remediation_lines(
             "family prior from the knowledge base (no verified action recorded)."
         ]
     # No symptom keyword matched the observed evidence: don't dump a generic family
-    # checklist as if it were a match — say so plainly.
+    # checklist as if it were a match — say so plainly. (The chat-adhoc
+    # knowledge-only rewording of this line lives one level up, in
+    # _knowledge_base_lines -- a knowledge-only run always has
+    # allow_remediation=False, so it never reaches this function at all.)
+    if language == "ko":
+        return ["- 이 증거와 밀접하게 일치하는 사전 지식은 아직 없습니다."]
     return ["- No closely-matching prior knowledge for this evidence yet."]
 
 
@@ -8947,6 +9078,59 @@ def _safe_line(value: object, *, limit: int, masker: Masker | None = None) -> st
     active_masker = masker or build_masker(())
     text = " ".join(active_masker.mask_text(str(value or "")).split())
     return textwrap.shorten(text, width=limit, placeholder="…") if text else text
+
+
+# Sentence-final plain-imperative endings -> polite form. Checked longest/most
+# specific first so "하지 마라"/"하지 말라" (which do NOT end in 하라/해라) never
+# fall through to a less specific rule by accident, though none of these
+# suffixes actually overlap.
+_POLITE_KO_ENDINGS = (
+    ("하지 마라", "하지 마세요"),
+    ("하지마라", "하지 마세요"),
+    ("하지 말라", "하지 마세요"),
+    ("하지말라", "하지 마세요"),
+    ("해라", "하세요"),
+    ("하라", "하세요"),
+)
+# Trailing punctuation/whitespace to look past when checking the ending, kept
+# verbatim on output ("수집하라." -> "수집하세요.", not "수집하세요").
+_POLITE_KO_TRAILING_RE = re.compile(r"([.!?~…]*\s*)$")
+
+
+def _polite_ko_tail(text: str) -> str:
+    trailing = _POLITE_KO_TRAILING_RE.search(text).group(1)
+    stem = text[: len(text) - len(trailing)] if trailing else text
+    for ending, polite in _POLITE_KO_ENDINGS:
+        if stem.endswith(ending):
+            return stem[: -len(ending)] + polite + trailing
+    return text
+
+
+def _polite_ko(line: str) -> str:
+    """Rewrite a rendered Korean line's plain-imperative sentence ending
+    (~하라/~해라/~하지 마라/~말라) to polite form (~하세요/~하지 마세요).
+
+    The single choke point for report-rendered guidance/action/check text,
+    regardless of source (self-check's LLM-generated next_check/caveat, the
+    English->Korean batch translator, curated catalog actions, future
+    additions) -- so tone is a property of RENDERING, not of every producer
+    getting it right independently. Deliberately narrow: only the very end of
+    the line (outside any backtick code span) is a candidate, so a quoted
+    command, log line, or mid-sentence text is never touched; a line with
+    unbalanced backticks is left alone rather than guessed at. An
+    already-polite ending (하세요/하십시오/합니다/...) or an English line simply
+    matches no suffix here and passes through unchanged.
+    """
+    if not line:
+        return line
+    segments = line.split("`")
+    if len(segments) % 2 == 0:  # unbalanced backticks -- don't guess spans
+        return line
+    rewritten = _polite_ko_tail(segments[-1])
+    if rewritten == segments[-1]:
+        return line
+    segments[-1] = rewritten
+    return "`".join(segments)
 
 
 def _investigation_plan_lines(plan: InvestigationPlan | None) -> list[str]:

@@ -30,6 +30,6 @@ describe('ChatDashboard', () => {
     expect(markup).not.toContain('Auto (');
     expect(markup).toContain('Select an incident…');
     expect(markup).toContain('INC-42 · GPU workload is pending');
-    expect(markup).toContain('New question? Press the RCA button');
+    expect(markup).toContain('새로운 질문은 RCA 버튼으로');
   });
 });

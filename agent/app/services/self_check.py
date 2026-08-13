@@ -550,6 +550,12 @@ async def _llm_refute(
         "The caveat is one or two sentences naming the strongest doubt and the single "
         "check that would settle it; next_check is that single settling check phrased "
         "as one concrete instruction to the operator."
+        + (
+            " Write Korean in polite form (~하세요/~합니다), never the plain "
+            "imperative (~하라/~해라)."
+            if ko
+            else ""
+        )
     )
     user = (
         f"Proposed root cause family: {top.family}\n"

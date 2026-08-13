@@ -2935,6 +2935,16 @@ td span.occurrence-pill {
   font-weight: 400;
 }
 
+.evaluation-knowledge-only-note {
+  margin: 0 0 0.6rem;
+  padding: 0.5rem 0.7rem;
+  border: 1px solid #e8dcb8;
+  border-radius: 0.55rem;
+  background: #fdfaf1;
+  color: #6b5b1e;
+  font-size: 0.78rem;
+}
+
 .evaluation-form {
   display: grid;
   gap: 1rem;

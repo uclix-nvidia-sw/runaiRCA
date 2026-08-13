@@ -42,10 +42,14 @@ receiver matched or that Alertmanager could reach the Backend service.
 Every accepted webhook alert is stored, correlated into an incident, and then
 starts an asynchronous Agent `/analyze` call. Operators can also create analysis
 runs manually from incident analysis, comment/feedback reanalysis, or chat
-requests that explicitly ask for a new analysis. When chat does not specify a
-target incident or alert, Backend selects the latest non-resolved alert if one
-exists. The Analysis Dashboard is backed by `/api/v1/analysis-runs`; if that
-list is empty, no analysis trigger has reached the Backend yet.
+requests that explicitly ask for a new analysis (the RCA button). That button
+first honors whatever alert or incident is already selected in the UI. With no
+explicit selection, it targets the latest non-resolved alert only when the chat
+message itself references an existing alert or incident (Korean/English
+keywords such as "알람"/"최근" or "alert"/"latest"); otherwise it creates a
+fresh ad-hoc incident from the message content and analyzes that instead. The
+Analysis Dashboard is backed by `/api/v1/analysis-runs`; if that list is empty,
+no analysis trigger has reached the Backend yet.
 
 When an already analyzed alert auto-refires within
 `AUTO_REANALYZE_COOLDOWN_MINUTES` (default `360`), Backend returns its existing

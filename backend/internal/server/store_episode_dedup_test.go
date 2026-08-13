@@ -54,6 +54,34 @@ func TestSameEpisodeResendReusesIncidentDespiteActivityDrift(t *testing.T) {
 	}
 }
 
+func TestChatAdHocResendWithoutStartsAtDoesNotRefire(t *testing.T) {
+	store := NewStore()
+	alert := Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "OperatorRequestedAnalysis", "source": "chat"},
+		Fingerprint: "chat-adhoc-same-question",
+	}
+
+	first := store.UpsertAlertResult(AlertmanagerWebhook{GroupKey: alert.Fingerprint}, alert)
+	resend := store.UpsertAlertResult(AlertmanagerWebhook{GroupKey: alert.Fingerprint}, alert)
+	if resend.NewIncident || resend.Incident.IncidentID != first.Incident.IncidentID ||
+		resend.Incident.AlertCount != 1 || resend.Alert.OccurrenceCount != 1 {
+		t.Fatalf("same chat question must reuse one episode without an occurrence bump, first=%+v resend=%+v", first, resend)
+	}
+}
+
+func TestNewerStartsAtStillRefires(t *testing.T) {
+	store := NewStore()
+	webhook := AlertmanagerWebhook{GroupKey: "episode"}
+	first := store.UpsertAlertResult(webhook, flapAlert("2026-07-24T05:58:37Z"))
+	refire := store.UpsertAlertResult(webhook, flapAlert("2026-07-24T06:00:37Z"))
+
+	if refire.Incident.IncidentID != first.Incident.IncidentID ||
+		refire.Incident.AlertCount != 2 || refire.Alert.OccurrenceCount != 2 {
+		t.Fatalf("newer Alertmanager StartsAt must bump the reused incident exactly once, first=%+v refire=%+v", first, refire)
+	}
+}
+
 func TestNewEpisodeOutsideFlapWindowStillCreatesNewIncident(t *testing.T) {
 	store := NewStore()
 	webhook := AlertmanagerWebhook{GroupKey: "episode"}

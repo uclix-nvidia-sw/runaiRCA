@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -935,6 +936,13 @@ func TestExcerptDoesNotSplitUTF8(t *testing.T) {
 	}
 	if got != "한..." {
 		t.Fatalf("excerpt should stop at rune boundary, got %q", got)
+	}
+}
+
+func TestAgentRuntimeContextLeavesChatModeToAgent(t *testing.T) {
+	runtime := NewServer().agentRuntimeContext()
+	if _, ok := runtime["chat_mode"]; ok {
+		t.Fatalf("backend must leave chat mode reporting to the agent service, got %+v", runtime)
 	}
 }
 
@@ -3539,6 +3547,12 @@ func TestRecurrenceStatsAndIncidentSimilarRecentCount(t *testing.T) {
 	store.ApplyAnalysis(deletedAlert.AlertID, AgentAnalysisResponse{AnalysisSummary: "Deleted queue block."})
 	approveIncidentForTest(t, store, deleted.IncidentID)
 	store.SoftDeleteIncident(deleted.IncidentID)
+	store.UpsertAlert(AlertmanagerWebhook{GroupKey: "chat-adhoc-recurrence"}, Alert{
+		Status:      "firing",
+		Labels:      map[string]string{"alertname": "OperatorRequestedAnalysis", "source": "chat"},
+		Fingerprint: "chat-adhoc-recurrence",
+		StartsAt:    now.Add(-12 * time.Hour).Format(time.RFC3339),
+	})
 
 	stats := store.RecurrenceStats(7, now)
 	if stats.Total != 2 || stats.Recurred != 1 || stats.Rate != 0.5 {
@@ -3662,6 +3676,62 @@ func TestChatAdHocAnalysisDedupesRepeatedSubmission(t *testing.T) {
 	elsewhere := send(question, "conv-2")
 	if elsewhere.AnalysisRun.TargetID == first.AnalysisRun.TargetID {
 		t.Fatalf("the same question in another conversation must not merge threads")
+	}
+}
+
+func TestChatAdHocAnalysisReasksCompletedQuestion(t *testing.T) {
+	server := NewServer()
+	agentRequests := make(chan AgentAnalysisRequest, 2)
+	server.client = &http.Client{Transport: operatorRoundTripper(func(r *http.Request) (*http.Response, error) {
+		var req AgentAnalysisRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode agent analysis request: %v", err)
+		}
+		agentRequests <- req
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body: io.NopCloser(strings.NewReader(
+				`{"status":"ok","analysis_summary":"Fresh ad-hoc RCA completed.","analysis_detail":"## Root Cause\n\nFresh ad-hoc analysis.","analysis_quality":"medium"}`,
+			)),
+		}, nil
+	})}
+	server.agentURL = "http://agent.test"
+
+	send := func() ChatResponse {
+		payload, _ := json.Marshal(ChatRequest{Message: "같은 문제를 다시 분석해줘", ConversationID: "conv-reask", Analyze: true})
+		rec := httptest.NewRecorder()
+		server.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v1/chat", bytes.NewReader(payload)))
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("expected chat 202, got %d: %s", rec.Code, rec.Body.String())
+		}
+		var response ChatResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatalf("decode chat response: %v", err)
+		}
+		return response
+	}
+
+	first := send()
+	firstRequest := <-agentRequests
+	if first.AnalysisRun == nil {
+		t.Fatalf("expected first analysis run, got %+v", first)
+	}
+	waitForRunIDStatus(t, server, first.AnalysisRun.RunID, "complete")
+
+	second := send()
+	secondRequest := <-agentRequests
+	if second.AnalysisRun == nil || second.AnalysisRun.RunID != first.AnalysisRun.RunID || second.AnalysisRun.Status != "analyzing" {
+		t.Fatalf("completed re-ask must restart the reused run row: first=%+v second=%+v", first.AnalysisRun, second.AnalysisRun)
+	}
+	if firstRequest.Alert.Annotations["operator_prompt"] != "같은 문제를 다시 분석해줘" ||
+		secondRequest.Alert.Annotations["operator_prompt"] != "같은 문제를 다시 분석해줘" {
+		t.Fatalf("both agent attempts must receive the operator prompt: first=%q second=%q",
+			firstRequest.Alert.Annotations["operator_prompt"], secondRequest.Alert.Annotations["operator_prompt"])
+	}
+	waitForRunIDStatus(t, server, second.AnalysisRun.RunID, "complete")
+	if runs := server.store.ListAnalysisRuns(); len(runs) != 1 {
+		t.Fatalf("completed re-ask should reuse one durable run row, got %+v", runs)
 	}
 }
 

@@ -1188,6 +1188,12 @@ async def _llm_refine(
     ][:5]
     narrative = data.get("narrative")
     hypotheses = _coerce_hypotheses(data.get("hypotheses"), masker)
+    # Whether the LLM itself supplied a usable hypothesis list -- captured before
+    # the deterministic fallback below overwrites an empty/unusable one, so
+    # llm_refined can tell "the LLM changed the leads" from "valid JSON, nothing
+    # usable in it" (the latter must NOT be presented downstream as an
+    # LLM interpretation of the request -- see _plan_families in pipeline.py).
+    llm_supplied_hypotheses = bool(hypotheses)
     component_entry = (
         architecture.get(data.get("component"))
         if not plan.component and isinstance(data.get("component"), str)
@@ -1241,7 +1247,11 @@ async def _llm_refine(
         strategy=strategy if strategy in ("targeted", "breadth_first") else plan.strategy,
         used_similarity=plan.used_similarity,
         used_ontology=plan.used_ontology,
-        llm_refined=True,
+        # True only when the LLM actually replaced/reordered the leads: either it
+        # supplied its own usable hypotheses, or it named a catalog component whose
+        # entry prepends its family. Valid JSON that coerces to nothing usable keeps
+        # the deterministic hypotheses AND must not claim credit for them.
+        llm_refined=llm_supplied_hypotheses or component_entry is not None,
         narrative=refined_narrative,
         matched_alert=plan.matched_alert,
         component=component,

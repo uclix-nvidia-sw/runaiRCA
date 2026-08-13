@@ -121,7 +121,7 @@ export function FloatingChat({
 
           <footer className="chat-compose">
             {!chat.canSendOrdinary && (
-              <small className="chat-send-hint">Select an incident to chat, or use RCA for a new question.</small>
+              <small className="chat-send-hint">대화하려면 인시던트를 선택하세요. 새 질문은 RCA 버튼을 이용하세요.</small>
             )}
             <textarea
               value={chat.input}
