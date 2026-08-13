@@ -63,7 +63,7 @@ Backend and agent read these at startup; Helm maps them from the values below.
 | `PROMETHEUS_DATASOURCE_UID` / `LOKI_DATASOURCE_UID` | Grafana datasource UIDs for the Prometheus/Loki MCP tools; empty by default (Helm keys `grafanaMcp.prometheusDatasourceUid` / `lokiDatasourceUid`) |
 | `RUNAI_CLIENT_ID` | Run:ai application client ID |
 | `RUNAI_CLIENT_SECRET` | Run:ai application client secret |
-| `RUNAI_TOKEN_URL` | Optional OAuth token URL for Run:ai client credentials |
+| `RUNAI_TOKEN_URL` | Optional token endpoint override for unusual deployments. When empty, endpoints are derived from `RUNAI_BASE_URL`, starting with `/api/v1/token` |
 | `RUNAI_WORKLOADS_PATH` | Run:ai workloads API path, default `/api/v1/workloads` |
 | `RUNAI_PROJECTS_PATH` | Run:ai projects API path, default `/api/v1/projects` |
 | `RUNAI_QUEUES_PATH` | Run:ai queues API path, default `/api/v1/queues` |
@@ -200,7 +200,7 @@ Frequently tuned Helm values:
 | `agent.serviceAccount.annotations` | ServiceAccount annotations for workload identity integrations |
 | `{backend,frontend,postgresql}.automountServiceAccountToken` | Disable Kubernetes API token mounts for pods that do not need cluster API access; default `false` |
 | `agent.automountServiceAccountToken` | Agent Kubernetes API token mount; default `true` because direct Kubernetes collection uses the service account token |
-| `agent.env.runaiBaseUrl` / `agent.env.runaiTokenUrl` | Run:ai API and optional OAuth token endpoint; `agent.env.runaiBaseUrl` has no default and is required when `runaiMcp.enabled=true`; provide `secrets.runaiBearerToken` or client credentials to avoid Run:ai HTTP 401. Use the control plane's client-credentials endpoint (for example, `/api/v1/token`), not an interactive `/auth/token` route. |
+| `agent.env.runaiBaseUrl` / `agent.env.runaiTokenUrl` | Run:ai API and optional token endpoint override; `agent.env.runaiBaseUrl` has no default and is required when `runaiMcp.enabled=true`. With client credentials, the token endpoint is automatically derived from `runaiBaseUrl`, starting with the documented `/api/v1/token`; set `runaiTokenUrl` only for unusual deployments. |
 | `runaiMcp.oidcIssuerUrl` | Optional token `iss` URL for the official Run:ai MCP. Set it when `<runaiBaseUrl>/.well-known/openid-configuration` returns HTML: an in-pod proxy resolves only discovery through `<issuer>/.well-known/openid-configuration` while normal Run:ai API calls remain on `agent.env.runaiBaseUrl`. |
 | `agent.env.runaiWorkloadsPath`, `runaiProjectsPath`, `runaiQueuesPath` | Run:ai API path overrides for different Run:ai versions |
 | `agent.env.runaiLogNamespaces` | Namespaces for Run:ai control-plane/backend logs, default `runai,runai-backend` |

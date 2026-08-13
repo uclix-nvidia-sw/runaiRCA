@@ -82,6 +82,18 @@ async def _fetch_runai_version(settings: Settings, headers: dict[str, str]) -> s
         headers=headers,
         verify=mcp_tls_verify(),
     )
+    if resp.status_code in {401, 403} and _can_refresh_runai_token(settings):
+        retry_headers, _retry_warnings = await _runai_headers(
+            settings, prefer_oauth=True
+        )
+        if retry_headers.get("Authorization"):
+            resp = await get_json(
+                base_url=settings.runai_base_url,
+                path=_RUNAI_VERSION_PATH,
+                timeout_seconds=_RUNAI_VERSION_TIMEOUT_SECONDS,
+                headers=retry_headers,
+                verify=mcp_tls_verify(),
+            )
     if not resp.ok:
         _log.warning(
             "Run:ai version request failed: path=%s status=%s error=%s",
@@ -366,9 +378,10 @@ class RunAICollector:
                 )
                 if retry_headers.get("Authorization"):
                     auth_warnings.append(
-                        "Run:ai returned HTTP 401; refreshed OAuth token and retried once."
+                        "Run:ai returned HTTP 401; refreshed the access token and retried once."
                     )
                     auth_warnings.extend(retry_warnings)
+                    headers = retry_headers
                     query_results = _validated_runai_query_results(
                         await _collect_runai_responses(
                             self._settings, target, retry_headers
@@ -522,22 +535,18 @@ async def _runai_headers(
     settings: Settings, *, prefer_oauth: bool = False
 ) -> tuple[dict[str, str], list[str]]:
     warnings: list[str] = []
-    token = "" if prefer_oauth else settings.runai_bearer_token
-    if (
-        not token
-        and settings.runai_client_id
-        and settings.runai_client_secret
-        and (settings.runai_token_url or settings.runai_base_url)
-    ):
+    if settings.runai_client_id and settings.runai_client_secret:
         token = await _cached_runai_token(
             settings, warnings, force_refresh=prefer_oauth
         )
-    elif not token and (settings.runai_client_id or settings.runai_client_secret):
-        warnings.append(
-            "Run:ai client credential configuration is incomplete. "
-            "Set both RUNAI_CLIENT_ID and RUNAI_CLIENT_SECRET; RUNAI_TOKEN_URL is optional "
-            "when RUNAI_BASE_URL can infer a token endpoint."
-        )
+    else:
+        token = "" if prefer_oauth else settings.runai_bearer_token
+        if settings.runai_client_id or settings.runai_client_secret:
+            warnings.append(
+                "Run:ai application credential configuration is incomplete. "
+                "Set both RUNAI_CLIENT_ID and RUNAI_CLIENT_SECRET; RUNAI_TOKEN_URL is optional "
+                "when RUNAI_BASE_URL can infer a token endpoint."
+            )
 
     headers = {"Accept": "application/json"}
     if token:
@@ -545,8 +554,9 @@ async def _runai_headers(
     elif settings.runai_base_url:
         warnings.append(
             "Run:ai API URL is configured, but no Authorization header could be built. "
-            "Set RUNAI_BEARER_TOKEN or configure RUNAI_CLIENT_ID and "
-            "RUNAI_CLIENT_SECRET; RUNAI_TOKEN_URL is an optional endpoint override."
+            "Configure both RUNAI_CLIENT_ID and RUNAI_CLIENT_SECRET for token exchange, "
+            "or set RUNAI_BEARER_TOKEN when application credentials are not configured; "
+            "RUNAI_TOKEN_URL is an optional endpoint override."
         )
     return headers, warnings
 
@@ -612,6 +622,21 @@ def _runai_token_cache_key(settings: Settings) -> tuple[str, str, str, str]:
 async def _request_runai_token(settings: Settings, warnings: list[str]) -> str:
     attempts: list[str] = []
     for url in _runai_token_urls(settings):
+        app_response = await post_oauth_token(
+            url=url,
+            timeout_seconds=settings.runai_timeout_seconds,
+            json_body={
+                "grantType": "app_token",
+                "appID": settings.runai_client_id,
+                "appSecret": settings.runai_client_secret,
+            },
+            headers={"Content-Type": "application/json"},
+            verify=mcp_tls_verify(),
+        )
+        if app_response.ok:
+            return app_response.token
+        attempts.append(f"{url} app-json={app_response.error or 'missing access token'}")
+
         json_response = await post_oauth_token(
             url=url,
             timeout_seconds=settings.runai_timeout_seconds,
@@ -659,8 +684,9 @@ def _runai_token_urls(settings: Settings) -> list[str]:
     if base_url:
         urls.extend(
             [
-                f"{base_url}/auth/realms/runai/protocol/openid-connect/token",
                 f"{base_url}/api/v1/token",
+                f"{base_url}/api/v2/token",
+                f"{base_url}/auth/realms/runai/protocol/openid-connect/token",
                 f"{base_url}/api/v1/auth/token",
             ]
         )

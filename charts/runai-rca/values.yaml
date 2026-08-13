@@ -498,6 +498,8 @@ agent:
     maxRcaRepairAttempts: 3
     rcaHarnessPassScore: 70
     runaiBaseUrl: ""
+    # Optional override for unusual deployments. Empty derives token endpoints
+    # from runaiBaseUrl, trying the documented /api/v1/token endpoint first.
     runaiTokenUrl: ""
     # TLS policy for MCP transports, direct datasource fallbacks, and the
     # Run:ai token exchange. Verification is ON by default; point

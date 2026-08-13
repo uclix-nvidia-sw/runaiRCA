@@ -213,6 +213,83 @@ def test_no_false_match() -> None:
     assert match_runai_known_issues(catalog, "a perfectly healthy cluster log line") == []
 
 
+def test_match_titles_finds_a_question_pasting_the_full_issue_title() -> None:
+    # rung b of the chat-adhoc knowledge ladder: an operator's question may
+    # quote a known issue's TITLE instead of any of its error-string keywords
+    # -- match_titles is the question-only escape hatch for that.
+    catalog = [
+        {
+            "issue": "Distributed Training Locked hostPath Policy Rejected In UI",
+            "family": "runai_scheduling_quota",
+            "keywords": ["administrator prohibited modifying", "masterspec.storage.hostpath"],
+            "reason": "The UI enforces a locked hostPath policy for the master.",
+            "actions": ["Use the CLI or API to submit the job instead."],
+            "affected_version": "",
+            "fixed_version": "",
+            "refs": [],
+        }
+    ]
+    question = "Distributed Training Locked hostPath Policy Rejected In UI 이거 왜 이러는거야?"
+
+    # Evidence-path guard: the default keyword-only match must NOT see a title.
+    assert match_runai_known_issues(catalog, question) == []
+
+    hits = match_runai_known_issues(catalog, question, match_titles=True)
+    assert [h["issue"] for h in hits] == [
+        "Distributed Training Locked hostPath Policy Rejected In UI"
+    ]
+    assert (
+        "distributed training locked hostpath policy rejected in ui" in hits[0]["matched_keywords"]
+    )
+
+
+def test_match_titles_does_not_change_a_keyword_hit() -> None:
+    # No duplicate entries/keywords when a run already matched by keyword.
+    catalog = load_runai_known_issues(CATALOG)
+    text = "Error: the administrator prohibited modifying item 'project-data'"
+    without_titles = match_runai_known_issues(catalog, text)
+    with_titles = match_runai_known_issues(catalog, text, match_titles=True)
+    assert with_titles == without_titles
+
+
+def test_include_fixed_is_the_single_choke_point_for_version_suppression() -> None:
+    # pipeline._suppress_fixed_known_issues annotates (never drops) an entry
+    # already fixed in the running Run:ai version; the matcher is where that
+    # annotation actually stops it from surfacing -- by default, everywhere.
+    catalog = [
+        {
+            "issue": "bug fixed already",
+            "family": "runai_scheduling_quota",
+            "keywords": ["some rare error string"],
+            "actions": [],
+            "_fixed_in_running": True,
+            "_running_version": "2.23.71",
+            "fixed_version": "2.23.60",
+        }
+    ]
+    text = "log line containing some rare error string"
+
+    # Evidence-path guard: identical to the old filter's observable behavior.
+    assert match_runai_known_issues(catalog, text) == []
+    assert match_runai_known_issues(catalog, text, fuzzy_query=text) == []
+
+    # Question path opts in explicitly.
+    hits = match_runai_known_issues(catalog, text, include_fixed=True)
+    assert [h["issue"] for h in hits] == ["bug fixed already"]
+    assert hits[0]["_fixed_in_running"] is True
+    assert hits[0]["_running_version"] == "2.23.71"
+
+
+def test_include_fixed_does_not_affect_unannotated_entries() -> None:
+    # An entry with no _fixed_in_running marker (running version was unknown,
+    # or it isn't fixed yet) matches identically regardless of include_fixed.
+    catalog = load_runai_known_issues(CATALOG)
+    text = "Error: the administrator prohibited modifying item 'project-data'"
+    assert match_runai_known_issues(catalog, text) == match_runai_known_issues(
+        catalog, text, include_fixed=True
+    )
+
+
 def test_missing_file_is_empty() -> None:
     assert load_runai_known_issues("/nope/does-not-exist.yaml") == []
 

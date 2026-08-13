@@ -1749,7 +1749,12 @@ def _sync_error(exc: Exception) -> str:
 
 
 def match_runai_known_issues(
-    catalog: list[dict[str, Any]], observed_text: str, *, fuzzy_query: str = ""
+    catalog: list[dict[str, Any]],
+    observed_text: str,
+    *,
+    fuzzy_query: str = "",
+    match_titles: bool = False,
+    include_fixed: bool = False,
 ) -> list[dict[str, Any]]:
     """Known-issue entries whose signature keyword appears in the evidence text.
 
@@ -1757,13 +1762,34 @@ def match_runai_known_issues(
     match — one incident can hit more than one known issue. Known support cases
     stay exact-signature only: fuzzy recall here polluted reports with unrelated
     case notes that shared generic GPU/workload words.
+
+    ``match_titles`` additionally matches an entry's own ``issue`` title as a
+    whole phrase. It exists ONLY for a human operator's question, which may
+    quote a known issue's title instead of its error-string keywords -- the
+    evidence path (an alert's own text/logs) must never match on prose, so
+    every other caller leaves this False.
+
+    ``include_fixed`` is the single choke point for version-aware suppression
+    (pipeline._suppress_fixed_known_issues annotates, never drops, an entry
+    already fixed in the cluster's running Run:ai version): by default an
+    annotated entry (``_fixed_in_running``) is skipped here, matching the old
+    filter's observable precision for every evidence-path caller. Only the
+    chat ladder's question path sets this True, so it can still show the
+    knowledge with a version caveat instead of nothing.
     """
     text = (observed_text or "").lower()
     if not text or not catalog:
         return []
     hits = []
     for entry in catalog:
+        if not include_fixed and entry.get("_fixed_in_running"):
+            continue
         matched, _negated = _keyword_hits(text, entry["keywords"])
+        if match_titles:
+            title = " ".join(str(entry.get("issue") or "").split()).lower()
+            if title and title not in matched:
+                title_hits, _title_negated = _keyword_hits(text, [title])
+                matched = matched + title_hits
         if matched:
             hits.append({**entry, "matched_keywords": matched})
     return hits

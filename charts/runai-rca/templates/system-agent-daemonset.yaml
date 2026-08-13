@@ -181,6 +181,14 @@ spec:
       labels:
         {{- include "runai-rca.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: system-agent
+      annotations:
+        # SYSTEM_AGENT_TOKEN is frozen at pod start, and this DaemonSet's image is
+        # a pinned base image, so nothing else would ever roll it. The agent side
+        # DOES roll every release (its tag follows appVersion), so a changed token
+        # would leave the two disagreeing and node-log reads failing 401 in silence.
+        # Hashes $token itself, not secret.yaml: the token is minted in THIS
+        # template, so including the file here would recurse.
+        checksum/token: {{ $token | sha256sum }}
     spec:
       serviceAccountName: {{ $name }}
       # hostNetwork so the agent reaches each node at http://<node-ip>:<port>.

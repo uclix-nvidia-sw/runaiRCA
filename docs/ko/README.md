@@ -67,7 +67,6 @@ helm upgrade --install runai-rca oci://ghcr.io/<owner>/charts/runai-rca \
   --set global.imageRegistry=ghcr.io/<owner> \
   --set secrets.existingSecret=runai-rca-secrets \
   --set agent.env.runaiBaseUrl=https://runai.example.com \
-  --set agent.env.runaiTokenUrl=https://runai.example.com/api/v1/token \
   --set agent.env.prometheusUrl=http://prometheus.monitoring.svc:9090 \
   --set agent.env.lokiUrl=http://loki-read.monitoring.svc.cluster.local:3100
 ```
@@ -105,7 +104,7 @@ curl -s http://<frontend-or-backend-url>/api/v1/analysis-runs
 | ---------------------------------------------- | ------------------------------------------------------------------------- |
 | `global.imageRegistry` / `imagePullSecrets`    | 모든 이미지에 대한 레지스트리 접두사 및 풀 시크릿                                              |
 | `secrets.existingSecret`                       | DB/Run:ai/NVIDIA/LLM 자격 증명이 담긴 기존 Secret                                  |
-| `agent.env.runaiBaseUrl` / `runaiTokenUrl`     | Run:ai API URL 및 클라이언트 자격 증명 토큰 URL(예: `/api/v1/token`, client\_id/secret 사용 시 필수) |
+| `agent.env.runaiBaseUrl` / `runaiTokenUrl`     | Run:ai API URL. 토큰 엔드포인트는 이 URL에서 자동 유도됩니다(문서화된 `/api/v1/token` 우선) — `runaiTokenUrl`은 특수한 배포에서만 재정의로 설정하세요 |
 | `runaiMcp.oidcIssuerUrl`                       | 컨트롤 플레인 루트 OIDC discovery 엔드포인트가 HTML을 반환할 때 공식 Run:ai MCP가 사용할 토큰 `iss` URL |
 | `agent.env.prometheusUrl` / `lokiUrl`          | 클러스터 내부 Prometheus / Loki URL. Loki는 인증 게이트웨이가 아닌 직접 읽기 서비스를 기본값으로 사용합니다. |
 | `grafanaMcp.grafanaUrl` / `grafanaOrgId`       | shared MCP 서비스가 사용할 Grafana 엔드포인트와 조직입니다. service account token은 `GRAFANA_SERVICE_ACCOUNT_TOKEN`입니다. |

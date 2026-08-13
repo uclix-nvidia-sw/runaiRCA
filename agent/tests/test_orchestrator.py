@@ -403,7 +403,7 @@ async def test_runai_headers_warn_when_auth_header_is_missing() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runai_token_uses_json_client_credentials(monkeypatch) -> None:
+async def test_runai_token_uses_documented_v1_app_token_body(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     async def fake_post_oauth_token(
@@ -425,11 +425,73 @@ async def test_runai_token_uses_json_client_credentials(monkeypatch) -> None:
 
     assert headers["Authorization"] == "Bearer tok-123"
     assert captured["json_body"] == {
-        "grantType": "client_credentials",
-        "clientId": "cid",
-        "clientSecret": "secret",
+        "grantType": "app_token",
+        "appID": "cid",
+        "appSecret": "secret",
     }
     assert warnings == []
+
+
+@pytest.mark.asyncio
+async def test_runai_credentials_take_precedence_over_static_bearer(monkeypatch) -> None:
+    from app.collectors import runai as runai_mod
+
+    async def fake_post_oauth_token(**_kwargs):
+        return SimpleNamespace(ok=True, error=None, token="exchanged-token")
+
+    monkeypatch.setattr(runai_mod, "post_oauth_token", fake_post_oauth_token)
+    runai_mod._RUNAI_TOKEN_CACHE.clear()
+    settings = replace(
+        make_settings(),
+        runai_base_url="https://runai-precedence.example",
+        runai_bearer_token="static-token",
+        runai_client_id="cid",
+        runai_client_secret="secret",
+    )
+
+    headers, warnings = await _runai_headers(settings)
+
+    assert headers["Authorization"] == "Bearer exchanged-token"
+    assert warnings == []
+
+
+@pytest.mark.asyncio
+async def test_runai_static_bearer_is_used_without_credentials(monkeypatch) -> None:
+    async def forbidden_exchange(**_kwargs):
+        raise AssertionError("credential exchange must not run")
+
+    monkeypatch.setattr("app.collectors.runai.post_oauth_token", forbidden_exchange)
+    headers, warnings = await _runai_headers(
+        replace(
+            make_settings(),
+            runai_base_url="https://runai-static.example",
+            runai_bearer_token="static-token",
+        )
+    )
+
+    assert headers["Authorization"] == "Bearer static-token"
+    assert warnings == []
+
+
+def test_runai_token_url_candidates_are_ordered_with_optional_override() -> None:
+    from app.collectors.runai import _runai_token_urls
+
+    base = "https://runai.example"
+    derived = [
+        f"{base}/api/v1/token",
+        f"{base}/api/v2/token",
+        f"{base}/auth/realms/runai/protocol/openid-connect/token",
+        f"{base}/api/v1/auth/token",
+    ]
+
+    assert _runai_token_urls(replace(make_settings(), runai_base_url=base)) == derived
+    assert _runai_token_urls(
+        replace(
+            make_settings(),
+            runai_base_url=base,
+            runai_token_url=f"{base}/custom/token",
+        )
+    ) == [f"{base}/custom/token", *derived]
 
 
 @pytest.mark.asyncio
@@ -1788,6 +1850,55 @@ async def test_runai_collector_falls_back_to_curl_when_mcp_unavailable(monkeypat
     settings = replace(make_settings(), runai_base_url="https://runai.example", runai_mcp_url="")
     await RunAICollector(settings).collect(make_target())
     assert called["curl"] is True
+
+
+@pytest.mark.asyncio
+async def test_runai_version_fetch_uses_headers_refreshed_after_query_401(
+    monkeypatch,
+) -> None:
+    from app.collectors import runai as runai_mod
+
+    async def mcp_none(_settings, _target, *, headers):
+        return None
+
+    async def fake_headers(_settings, prefer_oauth=False):
+        token = "fresh" if prefer_oauth else "stale"
+        return ({"Authorization": f"Bearer {token}"}, [])
+
+    async def fake_direct(_settings, _target, headers):
+        fresh = headers["Authorization"] == "Bearer fresh"
+        return [
+            {
+                "name": "workloads",
+                "path": "/api/v1/workloads",
+                "transport": "direct",
+                "status_code": 200 if fresh else 401,
+                "error": None if fresh else "HTTP 401",
+                "data": {"workloads": [{"name": "trainer"}]} if fresh else {},
+            }
+        ]
+
+    version_headers: dict[str, str] = {}
+
+    async def fake_version(_settings, headers):
+        version_headers.update(headers)
+        return "2.23.71"
+
+    monkeypatch.setattr(runai_mod, "gather_runai_via_mcp", mcp_none)
+    monkeypatch.setattr(runai_mod, "_runai_headers", fake_headers)
+    monkeypatch.setattr(runai_mod, "_collect_runai_responses", fake_direct)
+    monkeypatch.setattr(runai_mod, "_fetch_runai_version", fake_version)
+    settings = replace(
+        make_settings(),
+        runai_base_url="https://runai.example",
+        runai_client_id="cid",
+        runai_client_secret="secret",
+    )
+
+    result = await RunAICollector(settings).collect(make_target())
+
+    assert result.details["runai_version"] == "2.23.71"
+    assert version_headers["Authorization"] == "Bearer fresh"
 
 
 @pytest.mark.asyncio

@@ -1375,11 +1375,17 @@ select $iid, $sum, $sn, $kw, $case_id, $family;
 
 
 async def external_case_cards(
-    settings: Settings, observed_text: str, *, limit: int = 2
+    settings: Settings, observed_text: str, *, limit: int = 2, question_vocabulary: bool = False
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Labelled external support-case priors whose error signature hits the run's
     observed evidence. Empty (never an exception) when the graph ships no external
-    cases or nothing matches — a missing prior is safer than a failed RCA."""
+    cases or nothing matches — a missing prior is safer than a failed RCA.
+
+    ``question_vocabulary=True`` additionally matches each case's curator-authored
+    ``retrieval_keywords`` (prose, e.g. a title) against ``observed_text`` -- safe
+    ONLY when the caller's ``observed_text`` is the operator's own question, never
+    cluster evidence. See ``_query_external_cases``.
+    """
     if not observed_text or not settings.enable_typedb or not settings.typedb_address:
         return [], []
     try:
@@ -1389,7 +1395,13 @@ async def external_case_cards(
     client = TypeDBClient(settings)
     try:
         cards = await asyncio.wait_for(
-            asyncio.to_thread(_query_external_cases, client, observed_text, limit),
+            asyncio.to_thread(
+                _query_external_cases,
+                client,
+                observed_text,
+                limit,
+                question_vocabulary=question_vocabulary,
+            ),
             timeout=settings.typedb_timeout_seconds + 1,
         )
         return cards, []
@@ -1455,6 +1467,67 @@ def _matched_external_cases(
     matched: list[tuple[str, dict[str, Any], list[str]]] = []
     for case_id, info in cases.items():
         hits, _negated = _keyword_hits(text, sorted(info["keywords"]))
+        if hits:
+            matched.append((case_id, info, hits))
+    return sorted(matched, key=lambda match: (-len(match[2]), match[0]))
+
+
+_MIN_RETRIEVAL_KEYWORD_LEN = 10  # skips generic version tokens (e.g. "Run:ai 2.23.x")
+
+
+def _retrieval_keywords_for_case(run: Any, case_id: str) -> list[str]:
+    """A case's curator-authored ``retrieval_keywords`` (prose, e.g. a title),
+    read from the RAW stored card JSON -- ``_safe_case_card``'s allowlist (the
+    evidence-path projection) deliberately excludes ``searchable_context``, so
+    this data must never reach it. Degrades to no keywords on any parse issue;
+    a missing prior is safer than a failed RCA."""
+    if not case_id:
+        return []
+    try:
+        rows = run(_CASE_CARD_QUERY.format(case_id=escape_typeql(case_id)))
+        raw = next((row.get("card") for row in rows if row.get("card")), "")
+        card = json.loads(raw) if isinstance(raw, str) else {}
+    except Exception as exc:  # noqa: BLE001 - a missing/stale card is no match, not a failure
+        _log.warning("external-case retrieval_keywords parse failed for %s: %s", case_id, exc)
+        return []
+    context = card.get("searchable_context") if isinstance(card, dict) else None
+    raw_keywords = context.get("retrieval_keywords") if isinstance(context, dict) else None
+    if not isinstance(raw_keywords, list):
+        return []
+    return [
+        normalized
+        for kw in raw_keywords
+        if len(normalized := " ".join(str(kw).split()).lower()) >= _MIN_RETRIEVAL_KEYWORD_LEN
+    ]
+
+
+def _question_vocabulary_matched_external_cases(
+    run: Any, question_text: str, exclude_case_ids: frozenset[str]
+) -> list[tuple[str, dict[str, Any], list[str]]]:
+    """External cases whose curator-authored retrieval_keywords (prose, e.g. a
+    known-issue TITLE) appear in the OPERATOR'S OWN QUESTION text -- never run
+    against observed cluster evidence, since prose-vocabulary matching there
+    has caused misdiagnosis before. Candidate case_ids come from the same
+    ``_EXTERNAL_CASE_QUERY`` row set ``_matched_external_cases`` reads (the
+    whole ~25-case population, not just cases with a case-local ext: symptom
+    -- a case with no error signature at all would otherwise never surface
+    here), skipping ``exclude_case_ids`` (already matched by signature).
+    """
+    text = (question_text or "").lower()
+    if not text:
+        return []
+    candidates: dict[str, dict[str, str]] = {}
+    for row in run(_EXTERNAL_CASE_QUERY):
+        case_id = str(row.get("case_id") or "")
+        if case_id and case_id not in exclude_case_ids and case_id not in candidates:
+            candidates[case_id] = {
+                "incident_id": str(row.get("iid") or ""),
+                "family": str(row.get("family") or ""),
+                "analysis_summary": str(row.get("sum") or ""),
+            }
+    matched: list[tuple[str, dict[str, Any], list[str]]] = []
+    for case_id, info in candidates.items():
+        hits, _negated = _keyword_hits(text, _retrieval_keywords_for_case(run, case_id))
         if hits:
             matched.append((case_id, info, hits))
     return sorted(matched, key=lambda match: (-len(match[2]), match[0]))
@@ -1553,10 +1626,17 @@ def _query_external_case_hints(
 
 
 def _query_external_cases(
-    client: TypeDBClient, observed_text: str, limit: int
+    client: TypeDBClient, observed_text: str, limit: int, *, question_vocabulary: bool = False
 ) -> list[dict[str, Any]]:
     with client.open_reader() as run:
         matched = _matched_external_cases(run, observed_text)
+        if question_vocabulary:
+            # Additive only: the signature match above is untouched, so the
+            # evidence path (question_vocabulary=False) is byte-for-byte the
+            # same as before this ever existed.
+            matched = matched + _question_vocabulary_matched_external_cases(
+                run, observed_text, frozenset(case_id for case_id, _info, _hits in matched)
+            )
         # Most signature hits first, then case_id — deterministic, no run() calls
         # for non-matching cases (early return before per-case projection).
         cards: list[dict[str, Any]] = []
