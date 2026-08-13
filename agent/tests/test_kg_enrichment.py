@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import contextmanager
 from dataclasses import replace
 
@@ -1434,6 +1435,121 @@ def test_external_no_signature_match_returns_empty_and_skips_projection() -> Non
     assert cards == []
     # The single has_symptom query runs, but no per-case card projection is issued.
     assert not any("has case_card $card" in q for q in recorded)
+
+
+def _prose_only_external_fake(retrieval_keywords: list[str]):
+    """A case with NO case-local ext: symptom row at all (so the signature
+    matcher never even learns its case_id) -- only the `has_symptom` row that
+    _EXTERNAL_CASE_QUERY joins through, plus a stored card carrying prose
+    retrieval_keywords. Mirrors a case whose only distinguishing signal is a
+    curator-authored title, like live case-239ee9638d98."""
+    card_json = json.dumps({"searchable_context": {"retrieval_keywords": retrieval_keywords}})
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "isa has_symptom" in query:
+                    return [
+                        # A curated (non ext:) symptom row -- the case still
+                        # appears in the row set, just never as a signature.
+                        {"iid": "ext:239ee9638d98", "sum": "Distributed training hostPath rejected",
+                         "sn": "hostpath_policy_violation", "case_id": "enterprise_support:239ee9638d98",
+                         "family": "runai_scheduling_quota", "kw": ""},
+                    ]
+                if "has case_card $card" in query:
+                    return [{"card": card_json}]
+                return []
+
+            yield run
+
+    return FakeClient()
+
+
+def test_question_vocabulary_matches_a_case_with_no_error_signature_at_all() -> None:
+    # Live-case regression: case-239ee9638d98's only reachable text is its
+    # curator-authored retrieval_keyword, which quotes the known issue's own
+    # title -- and the case has no case-local ext: symptom row, so the
+    # signature matcher can never see it, with or without question_vocabulary.
+    client = _prose_only_external_fake(["distributed training locked hostPath policy"])
+    question = (
+        "Distributed Training Locked hostPath Policy 가 UI 상에서 거부되는데 "
+        "이거 왜 이러는거야? 시스템 버그야?"
+    )
+
+    # Evidence-path guard: default (question_vocabulary=False) never sees it.
+    assert _query_external_cases(client, question, 2) == []  # type: ignore[arg-type]
+
+    cards = _query_external_cases(client, question, 2, question_vocabulary=True)  # type: ignore[arg-type]
+    assert len(cards) == 1
+    assert cards[0]["case_id"] == "enterprise_support:239ee9638d98"
+    assert cards[0]["matched_error_signatures"] == ["distributed training locked hostpath policy"]
+
+
+def test_question_vocabulary_skips_retrieval_keywords_under_ten_chars() -> None:
+    # "hostpath" (8 chars) is a literal substring of the question below, but
+    # must not match -- the floor exists to skip generic tokens like a bare
+    # version string ("Run:ai 2.23.x").
+    client = _prose_only_external_fake(["hostpath"])
+    question = "our distributed training job hit a hostpath issue, what now?"
+
+    assert _query_external_cases(client, question, 2, question_vocabulary=True) == []  # type: ignore[arg-type]
+
+
+def _mixed_signature_and_prose_fake():
+    """One signature-matchable case (ext: keyword) and one prose-only case
+    (retrieval_keywords, no ext: row at all) in the SAME row set."""
+    cards = {
+        "enterprise_support:ab12cd34ef56": json.dumps({"searchable_context": {}}),
+        "enterprise_support:239ee9638d98": json.dumps(
+            {"searchable_context": {"retrieval_keywords": ["distributed training locked hostPath policy"]}}
+        ),
+    }
+
+    class FakeClient:
+        @contextmanager
+        def open_reader(self):
+            def run(query: str) -> list[dict]:
+                if "isa has_symptom" in query:
+                    return [
+                        {"iid": "ext:sc-ab12cd34ef56", "sum": "RDMA connect failed",
+                         "sn": "ext:sc-ab12cd34ef56", "case_id": "enterprise_support:ab12cd34ef56",
+                         "family": "network_fabric_error",
+                         "kw": "ibv_modify_qp failed with 19 no such device"},
+                        {"iid": "ext:239ee9638d98", "sum": "Distributed training hostPath rejected",
+                         "sn": "hostpath_policy_violation", "case_id": "enterprise_support:239ee9638d98",
+                         "family": "runai_scheduling_quota", "kw": ""},
+                    ]
+                if "has case_card $card" in query:
+                    for case_id, card_json in cards.items():
+                        if case_id in query:
+                            return [{"card": card_json}]
+                    return []
+                return []
+
+            yield run
+
+    return FakeClient()
+
+
+def test_question_vocabulary_is_additive_to_and_ranked_after_signature_matches() -> None:
+    # A signature-matched case and a prose-only case in the SAME run: the
+    # question_vocabulary addition must never crowd out or reorder the
+    # existing signature match.
+    client = _mixed_signature_and_prose_fake()
+    text = (
+        "worker logs show ibv_modify_qp failed with 19 No such device during RDMA setup\n"
+        "also asking about: distributed training locked hostPath policy"
+    )
+
+    signature_only = _query_external_cases(client, text, 2)  # type: ignore[arg-type]
+    assert [c["case_id"] for c in signature_only] == ["enterprise_support:ab12cd34ef56"]
+
+    combined = _query_external_cases(client, text, 2, question_vocabulary=True)  # type: ignore[arg-type]
+    assert [c["case_id"] for c in combined] == [
+        "enterprise_support:ab12cd34ef56",  # signature match ranks first
+        "enterprise_support:239ee9638d98",  # question-vocabulary match added after
+    ]
 
 
 def test_safe_case_card_keeps_context_class_and_case_origin_but_strips_the_rest() -> None:

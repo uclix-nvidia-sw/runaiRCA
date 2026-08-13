@@ -151,6 +151,10 @@ class ChatAdhocKnowledge:
     supplementary_lines: tuple[str, ...] = ()
     match_status: str = "none"
     provenance_tags: tuple[str, ...] = ()
+    # Display title of the FIRST ladder hit (rungs a-e, in priority order) --
+    # lets a knowledge_only headline name what was actually found instead of
+    # the generic insufficient-evidence sentence.
+    top_match_title: str = ""
 
 
 @dataclass
@@ -3232,6 +3236,11 @@ async def harness_stage(state: PipelineState) -> PipelineState:
             and state.chat_adhoc_knowledge is not None
         ):
             response.context["answer_mode"] = "knowledge_only"
+            response.analysis_summary = _chat_adhoc_knowledge_headline(
+                state.request,
+                state.chat_adhoc_knowledge,
+                getattr(state.settings, "language", "en"),
+            )
         return state
 
     repairs = 0
@@ -3352,11 +3361,12 @@ async def harness_stage(state: PipelineState) -> PipelineState:
     # short summary after that decision so a demotion cannot leave a confident
     # mechanism sentence beside ``insufficient_evidence``.
     final_family = response.root_cause_family
-    if (
+    knowledge_only = (
         _is_chat_adhoc(state.request)
         and final_family == "insufficient_evidence"
         and state.chat_adhoc_knowledge is not None
-    ):
+    )
+    if knowledge_only:
         # Never on root_cause_family/verdict -- this only flags that the
         # state-carried knowledge result rendered (content or an explicit
         # no-match), for the frontend to badge the answer instead of presenting
@@ -3365,13 +3375,21 @@ async def harness_stage(state: PipelineState) -> PipelineState:
     if final_family == "insufficient_evidence":
         _warn_on_discarded_support(state, response)
         _warn_on_starved_evidence(state, response)
-        response.analysis_summary = _short_sentence(
-            _ranked_root_cause_statement(
-                [RankedCause("insufficient_evidence", "low", 0.0)],
+        response.analysis_summary = (
+            _chat_adhoc_knowledge_headline(
                 state.request,
-                language=getattr(state.settings, "language", "en"),
-            ),
-            limit=280,
+                state.chat_adhoc_knowledge,
+                getattr(state.settings, "language", "en"),
+            )
+            if knowledge_only
+            else _short_sentence(
+                _ranked_root_cause_statement(
+                    [RankedCause("insufficient_evidence", "low", 0.0)],
+                    state.request,
+                    language=getattr(state.settings, "language", "en"),
+                ),
+                limit=280,
+            )
         )
     elif top is not None:
         response.analysis_summary = _summary_from(
@@ -5145,6 +5163,36 @@ def _chat_adhoc_knowledge_sections(
     )
 
 
+def _chat_adhoc_knowledge_headline(
+    request: AlertAnalysisRequest, result: ChatAdhocKnowledge, language: str
+) -> str:
+    """Headline for a knowledge_only chat-adhoc answer: names what the ladder
+    actually found instead of the generic insufficient-evidence sentence --
+    that generic wording reads as "the question wasn't understood" even when
+    the report body below correctly led with the right known issue."""
+    subject = _as_sentence(_root_cause_statement(request, language=language))
+    ko = language == "ko"
+    if result.match_status == "exact":
+        found = (
+            f"지식 기반 답변: {result.top_match_title}"
+            if ko
+            else f"Knowledge-base answer: {result.top_match_title}"
+        )
+    elif result.match_status == "nearest":
+        found = (
+            f"가장 근접한 지식(정확히 일치하지 않음): {result.top_match_title}"
+            if ko
+            else f"Nearest knowledge (not an exact match): {result.top_match_title}"
+        )
+    else:
+        found = (
+            "질문과 일치하는 지식을 지식 베이스에서 찾지 못했습니다."
+            if ko
+            else "No matching knowledge was found in the knowledge base for this question."
+        )
+    return _short_sentence(f"{subject} {found}", limit=280)
+
+
 async def _chat_adhoc_knowledge_ladder_lines(
     state: PipelineState, question: str
 ) -> ChatAdhocKnowledge:
@@ -5167,6 +5215,7 @@ async def _chat_adhoc_knowledge_ladder_lines(
     provenance_tags: list[str] = []
     exact_found = False
     nearest_found = False
+    top_match_title = ""
 
     # a. XID codes named in the question -- ontology-first (owner directive:
     # TypeDB is the runtime source of truth, YAML is catalog_fallback only),
@@ -5213,6 +5262,8 @@ async def _chat_adhoc_knowledge_ladder_lines(
                     applicability = "카탈로그 적용 대상" if ko else "catalog applicability"
                     digest += f" · {model_label}: {', '.join(models)} ({applicability})"
                 problem_lines.append(digest)
+                if not top_match_title:
+                    top_match_title = digest
                 label = "**[XID 카탈로그]**" if ko else "**[XID Catalog]**"
                 description_label = "설명" if ko else "Description"
                 description = identity or (
@@ -5235,13 +5286,16 @@ async def _chat_adhoc_knowledge_ladder_lines(
                     if str(fix).strip()
                 )
 
-    # b. Exact known-issue keyword match on the question itself.
-    for issue in match_runai_known_issues(state.known_issues, question)[:2]:
+    # b. Exact known-issue keyword match on the question itself -- match_titles
+    # is safe ONLY here: the question is prose, never observed cluster evidence.
+    for issue in match_runai_known_issues(state.known_issues, question, match_titles=True)[:2]:
         exact_found = True
         provenance_tags.append("known_issue")
         label = "**[알려진 이슈]**" if ko else "**[Known Issue]**"
         name = _safe_line(issue.get("issue"), limit=180, masker=masker)
         problem_lines.append(f"{label} {name}")
+        if not top_match_title and name:
+            top_match_title = name
         reason = _safe_line(issue.get("reason"), limit=360, masker=masker)
         if reason:
             cause_lines.append(f"- {label} {reason}")
@@ -5260,6 +5314,8 @@ async def _chat_adhoc_knowledge_ladder_lines(
             _localized_failure_mode_name(symptom, language), limit=180, masker=masker
         )
         problem_lines.append(f"{label} {name} ({_family_label(family)})")
+        if not top_match_title and name:
+            top_match_title = name
         reason = _safe_line(
             symptom.get("reason_ko" if ko else "reason"), limit=360, masker=masker
         )
@@ -5279,10 +5335,15 @@ async def _chat_adhoc_knowledge_ladder_lines(
     # cluster evidence to match against) would otherwise surface nothing --
     # also run the SAME exact signature matcher against the question text
     # itself and union the hits (deduped by case_id, capped at 2 total).
+    # question_vocabulary=True additionally matches a case's curator-authored
+    # retrieval_keywords (prose, e.g. a title) -- safe only here, since
+    # ``question`` is the operator's own text, never cluster evidence.
     case_cards = list(getattr(state.kg_context, "case_cards", None) or [])
     external_cards = [card for card in case_cards if card.get("kind") == "external"]
     if len(external_cards) < 2:
-        question_cards, _warnings = await external_case_cards(settings, question, limit=2)
+        question_cards, _warnings = await external_case_cards(
+            settings, question, limit=2, question_vocabulary=True
+        )
         seen_ids = {cid for card in external_cards if (cid := card.get("case_id"))}
         for card in question_cards:
             cid = card.get("case_id")
@@ -5304,6 +5365,8 @@ async def _chat_adhoc_knowledge_ladder_lines(
                 )
                 if identity:
                     problem_lines.append(f"{label} {identity}")
+                    if not top_match_title:
+                        top_match_title = identity
                 summary = _safe_line(
                     card.get("analysis_summary") or card.get("mechanism"),
                     limit=360,
@@ -5332,6 +5395,10 @@ async def _chat_adhoc_knowledge_ladder_lines(
             supplementary_lines.extend(
                 _symptom_knowledge_lines(family, symptom, language, masker, nearest=True)
             )
+            if not top_match_title:
+                top_match_title = _safe_line(
+                    _localized_failure_mode_name(symptom, language), limit=180, masker=masker
+                )
         if nearest_found:
             cause_lines.append(
                 "질문과 정확히 일치하는 지식은 찾지 못했습니다."
@@ -5364,6 +5431,7 @@ async def _chat_adhoc_knowledge_ladder_lines(
         supplementary_lines=tuple(supplementary_lines),
         match_status=match_status,
         provenance_tags=tuple(dict.fromkeys(provenance_tags)),
+        top_match_title=top_match_title,
     )
 
 

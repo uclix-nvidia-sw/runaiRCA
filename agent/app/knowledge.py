@@ -1749,7 +1749,11 @@ def _sync_error(exc: Exception) -> str:
 
 
 def match_runai_known_issues(
-    catalog: list[dict[str, Any]], observed_text: str, *, fuzzy_query: str = ""
+    catalog: list[dict[str, Any]],
+    observed_text: str,
+    *,
+    fuzzy_query: str = "",
+    match_titles: bool = False,
 ) -> list[dict[str, Any]]:
     """Known-issue entries whose signature keyword appears in the evidence text.
 
@@ -1757,6 +1761,12 @@ def match_runai_known_issues(
     match — one incident can hit more than one known issue. Known support cases
     stay exact-signature only: fuzzy recall here polluted reports with unrelated
     case notes that shared generic GPU/workload words.
+
+    ``match_titles`` additionally matches an entry's own ``issue`` title as a
+    whole phrase. It exists ONLY for a human operator's question, which may
+    quote a known issue's title instead of its error-string keywords -- the
+    evidence path (an alert's own text/logs) must never match on prose, so
+    every other caller leaves this False.
     """
     text = (observed_text or "").lower()
     if not text or not catalog:
@@ -1764,6 +1774,11 @@ def match_runai_known_issues(
     hits = []
     for entry in catalog:
         matched, _negated = _keyword_hits(text, entry["keywords"])
+        if match_titles:
+            title = " ".join(str(entry.get("issue") or "").split()).lower()
+            if title and title not in matched:
+                title_hits, _title_negated = _keyword_hits(text, [title])
+                matched = matched + title_hits
         if matched:
             hits.append({**entry, "matched_keywords": matched})
     return hits

@@ -338,8 +338,9 @@ def test_question_keyed_external_case_surfaces_with_empty_kg_case_cards(monkeypa
     # question that names a case's own error signature purely by its wording
     # must still surface it, even with an empty state.kg_context.case_cards
     # (no cluster evidence was ever collected for a chat-adhoc question).
-    async def fake_external_case_cards(settings, observed_text, *, limit=2):
+    async def fake_external_case_cards(settings, observed_text, *, limit=2, question_vocabulary=False):
         assert "NVLink error" in observed_text  # the question text, not evidence
+        assert question_vocabulary is True  # rung d must ask for prose vocabulary too
         return [QUESTION_MATCH_CASE_CARD], []
 
     monkeypatch.setattr(pipeline, "external_case_cards", fake_external_case_cards)
@@ -357,7 +358,7 @@ def test_question_keyed_external_case_surfaces_with_empty_kg_case_cards(monkeypa
 
 
 def test_question_keyed_lookup_leaves_rung_d_unchanged_when_no_match(monkeypatch) -> None:
-    async def fake_external_case_cards(settings, observed_text, *, limit=2):
+    async def fake_external_case_cards(settings, observed_text, *, limit=2, question_vocabulary=False):
         return [], []
 
     monkeypatch.setattr(pipeline, "external_case_cards", fake_external_case_cards)
@@ -376,7 +377,7 @@ def test_question_keyed_lookup_leaves_rung_d_unchanged_when_no_match(monkeypatch
 def test_question_keyed_lookup_dedups_against_existing_kg_case_cards(monkeypatch) -> None:
     calls: list[int] = []
 
-    async def fake_external_case_cards(settings, observed_text, *, limit=2):
+    async def fake_external_case_cards(settings, observed_text, *, limit=2, question_vocabulary=False):
         calls.append(1)
         # Same case_id as the card already found via the evidence-keyed match.
         return [THANOS_CASE_CARD], []
@@ -396,6 +397,64 @@ def test_question_keyed_lookup_dedups_against_existing_kg_case_cards(monkeypatch
     assert calls == [1]  # still queried (room for a 2nd card) -- but deduped on merge
     assert case.provenance_tags == ("external_case",)
     assert "\n".join(case.problem_lines).count(THANOS_CASE_CARD["case_id"]) == 1
+
+
+# Live incident regression: "Distributed Training Locked hostPath Policy 가 UI
+# 상에서 거부되는데 이거 왜 이러는거야? 시스템 버그야?" only reached BM25-nearest
+# because rung d's evidence-keyed signature matcher never sees a case's own
+# curator-authored TITLE -- only its question_vocabulary=True retrieval_keyword
+# match does (live case-239ee9638d98, see app/services/kg_enrichment.py). This
+# also exercises the headline fix: a knowledge_only answer that found an exact
+# hit must say so, not the generic insufficient-evidence sentence.
+
+LIVE_HOSTPATH_QUESTION = (
+    "Distributed Training Locked hostPath Policy 가 UI 상에서 거부되는데 "
+    "이거 왜 이러는거야? 시스템 버그야?"
+)
+
+LIVE_HOSTPATH_CASE_CARD = {
+    "kind": "external",
+    "case_id": "enterprise_support:239ee9638d98",
+    "context_class": "mitigated_context",
+    "analysis_summary": "LIVE-CASE Distributed Training Locked hostPath Policy Rejected In UI.",
+    "successful_actions": [
+        {
+            "statement": "LIVE-CASE-ACTION submit the job via the CLI or API instead of the UI.",
+            "outcome": "mitigated",
+        }
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_live_case_question_vocabulary_match_drives_the_knowledge_headline(
+    monkeypatch,
+) -> None:
+    async def fake_external_case_cards(settings, observed_text, *, limit=2, question_vocabulary=False):
+        assert question_vocabulary is True  # rung d must ask for prose vocabulary
+        assert "distributed training locked hostpath policy" in observed_text.lower()
+        return [LIVE_HOSTPATH_CASE_CARD], []
+
+    monkeypatch.setattr(pipeline, "external_case_cards", fake_external_case_cards)
+
+    settings = replace(make_settings(), language="ko", enable_rca_output_harness=False)
+    state = _make_state(
+        _chat_adhoc_request(LIVE_HOSTPATH_QUESTION),
+        settings=settings,
+        kg_context=KGContext(case_cards=[]),
+        root_cause_candidates=[RankedCause("insufficient_evidence", "low", 0.0)],
+    )
+
+    await synthesize_stage(state)
+    await harness_stage(state)
+
+    assert state.chat_adhoc_knowledge is not None
+    assert state.chat_adhoc_knowledge.match_status == "exact"
+    assert "external_case" in state.chat_adhoc_knowledge.provenance_tags
+    assert state.response is not None
+    assert state.response.context.get("answer_mode") == "knowledge_only"
+    assert "지식 기반 답변:" in state.response.analysis_summary
+    assert "확정할 근거가 충분하지" not in state.response.analysis_summary
 
 
 def test_bm25_is_nearest_only_and_is_suppressed_by_an_exact_match() -> None:
@@ -706,3 +765,135 @@ async def test_chat_adhoc_knowledge_only_appendix_does_not_contradict_the_answer
     assert "위 답변은 클러스터 증거가 아니라 이 질문에 대한 지식 베이스 매칭 결과로" in detail
     assert "closely-matching" not in detail
     assert "이 증거와 밀접하게 일치하는 사전 지식은 아직 없습니다." not in detail
+
+
+# A knowledge_only run's headline (response.analysis_summary) must name what
+# the ladder actually found instead of the generic insufficient-evidence
+# sentence -- otherwise a body that correctly led with the right known issue
+# still reads, at the headline, as "the system didn't understand the
+# question" (live example: the Distributed Training Locked hostPath Policy
+# question, whose body was right and headline said insufficient evidence).
+
+
+@pytest.mark.asyncio
+async def test_knowledge_only_headline_names_the_exact_match() -> None:
+    settings = replace(make_settings(), language="ko", enable_rca_output_harness=False)
+    state = _make_state(
+        _chat_adhoc_request(XID8_QUESTION),
+        settings=settings,
+        root_cause_candidates=[RankedCause("insufficient_evidence", "low", 0.0)],
+    )
+
+    await synthesize_stage(state)
+    await harness_stage(state)
+
+    assert state.response is not None
+    assert state.chat_adhoc_knowledge is not None
+    assert state.chat_adhoc_knowledge.match_status == "exact"
+    summary = state.response.analysis_summary
+    assert "지식 기반 답변:" in summary
+    assert "XID 8 — GPU stopped processing" in summary
+    assert "확정할 근거가 충분하지" not in summary
+
+
+@pytest.mark.asyncio
+async def test_knowledge_only_headline_survives_hard_gate_abstain() -> None:
+    # Same hard-gate-abstain scenario as
+    # test_knowledge_sections_survive_hard_gate_abstain_in_both_languages --
+    # confirms the harness-enabled abstain path (not just the
+    # harness-disabled early return) also gets the knowledge headline: the
+    # ~3365 rewrite runs unconditionally AFTER abstain() replaces the
+    # document, so it must not fall back to the generic sentence.
+    settings = replace(make_settings(), language="ko", enable_rca_output_harness=True)
+    state = _make_state(
+        _chat_adhoc_request(XID8_QUESTION),
+        settings=settings,
+        results=[],
+        root_cause_candidates=[RankedCause("gpu_hardware_error", "high", 8.0)],
+    )
+
+    await synthesize_stage(state)
+    await harness_stage(state)
+
+    assert state.response is not None
+    assert state.response.root_cause_family == "insufficient_evidence"
+    summary = state.response.analysis_summary
+    assert "지식 기반 답변:" in summary
+    assert "XID 8 — GPU stopped processing" in summary
+    assert "확정할 근거가 충분하지" not in summary
+
+
+@pytest.mark.asyncio
+async def test_knowledge_only_headline_names_the_nearest_match() -> None:
+    modes = load_failure_modes(FAILURE_MODES_PATH)
+    question = "작업이 선점됐어요"
+    settings = replace(make_settings(), enable_rca_output_harness=False)
+    state = _make_state(
+        _chat_adhoc_request(question),
+        settings=settings,
+        failure_modes=modes,
+        root_cause_candidates=[RankedCause("insufficient_evidence", "low", 0.0)],
+    )
+
+    await synthesize_stage(state)
+    await harness_stage(state)
+
+    assert state.response is not None
+    assert state.chat_adhoc_knowledge is not None
+    assert state.chat_adhoc_knowledge.match_status == "nearest"
+    title = state.chat_adhoc_knowledge.top_match_title
+    assert title
+    summary = state.response.analysis_summary
+    assert "Nearest knowledge (not an exact match):" in summary
+    assert title in summary
+    assert "Insufficient evidence" not in summary
+
+
+@pytest.mark.asyncio
+async def test_knowledge_only_headline_names_no_match() -> None:
+    question = "user deleted old experiment after successful completion"
+    settings = replace(make_settings(), enable_rca_output_harness=False)
+    state = _make_state(
+        _chat_adhoc_request(question),
+        settings=settings,
+        failure_modes=load_failure_modes(FAILURE_MODES_PATH),
+        root_cause_candidates=[RankedCause("insufficient_evidence", "low", 0.0)],
+    )
+
+    await synthesize_stage(state)
+    await harness_stage(state)
+
+    assert state.response is not None
+    assert state.chat_adhoc_knowledge == pipeline.ChatAdhocKnowledge()
+    summary = state.response.analysis_summary
+    assert "No matching knowledge was found in the knowledge base for this question." in summary
+    assert "Insufficient evidence" not in summary
+
+
+@pytest.mark.asyncio
+async def test_non_chat_adhoc_insufficient_evidence_keeps_the_generic_headline() -> None:
+    # A real alert with no knowledge ladder must keep today's generic
+    # insufficient-evidence sentence -- this fix is chat-adhoc knowledge_only
+    # only, never a real alert's honest "not enough evidence" headline.
+    request = AlertAnalysisRequest(
+        alert=Alert(
+            status="firing",
+            labels={"alertname": "KubePodCrashLooping"},
+            annotations={"summary": "pod is crash looping"},
+            fingerprint="real-fp-headline",
+        )
+    )
+    state = _make_state(
+        request,
+        settings=replace(make_settings(), enable_rca_output_harness=False),
+        root_cause_candidates=[RankedCause("insufficient_evidence", "low", 0.0)],
+    )
+
+    await synthesize_stage(state)
+    await harness_stage(state)
+
+    assert state.response is not None
+    assert state.chat_adhoc_knowledge is None
+    summary = state.response.analysis_summary
+    assert "Insufficient evidence: there is not yet enough evidence" in summary
+    assert "answer_mode" not in state.response.context

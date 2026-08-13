@@ -213,6 +213,45 @@ def test_no_false_match() -> None:
     assert match_runai_known_issues(catalog, "a perfectly healthy cluster log line") == []
 
 
+def test_match_titles_finds_a_question_pasting_the_full_issue_title() -> None:
+    # rung b of the chat-adhoc knowledge ladder: an operator's question may
+    # quote a known issue's TITLE instead of any of its error-string keywords
+    # -- match_titles is the question-only escape hatch for that.
+    catalog = [
+        {
+            "issue": "Distributed Training Locked hostPath Policy Rejected In UI",
+            "family": "runai_scheduling_quota",
+            "keywords": ["administrator prohibited modifying", "masterspec.storage.hostpath"],
+            "reason": "The UI enforces a locked hostPath policy for the master.",
+            "actions": ["Use the CLI or API to submit the job instead."],
+            "affected_version": "",
+            "fixed_version": "",
+            "refs": [],
+        }
+    ]
+    question = "Distributed Training Locked hostPath Policy Rejected In UI 이거 왜 이러는거야?"
+
+    # Evidence-path guard: the default keyword-only match must NOT see a title.
+    assert match_runai_known_issues(catalog, question) == []
+
+    hits = match_runai_known_issues(catalog, question, match_titles=True)
+    assert [h["issue"] for h in hits] == [
+        "Distributed Training Locked hostPath Policy Rejected In UI"
+    ]
+    assert (
+        "distributed training locked hostpath policy rejected in ui" in hits[0]["matched_keywords"]
+    )
+
+
+def test_match_titles_does_not_change_a_keyword_hit() -> None:
+    # No duplicate entries/keywords when a run already matched by keyword.
+    catalog = load_runai_known_issues(CATALOG)
+    text = "Error: the administrator prohibited modifying item 'project-data'"
+    without_titles = match_runai_known_issues(catalog, text)
+    with_titles = match_runai_known_issues(catalog, text, match_titles=True)
+    assert with_titles == without_titles
+
+
 def test_missing_file_is_empty() -> None:
     assert load_runai_known_issues("/nope/does-not-exist.yaml") == []
 
