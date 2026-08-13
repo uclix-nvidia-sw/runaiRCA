@@ -201,10 +201,14 @@ spec:
         {{- with .Values.grafanaMcp.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.grafanaMcp.podAnnotations }}
       annotations:
+        # Same reason as agent/backend: GRAFANA_SERVICE_ACCOUNT_TOKEN arrives via
+        # secretKeyRef and is frozen at pod start, so without this a rotated token
+        # leaves this pod authenticating to Grafana with the old one.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.grafanaMcp.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
     spec:
       automountServiceAccountToken: {{ .Values.grafanaMcp.automountServiceAccountToken }}
       {{- with .Values.imagePullSecrets }}
@@ -587,10 +591,14 @@ spec:
         {{- with .Values.postgresMcp.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.postgresMcp.podAnnotations }}
       annotations:
+        # POSTGRES_DSN/RUNAI_DB_DSN come from secretKeyRef (frozen at pod start).
+        # A release rolls this pod anyway — its image tag follows appVersion — but
+        # a secret-only `helm upgrade` would otherwise leave the old DSN running.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.postgresMcp.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
     spec:
       automountServiceAccountToken: {{ .Values.postgresMcp.automountServiceAccountToken }}
       {{- with .Values.imagePullSecrets }}
