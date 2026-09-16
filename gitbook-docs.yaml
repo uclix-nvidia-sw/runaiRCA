@@ -1,0 +1,12 @@
+site:
+  title: GPU Ops Advisor
+
+structure:
+  - type: space
+    key: gpu-ops-advisor
+    title: GPU Ops Advisor
+    path: docs
+    default: true
+
+content:
+  directory: ./
